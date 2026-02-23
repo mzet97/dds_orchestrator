@@ -119,6 +119,8 @@ class OrchestratorServer:
 
     async def _dds_client_loop(self):
         """Background task to process DDS client requests"""
+        import sys
+        print("DDS client loop started", flush=True, file=sys.stderr)
         logger.info("DDS client loop started")
         while True:
             try:
@@ -131,6 +133,7 @@ class OrchestratorServer:
                 client_requests = await self.dds.read_client_requests(timeout_ms=100)
 
                 if client_requests:
+                    print(f"RECEIVED {len(client_requests)} CLIENT REQUESTS!", flush=True, file=sys.stderr)
                     logger.info(f"Received {len(client_requests)} client requests via DDS")
                 else:
                     # Debug: check if there are any messages at all
