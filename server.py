@@ -89,6 +89,8 @@ class OrchestratorServer:
         # Start background tasks
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        # DDS client request handler
+        self._dds_client_task = asyncio.create_task(self._dds_client_loop())
 
     async def stop(self):
         """Stop the orchestrator server"""
@@ -114,6 +116,97 @@ class OrchestratorServer:
                 break
             except Exception as e:
                 logger.error(f"Error in heartbeat loop: {e}")
+
+    async def _dds_client_loop(self):
+        """Background task to process DDS client requests"""
+        while True:
+            try:
+                await asyncio.sleep(0.1)  # Poll every 100ms
+
+                if not self.dds.is_available():
+                    continue
+
+                # Read client requests from DDS
+                client_requests = await self.dds.read_client_requests(timeout_ms=100)
+
+                for req in client_requests:
+                    await self._process_dds_client_request(req)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in DDS client loop: {e}")
+
+    async def _process_dds_client_request(self, req: dict):
+        """Process a DDS client request"""
+        import json
+
+        request_id = req.get("request_id")
+        client_id = req.get("client_id")
+        messages_json = req.get("messages_json", "[]")
+
+        try:
+            messages = json.loads(messages_json)
+        except:
+            messages = [{"role": "user", "content": messages_json}]
+
+        logger.info(f"Processing DDS client request: {request_id}")
+
+        # Get available agent
+        agents = await self.registry.get_available_agents()
+        if not agents:
+            # Send error response
+            await self._send_dds_client_response(request_id, client_id, "", success=False, error="No agents available")
+            return
+
+        agent = agents[0]
+        logger.info(f"Selected agent: {agent.agent_id}")
+
+        # Send task to agent via DDS
+        dds_request = AgentTaskRequest(
+            task_id=request_id,
+            requester_id="orchestrator",
+            task_type="chat",
+            messages=messages,
+            priority=5,
+            timeout_ms=60000,
+            requires_context=False,
+        )
+        await self.dds.publish_agent_request(dds_request)
+
+        # Wait for agent response
+        agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=60000)
+
+        # Send response back to client via DDS
+        content = agent_response.get("content", "")
+        await self._send_dds_client_response(
+            request_id,
+            client_id,
+            content,
+            success=agent_response.get("success", True),
+            prompt_tokens=agent_response.get("prompt_tokens", 0),
+            completion_tokens=agent_response.get("completion_tokens", 0),
+            processing_time_ms=agent_response.get("processing_time_ms", 0)
+        )
+
+    async def _send_dds_client_response(self, request_id, client_id, content, success=True, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0):
+        """Send response to client via DDS"""
+        from dataclasses import asdict
+        from dds import ClientTaskResponse
+
+        response = ClientTaskResponse(
+            request_id=request_id,
+            client_id=client_id,
+            content=content,
+            is_final=True,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            processing_time_ms=processing_time_ms,
+            success=success,
+            error_message=error,
+        )
+
+        await self.dds.publish_client_response(response)
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""
