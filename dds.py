@@ -382,7 +382,10 @@ class DDSLayer:
         try:
             from cyclonedds.util import duration
             samples = self.subscribers[topic].take(timeout=duration(milliseconds=timeout_ms))
-            return [s.data for s in samples if s.data]
+            result = [s.data for s in samples if s.data]
+            if result:
+                logger.info(f"Read {len(result)} messages from {topic}")
+            return result
         except Exception as e:
             logger.debug(f"No messages from {topic}: {e}")
             return []
