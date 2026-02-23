@@ -119,6 +119,7 @@ class OrchestratorServer:
 
     async def _dds_client_loop(self):
         """Background task to process DDS client requests"""
+        logger.info("DDS client loop started")
         while True:
             try:
                 await asyncio.sleep(0.1)  # Poll every 100ms
@@ -128,6 +129,9 @@ class OrchestratorServer:
 
                 # Read client requests from DDS
                 client_requests = await self.dds.read_client_requests(timeout_ms=100)
+
+                if client_requests:
+                    logger.info(f"Received {len(client_requests)} client requests via DDS")
 
                 for req in client_requests:
                     await self._process_dds_client_request(req)
