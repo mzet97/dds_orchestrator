@@ -10,6 +10,9 @@ import time
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, asdict
 
+# Import shared DDS types
+from dds_types import ClientRequestType, ClientResponseType
+
 logger = logging.getLogger(__name__)
 
 
@@ -424,7 +427,8 @@ class DDSLayer:
             responses = self.read_messages(TOPIC_CLIENT_RESPONSE, timeout_ms=100)
 
             for response in responses:
-                if response.get("request_id") == request_id:
+                resp_id = getattr(response, "request_id", None)
+                if resp_id == request_id:
                     logger.info(f"Received response for client request {request_id}")
                     return response
 
@@ -448,7 +452,8 @@ class DDSLayer:
             responses = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=100)
 
             for response in responses:
-                if response.get("task_id") == task_id:
+                resp_task_id = getattr(response, "task_id", None)
+                if resp_task_id == task_id:
                     logger.info(f"Received response for task {task_id}")
                     return response
 

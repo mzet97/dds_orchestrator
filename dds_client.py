@@ -28,9 +28,15 @@ try:
     from cyclonedds.sub import DataReader
     from cyclonedds.topic import Topic
     from cyclonedds.util import duration
+    from cyclonedds.idl import IdlStruct
+    from cyclonedds.idl.types import bounded_str, int32
     DDS_AVAILABLE = True
 except ImportError:
     DDS_AVAILABLE = False
+    # Provide fallback base class for type definitions
+    from dataclasses import dataclass as _idl_fallback
+    class IdlStruct:
+        pass
 
 
 # ============================================
@@ -39,20 +45,20 @@ except ImportError:
 
 
 @dataclass
-class DDSAgentRegistration:
+class DDSAgentRegistration(IdlStruct):
     """DDS type for agent registration"""
-    agent_id: str = ""
-    hostname: str = ""
-    port: int = 0
-    model: str = ""
-    model_path: str = ""
-    vram_available_mb: int = 0
-    vram_total_mb: int = 0
-    slots_idle: int = 0
-    slots_total: int = 0
+    agent_id: bounded_str[256] = ""
+    hostname: bounded_str[256] = ""
+    port: int32 = 0
+    model: bounded_str[256] = ""
+    model_path: bounded_str[512] = ""
+    vram_available_mb: int32 = 0
+    vram_total_mb: int32 = 0
+    slots_idle: int32 = 0
+    slots_total: int32 = 0
     vision_enabled: bool = False
     reasoning_enabled: bool = False
-    registered_at: int = 0
+    registered_at: int32 = 0
 
     def to_model(self) -> AgentRegistration:
         return AgentRegistration(
@@ -89,16 +95,16 @@ class DDSAgentRegistration:
 
 
 @dataclass
-class DDSAgentStatus:
+class DDSAgentStatus(IdlStruct):
     """DDS type for agent status"""
-    agent_id: str = ""
-    state: str = "idle"
-    current_slots: int = 0
-    idle_slots: int = 1
-    memory_usage_mb: int = 0
-    vram_usage_mb: int = 0
-    current_model: str = ""
-    last_heartbeat: int = 0
+    agent_id: bounded_str[256] = ""
+    state: bounded_str[64] = "idle"
+    current_slots: int32 = 0
+    idle_slots: int32 = 1
+    memory_usage_mb: int32 = 0
+    vram_usage_mb: int32 = 0
+    current_model: bounded_str[256] = ""
+    last_heartbeat: int32 = 0
 
     def to_model(self) -> AgentStatus:
         return AgentStatus(
@@ -114,17 +120,17 @@ class DDSAgentStatus:
 
 
 @dataclass
-class DDSTaskRequest:
+class DDSTaskRequest(IdlStruct):
     """DDS type for task request"""
-    task_id: str = ""
-    requester_id: str = ""
-    task_type: str = "chat"
-    messages_json: str = "[]"
-    priority: int = 5
-    timeout_ms: int = 30000
+    task_id: bounded_str[256] = ""
+    requester_id: bounded_str[256] = ""
+    task_type: bounded_str[64] = "chat"
+    messages_json: bounded_str[16384] = "[]"
+    priority: int32 = 5
+    timeout_ms: int32 = 30000
     requires_context: bool = False
-    context_id: str = ""
-    created_at: int = 0
+    context_id: bounded_str[256] = ""
+    created_at: int32 = 0
 
     def to_model(self) -> AgentTaskRequest:
         from .models import ChatMessage, TaskType
@@ -158,18 +164,18 @@ class DDSTaskRequest:
 
 
 @dataclass
-class DDSTaskResponse:
+class DDSTaskResponse(IdlStruct):
     """DDS type for task response"""
-    task_id: str = ""
-    agent_id: str = ""
-    content: str = ""
+    task_id: bounded_str[256] = ""
+    agent_id: bounded_str[256] = ""
+    content: bounded_str[16384] = ""
     is_final: bool = True
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    processing_time_ms: int = 0
+    prompt_tokens: int32 = 0
+    completion_tokens: int32 = 0
+    processing_time_ms: int32 = 0
     success: bool = True
-    error_message: str = ""
-    created_at: int = 0
+    error_message: bounded_str[1024] = ""
+    created_at: int32 = 0
 
     def to_model(self) -> AgentTaskResponse:
         return AgentTaskResponse(
