@@ -9,11 +9,11 @@ import time
 from typing import Dict, List, Optional
 from aiohttp import web
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.registry import AgentRegistry, AgentInfo
-from orchestrator.scheduler import TaskScheduler, Task, TaskPriority
-from orchestrator.selector import AgentSelector, SelectionCriteria, TaskType
-from orchestrator.dds import DDSLayer, AgentTaskRequest
+from config import OrchestratorConfig
+from registry import AgentRegistry, AgentInfo
+from scheduler import TaskScheduler, Task, TaskPriority
+from selector import AgentSelector, SelectionCriteria, TaskType
+from dds import DDSLayer, AgentTaskRequest
 
 logger = logging.getLogger(__name__)
 

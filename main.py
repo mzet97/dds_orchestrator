@@ -8,15 +8,15 @@ import logging
 import sys
 from pathlib import Path
 
-# Add parent to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add current directory to path
+sys.path.insert(0, str(Path(__file__).parent))
 
-from orchestrator.server import OrchestratorServer
-from orchestrator.config import OrchestratorConfig, load_config_from_env
-from orchestrator.registry import AgentRegistry
-from orchestrator.scheduler import TaskScheduler
-from orchestrator.selector import AgentSelector
-from orchestrator.dds import DDSLayer
+from server import OrchestratorServer
+from config import OrchestratorConfig, load_config_from_env
+from registry import AgentRegistry
+from scheduler import TaskScheduler
+from selector import AgentSelector
+from dds import DDSLayer
 
 
 def setup_logging(level: str):

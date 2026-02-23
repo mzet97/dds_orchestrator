@@ -9,14 +9,14 @@ import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add current directory to path
+sys.path.insert(0, str(Path(__file__).parent))
 
-from orchestrator.server import OrchestratorServer
-from orchestrator.config import OrchestratorConfig
-from orchestrator.registry import AgentRegistry
-from orchestrator.scheduler import TaskScheduler
-from orchestrator.dds import DDSLayer
+from server import OrchestratorServer
+from config import OrchestratorConfig
+from registry import AgentRegistry
+from scheduler import TaskScheduler
+from dds import DDSLayer
 
 
 async def main():
