@@ -208,56 +208,57 @@ class DDSLayer:
         """Create DDS topics"""
         from cyclonedds.topic import Topic
         from cyclonedds.idl import IdlStruct
-        from cyclonedds.idl.types import string, long, boolean, sequence
+        # Using new cyclonedds API - bounded_str[N] instead of string, int32 instead of long
+        from cyclonedds.idl.types import bounded_str, int32, boolean, sequence
 
         # Define IDL types dynamically for Orchestrator topics
         # Agent Registration
         class AgentRegistrationType(IdlStruct):
-            agent_id: string
-            hostname: string
-            port: long
-            model: string
-            vram_available_mb: long
-            slots_idle: long
+            agent_id: bounded_str[256]
+            hostname: bounded_str[256]
+            port: int32
+            model: bounded_str[256]
+            vram_available_mb: int32
+            slots_idle: int32
             vision_enabled: boolean
             reasoning_enabled: boolean
-            registered_at: long
+            registered_at: int32
 
         # Agent Status
         class AgentStatusType(IdlStruct):
-            agent_id: string
-            state: string
-            current_slots: long
-            idle_slots: long
-            memory_usage_mb: long
-            vram_usage_mb: long
-            current_model: string
-            last_heartbeat: long
+            agent_id: bounded_str[256]
+            state: bounded_str[64]
+            current_slots: int32
+            idle_slots: int32
+            memory_usage_mb: int32
+            vram_usage_mb: int32
+            current_model: bounded_str[256]
+            last_heartbeat: int32
 
         # Task Request
         class TaskRequestType(IdlStruct):
-            task_id: string
-            requester_id: string
-            task_type: string
-            messages_json: string
-            priority: long
-            timeout_ms: long
+            task_id: bounded_str[256]
+            requester_id: bounded_str[256]
+            task_type: bounded_str[64]
+            messages_json: bounded_str[16384]
+            priority: int32
+            timeout_ms: int32
             requires_context: boolean
-            context_id: string
-            created_at: long
+            context_id: bounded_str[256]
+            created_at: int32
 
         # Task Response
         class TaskResponseType(IdlStruct):
-            task_id: string
-            agent_id: string
-            content: string
+            task_id: bounded_str[256]
+            agent_id: bounded_str[256]
+            content: bounded_str[16384]
             is_final: boolean
-            prompt_tokens: long
-            completion_tokens: long
-            processing_time_ms: long
+            prompt_tokens: int32
+            completion_tokens: int32
+            processing_time_ms: int32
             success: boolean
-            error_message: string
-            created_at: long
+            error_message: bounded_str[1024]
+            created_at: int32
 
         # Store types for later use
         self._topic_types = {
