@@ -292,35 +292,27 @@ class OrchestratorServer:
         # Submit to scheduler
         await self.scheduler.submit_task(task)
 
-        # If DDS available, send via DDS
-        if self.dds.is_available():
-            dds_request = AgentTaskRequest(
-                task_id=task.task_id,
-                requester_id="orchestrator",
-                task_type=task.task_type,
-                messages=messages,
-                priority=priority,
-                timeout_ms=task.timeout_ms,
-                requires_context=task.requires_context,
-            )
-            await self.dds.publish_agent_request(dds_request)
-        else:
-            # HTTP fallback - send directly to agent
-            agent_url = f"http://{agent.hostname}:{agent.port}"
-            result = await self.dds.send_request_via_http(
-                agent_url,
-                {"prompt": messages[-1].get("content", ""), "max_tokens": max_tokens}
-            )
+        # Always use HTTP to communicate with agent
+        # (DDS is for inter-orchestrator communication, not for orchestrator→agent)
+        # The agent only listens on HTTP, not DDS topics
+        agent_url = f"http://{agent.hostname}:{agent.port}"
 
-            # Complete task with result
-            await self.scheduler.complete_task(
-                task.task_id,
-                response=result.get("response", ""),
-                processing_time_ms=result.get("processing_time_ms", 0)
-            )
+        logger.info(f"Sending request to agent at {agent_url}")
 
-            # Update agent status
-            await self.registry.update_heartbeat(agent.agent_id, status="idle", slots_idle=agent.slots_idle)
+        result = await self.dds.send_request_via_http(
+            agent_url,
+            {"prompt": messages[-1].get("content", ""), "max_tokens": max_tokens}
+        )
+
+        # Complete task with result
+        await self.scheduler.complete_task(
+            task.task_id,
+            response=result.get("response", ""),
+            processing_time_ms=result.get("processing_time_ms", 0)
+        )
+
+        # Update agent status
+        await self.registry.update_heartbeat(agent.agent_id, status="idle", slots_idle=agent.slots_idle)
 
         return web.json_response({
             "task_id": task.task_id,
