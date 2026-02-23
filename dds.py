@@ -332,6 +332,9 @@ class DDSLayer:
             TOPIC_CLIENT_RESPONSE: DataWriter(
                 self.participant, self.topics[TOPIC_CLIENT_RESPONSE], self.qos_reliable
             ),
+            TOPIC_CLIENT_REQUEST: DataWriter(
+                self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_reliable
+            ),
         }
 
         # Create subscribers with readers (for receiving from clients and agents)
