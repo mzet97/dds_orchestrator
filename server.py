@@ -132,6 +132,10 @@ class OrchestratorServer:
 
                 if client_requests:
                     logger.info(f"Received {len(client_requests)} client requests via DDS")
+                else:
+                    # Debug: check if there are any messages at all
+                    # This helps debug if the reader is working
+                    pass
 
                 for req in client_requests:
                     await self._process_dds_client_request(req)

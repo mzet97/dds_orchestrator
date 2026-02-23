@@ -368,7 +368,7 @@ class DDSLayer:
                     for key, value in data.items():
                         setattr(msg, key, value)
                     self.publishers[topic].write(msg)
-                    logger.debug(f"Published to {topic}: {data}")
+                    logger.info(f"Published to {topic}: {data}")
             except Exception as e:
                 logger.error(f"Failed to publish to {topic}: {e}")
         else:
