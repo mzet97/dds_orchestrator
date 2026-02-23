@@ -49,7 +49,7 @@ class ClientTaskRequest:
     request_id: str
     client_id: str
     task_type: str
-    messages: List[dict]
+    messages_json: str  # JSON string of messages
     priority: int
     timeout_ms: int
     requires_context: bool
