@@ -363,8 +363,10 @@ class DDSLayer:
             try:
                 topic_type = self._topic_types.get(topic)
                 if topic_type:
-                    # Create message instance and write
-                    msg = topic_type(**data)
+                    # Create message instance and write - IdlStruct needs empty init then assign
+                    msg = topic_type()
+                    for key, value in data.items():
+                        setattr(msg, key, value)
                     self.publishers[topic].write(msg)
                     logger.debug(f"Published to {topic}: {data}")
             except Exception as e:
