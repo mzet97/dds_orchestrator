@@ -357,6 +357,30 @@ class DDSLayer:
         """Read agent task responses"""
         return self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms)
 
+    async def wait_for_agent_response(self, task_id: str, timeout_ms: int = 60000) -> dict:
+        """Wait for a specific agent response by task_id"""
+        import asyncio
+
+        if not self.dds_available:
+            logger.warning("DDS not available, cannot wait for response")
+            return {"content": "", "error": "DDS not available"}
+
+        start_time = time.time()
+        timeout_seconds = timeout_ms / 1000.0
+
+        while time.time() - start_time < timeout_seconds:
+            responses = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=100)
+
+            for response in responses:
+                if response.get("task_id") == task_id:
+                    logger.info(f"Received response for task {task_id}")
+                    return response
+
+            await asyncio.sleep(0.01)  # Small sleep to avoid CPU spinning
+
+        logger.warning(f"Timeout waiting for response for task {task_id}")
+        return {"content": "", "error": "Timeout waiting for response"}
+
     async def subscribe(self, topic: str, handler: Callable):
         """Subscribe to topic with handler"""
         self.handlers[topic] = handler

@@ -261,7 +261,7 @@ class OrchestratorServer:
         )
 
         # Get any available agent from registry (simpler approach)
-        agents = await self.registry.list_agents()
+        agents = await self.registry.get_available_agents()
         if not agents:
             return web.json_response({
                 "error": "No agents available for this task type",
@@ -292,23 +292,28 @@ class OrchestratorServer:
         # Submit to scheduler
         await self.scheduler.submit_task(task)
 
-        # Always use HTTP to communicate with agent
-        # (DDS is for inter-orchestrator communication, not for orchestrator→agent)
-        # The agent only listens on HTTP, not DDS topics
-        agent_url = f"http://{agent.hostname}:{agent.port}"
-
-        logger.info(f"Sending request to agent at {agent_url}")
-
-        result = await self.dds.send_request_via_http(
-            agent_url,
-            {"prompt": messages[-1].get("content", ""), "max_tokens": max_tokens}
+        # Send task to agent via DDS topic
+        # Agent subscribes to agent/request topic
+        dds_request = AgentTaskRequest(
+            task_id=task.task_id,
+            requester_id="orchestrator",
+            task_type=task.task_type,
+            messages=messages,
+            priority=priority,
+            timeout_ms=task.timeout_ms,
+            requires_context=task.requires_context,
         )
+        await self.dds.publish_agent_request(dds_request)
+
+        # Wait for response from agent via DDS topic
+        # Agent publishes to agent/response topic
+        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=task.timeout_ms)
 
         # Complete task with result
         await self.scheduler.complete_task(
             task.task_id,
-            response=result.get("response", ""),
-            processing_time_ms=result.get("processing_time_ms", 0)
+            response=response_data.get("content", ""),
+            processing_time_ms=response_data.get("processing_time_ms", 0)
         )
 
         # Update agent status
