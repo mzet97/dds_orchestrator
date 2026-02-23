@@ -260,22 +260,17 @@ class OrchestratorServer:
             priority=priority
         )
 
-        # Select best agent using selector (considera especialização)
-        selected_agent_id = await self.selector.select_agent(criteria)
-
-        if not selected_agent_id:
-            # Fallback: usar registry diretamente
-            agent = await self.registry.select_agent(
-                requirements={"model": data.get("model")}
-            )
-            if agent:
-                selected_agent_id = agent.agent_id
-
-        if not selected_agent_id:
+        # Get any available agent from registry (simpler approach)
+        agents = await self.registry.list_agents()
+        if not agents:
             return web.json_response({
                 "error": "No agents available for this task type",
                 "code": "NO_AGENTS"
             }, status=503)
+
+        # Use first available agent (simplified - can be improved)
+        selected_agent_id = agents[0].agent_id
+        logger.info(f"Selected agent: {selected_agent_id}")
 
         # Get agent info from registry
         agent = await self.registry.get_agent(selected_agent_id)
