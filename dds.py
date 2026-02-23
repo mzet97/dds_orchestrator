@@ -340,7 +340,7 @@ class DDSLayer:
                 self.participant, self.topics[TOPIC_AGENT_STATUS], self.qos_best_effort
             ),
             TOPIC_CLIENT_REQUEST: DataReader(
-                self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_best_effort
+                self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_reliable
             ),
             TOPIC_AGENT_RESPONSE: DataReader(
                 self.participant, self.topics[TOPIC_AGENT_RESPONSE], self.qos_reliable
