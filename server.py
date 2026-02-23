@@ -13,7 +13,7 @@ from config import OrchestratorConfig
 from registry import AgentRegistry, AgentInfo
 from scheduler import TaskScheduler, Task, TaskPriority
 from selector import AgentSelector, SelectionCriteria, TaskType
-from dds import DDSLayer, AgentTaskRequest
+from dds import DDSLayer, AgentTaskRequest, ClientTaskRequest
 
 logger = logging.getLogger(__name__)
 
