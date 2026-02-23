@@ -261,12 +261,36 @@ class DDSLayer:
             error_message: bounded_str[1024]
             created_at: int32
 
+        # Client request/response types
+        class ClientRequestType(IdlStruct):
+            request_id: bounded_str[256]
+            client_id: bounded_str[256]
+            task_type: bounded_str[64]
+            messages_json: bounded_str[16384]
+            priority: int32
+            timeout_ms: int32
+            requires_context: bool
+            created_at: int32
+
+        class ClientResponseType(IdlStruct):
+            request_id: bounded_str[256]
+            client_id: bounded_str[256]
+            content: bounded_str[16384]
+            is_final: bool
+            prompt_tokens: int32
+            completion_tokens: int32
+            processing_time_ms: int32
+            success: bool
+            error_message: bounded_str[1024]
+
         # Store types for later use
         self._topic_types = {
             TOPIC_AGENT_REGISTER: AgentRegistrationType,
             TOPIC_AGENT_STATUS: AgentStatusType,
             TOPIC_AGENT_REQUEST: TaskRequestType,
             TOPIC_AGENT_RESPONSE: TaskResponseType,
+            TOPIC_CLIENT_REQUEST: ClientRequestType,
+            TOPIC_CLIENT_RESPONSE: ClientResponseType,
         }
 
         # Create topics
@@ -297,7 +321,7 @@ class DDSLayer:
             Policy.History.KeepLast(5),
         )
 
-        # Create publishers
+        # Create publishers (for sending responses to clients and agents)
         self.publishers = {
             TOPIC_AGENT_REQUEST: DataWriter(
                 self.participant, self.topics[TOPIC_AGENT_REQUEST], self.qos_reliable
@@ -305,12 +329,18 @@ class DDSLayer:
             TOPIC_AGENT_REGISTER: DataWriter(
                 self.participant, self.topics[TOPIC_AGENT_REGISTER], self.qos_reliable
             ),
+            TOPIC_CLIENT_RESPONSE: DataWriter(
+                self.participant, self.topics[TOPIC_CLIENT_RESPONSE], self.qos_reliable
+            ),
         }
 
-        # Create subscribers with readers
+        # Create subscribers with readers (for receiving from clients and agents)
         self.subscribers = {
             TOPIC_AGENT_STATUS: DataReader(
                 self.participant, self.topics[TOPIC_AGENT_STATUS], self.qos_best_effort
+            ),
+            TOPIC_CLIENT_REQUEST: DataReader(
+                self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_best_effort
             ),
             TOPIC_AGENT_RESPONSE: DataReader(
                 self.participant, self.topics[TOPIC_AGENT_RESPONSE], self.qos_reliable
@@ -359,6 +389,34 @@ class DDSLayer:
     async def read_responses(self, timeout_ms: int = 100) -> list:
         """Read agent task responses"""
         return self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms)
+
+    async def read_client_requests(self, timeout_ms: int = 100) -> list:
+        """Read client task requests"""
+        return self.read_messages(TOPIC_CLIENT_REQUEST, timeout_ms)
+
+    async def wait_for_client_response(self, request_id: str, timeout_ms: int = 60000) -> dict:
+        """Wait for a specific client response by request_id"""
+        import asyncio
+
+        if not self.dds_available:
+            logger.warning("DDS not available, cannot wait for response")
+            return {"content": "", "error": "DDS not available"}
+
+        start_time = time.time()
+        timeout_seconds = timeout_ms / 1000.0
+
+        while time.time() - start_time < timeout_seconds:
+            responses = self.read_messages(TOPIC_CLIENT_RESPONSE, timeout_ms=100)
+
+            for response in responses:
+                if response.get("request_id") == request_id:
+                    logger.info(f"Received response for client request {request_id}")
+                    return response
+
+            await asyncio.sleep(0.01)
+
+        logger.warning(f"Timeout waiting for response for client request {request_id}")
+        return {"content": "", "error": "Timeout waiting for response"}
 
     async def wait_for_agent_response(self, task_id: str, timeout_ms: int = 60000) -> dict:
         """Wait for a specific agent response by task_id"""
