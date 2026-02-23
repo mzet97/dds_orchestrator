@@ -1,0 +1,25 @@
+# DDS-LLM Orchestrator Configuration
+
+# Server settings
+host: "0.0.0.0"
+port: 8080
+
+# DDS settings
+dds_domain: 0
+dds_enabled: true
+
+# Agent settings
+max_agents: 10
+agent_timeout_seconds: 300
+
+# Task settings
+max_concurrent_tasks: 50
+task_timeout_seconds: 120
+
+# Logging
+log_level: "INFO"
+
+# Model defaults
+default_model: "glm-4.6v-flash"
+default_max_tokens: 256
+default_temperature: 0.7
