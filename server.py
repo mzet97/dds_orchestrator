@@ -56,12 +56,22 @@ class OrchestratorServer:
         self.app.router.add_post('/agents/register', self.handle_register_agent)
         self.app.router.add_delete('/agents/{agent_id}', self.handle_unregister_agent)
 
+        # API v1 compatibility
+        self.app.router.add_get('/api/v1/agents', self.handle_list_agents)
+        self.app.router.add_get('/api/v1/agents/{agent_id}', self.handle_get_agent)
+        self.app.router.add_post('/api/v1/agents/register', self.handle_register_agent)
+        self.app.router.add_delete('/api/v1/agents/{agent_id}', self.handle_unregister_agent)
+
         # Task management
         self.app.router.add_post('/chat', self.handle_chat)
         self.app.router.add_post('/generate', self.handle_generate)
         self.app.router.add_get('/tasks/{task_id}', self.handle_get_task)
         self.app.router.add_delete('/tasks/{task_id}', self.handle_cancel_task)
         self.app.router.add_get('/tasks', self.handle_list_tasks)
+
+        # API v1 routes (OpenAI compatible)
+        self.app.router.add_post('/v1/chat/completions', self.handle_chat)
+        self.app.router.add_post('/v1/completions', self.handle_generate)
 
         # DDS topics (if enabled)
         if self.dds.is_available():
@@ -178,10 +188,17 @@ class OrchestratorServer:
 
     async def handle_register_agent(self, request: web.Request) -> web.Response:
         """Register a new agent"""
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception as e:
+            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
+
+        # Generate agent_id if not provided
+        import uuid
+        agent_id = data.get("agent_id") or str(uuid.uuid4())
 
         agent_info = AgentInfo(
-            agent_id=data["agent_id"],
+            agent_id=agent_id,
             hostname=data.get("hostname", "unknown"),
             port=data.get("port", 8080),
             model=data.get("model", "unknown"),
@@ -194,11 +211,14 @@ class OrchestratorServer:
         await self.registry.register_agent(agent_info)
 
         # Registrar também no selector para seleção inteligente
-        await self.selector.register_agent(
-            agent_id=agent_info.agent_id,
-            specialization=agent_info.specialization if hasattr(agent_info, 'specialization') else "generic",
-            max_load=agent_info.slots_idle
-        )
+        try:
+            await self.selector.register_agent(
+                agent_id=agent_info.agent_id,
+                specialization="generic",
+                max_load=agent_info.slots_idle
+            )
+        except Exception as e:
+            logger.warning(f"Failed to register in selector: {e}")
 
         return web.json_response({
             "success": True,
