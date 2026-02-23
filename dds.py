@@ -209,7 +209,8 @@ class DDSLayer:
         from cyclonedds.topic import Topic
         from cyclonedds.idl import IdlStruct
         # Using new cyclonedds API - bounded_str[N] instead of string, int32 instead of long
-        from cyclonedds.idl.types import bounded_str, int32, boolean, sequence
+        # boolean doesn't exist in new API, use Python's bool
+        from cyclonedds.idl.types import bounded_str, int32, sequence
 
         # Define IDL types dynamically for Orchestrator topics
         # Agent Registration
@@ -220,8 +221,8 @@ class DDSLayer:
             model: bounded_str[256]
             vram_available_mb: int32
             slots_idle: int32
-            vision_enabled: boolean
-            reasoning_enabled: boolean
+            vision_enabled: bool
+            reasoning_enabled: bool
             registered_at: int32
 
         # Agent Status
@@ -243,7 +244,7 @@ class DDSLayer:
             messages_json: bounded_str[16384]
             priority: int32
             timeout_ms: int32
-            requires_context: boolean
+            requires_context: bool
             context_id: bounded_str[256]
             created_at: int32
 
@@ -252,11 +253,11 @@ class DDSLayer:
             task_id: bounded_str[256]
             agent_id: bounded_str[256]
             content: bounded_str[16384]
-            is_final: boolean
+            is_final: bool
             prompt_tokens: int32
             completion_tokens: int32
             processing_time_ms: int32
-            success: boolean
+            success: bool
             error_message: bounded_str[1024]
             created_at: int32
 
