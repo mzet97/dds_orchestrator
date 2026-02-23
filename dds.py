@@ -455,7 +455,19 @@ class DDSLayer:
 
     async def publish_agent_request(self, request: AgentTaskRequest):
         """Publish task request to agents"""
-        data = asdict(request)
+        import json
+        # Convert to DDS format - messages need to be JSON string
+        data = {
+            "task_id": request.task_id,
+            "requester_id": request.requester_id,
+            "task_type": request.task_type,
+            "messages_json": json.dumps(request.messages),
+            "priority": request.priority,
+            "timeout_ms": request.timeout_ms,
+            "requires_context": request.requires_context,
+            "context_id": "",
+            "created_at": int(time.time()),
+        }
         await self.publish(TOPIC_AGENT_REQUEST, data)
 
     async def publish_orchestrator_command(self, command_id: str,
@@ -473,7 +485,17 @@ class DDSLayer:
     # Client DDS communication methods
     async def publish_client_request(self, request: ClientTaskRequest):
         """Publish client task request to orchestrator"""
-        data = asdict(request)
+        # Convert to DDS format - add created_at
+        data = {
+            "request_id": request.request_id,
+            "client_id": request.client_id,
+            "task_type": request.task_type,
+            "messages_json": request.messages_json,
+            "priority": request.priority,
+            "timeout_ms": request.timeout_ms,
+            "requires_context": request.requires_context,
+            "created_at": int(time.time()),
+        }
         await self.publish(TOPIC_CLIENT_REQUEST, data)
 
     async def subscribe_client_request(self, handler: Callable):
