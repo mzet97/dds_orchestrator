@@ -380,9 +380,16 @@ class DDSLayer:
             return []
 
         try:
-            from cyclonedds.util import duration
-            samples = self.subscribers[topic].take(timeout=duration(milliseconds=timeout_ms))
-            result = [s.data for s in samples if s.data]
+            # Use read() instead of take() with timeout - read returns available samples
+            samples = self.subscribers[topic].read()
+            result = []
+            for s in samples:
+                # Handle both DataSample objects and raw data
+                if hasattr(s, 'data'):
+                    if s.data:
+                        result.append(s.data)
+                elif s:
+                    result.append(s)
             if result:
                 logger.info(f"Read {len(result)} messages from {topic}")
             return result
