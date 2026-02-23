@@ -279,7 +279,8 @@ class DDSLayer:
         """Create publishers and subscribers"""
         from cyclonedds.pub import DataWriter
         from cyclonedds.sub import DataReader
-        from cyclonedds.core import Qos, Policy
+        from cyclonedds.core import Policy
+        from cyclonedds.qos import Qos
         from cyclonedds.util import duration
 
         # QoS for reliable communication (requests, responses)
