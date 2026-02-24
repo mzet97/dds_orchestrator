@@ -143,7 +143,7 @@ class OrchestratorServer:
                 client_requests = await self.dds.read_client_requests(timeout_ms=100)
 
                 if client_requests:
-                    print(f"RECEIVED {len(client_requests)} CLIENT REQUESTS!", flush=True, file=sys.stderr)
+                    # print(f"RECEIVED {len(client_requests)} CLIENT REQUESTS!", flush=True, file=sys.stderr)
                     logger.info(f"Received {len(client_requests)} client requests via DDS")
                 else:
                     # Debug: check if there are any messages at all
@@ -151,20 +151,40 @@ class OrchestratorServer:
                     pass  # Debug: no requests found
 
                 for req in client_requests:
-                    await self._process_dds_client_request(req)
+                    # Filter out empty/phantom DDS samples (dispose notifications, etc.)
+                    request_id = getattr(req, "request_id", "")
+                    if not request_id:
+                        logger.debug("Skipping empty DDS client request (no request_id)")
+                        continue
+                    messages_json = getattr(req, "messages_json", "")
+                    if not messages_json or messages_json == "[]":
+                        logger.debug(f"Skipping empty DDS client request {request_id} (no messages)")
+                        continue
+                    # Process valid requests concurrently
+                    task = asyncio.create_task(self._process_dds_client_request(req))
+                    task.add_done_callback(lambda t, rid=request_id: self._handle_task_completion(t, rid))
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in DDS client loop: {e}")
 
-    async def _process_dds_client_request(self, req: dict):
-        """Process a DDS client request"""
+    def _handle_task_completion(self, task, request_id):
+        """Handle completion of a background task"""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info(f"Task for request {request_id} was cancelled")
+        except Exception as e:
+            logger.error(f"Error processing request {request_id}: {e}", exc_info=True)
+
+    async def _process_dds_client_request(self, req):
+        """Process a DDS client request (req is an IDL struct, not a dict)"""
         import json
 
-        request_id = req.get("request_id")
-        client_id = req.get("client_id")
-        messages_json = req.get("messages_json", "[]")
+        request_id = getattr(req, "request_id", "unknown")
+        client_id = getattr(req, "client_id", "unknown")
+        messages_json = getattr(req, "messages_json", "[]")
 
         try:
             messages = json.loads(messages_json)
@@ -196,30 +216,41 @@ class OrchestratorServer:
         await self.dds.publish_agent_request(dds_request)
 
         # Wait for agent response
-        agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=60000)
+        agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
 
         # Send response back to client via DDS
-        content = agent_response.get("content", "")
+        # agent_response can be dict (timeout error) or IdlStruct (DDS response)
+        if isinstance(agent_response, dict):
+            content = agent_response.get("content", "")
+            success = agent_response.get("success", False)
+            prompt_tokens = agent_response.get("prompt_tokens", 0)
+            completion_tokens = agent_response.get("completion_tokens", 0)
+            processing_time_ms = agent_response.get("processing_time_ms", 0)
+            error = agent_response.get("error", "")
+        else:
+            content = getattr(agent_response, "content", "")
+            success = getattr(agent_response, "success", False)
+            prompt_tokens = getattr(agent_response, "prompt_tokens", 0)
+            completion_tokens = getattr(agent_response, "completion_tokens", 0)
+            processing_time_ms = getattr(agent_response, "processing_time_ms", 0)
+            error = getattr(agent_response, "error_message", "")
+
         await self._send_dds_client_response(
-            request_id,
-            client_id,
-            content,
-            success=agent_response.get("success", 1),
-            prompt_tokens=agent_response.get("prompt_tokens", 0),
-            completion_tokens=agent_response.get("completion_tokens", 0),
-            processing_time_ms=agent_response.get("processing_time_ms", 0)
+            request_id, client_id, content,
+            success=success, error=error,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            processing_time_ms=processing_time_ms,
         )
 
-    async def _send_dds_client_response(self, request_id, client_id, content, success=1, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0):
-        """Send response to client via DDS"""
-        from dataclasses import asdict
-        from dds import ClientTaskResponse
+    async def _send_dds_client_response(self, request_id, client_id, content, success=True, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0):
+        """Send response to client via DDS using IDL-generated ClientResponse type"""
+        from orchestrator import ClientResponse
 
-        response = ClientTaskResponse(
+        response = ClientResponse(
             request_id=request_id,
-            client_id=client_id,
             content=content,
-            is_final=1,
+            is_final=True,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             processing_time_ms=processing_time_ms,
@@ -425,7 +456,7 @@ class OrchestratorServer:
 
             # Wait for response from agent via DDS topic
             # Agent publishes to agent/response topic
-            response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=10000)  # 10s timeout for DDS
+            response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)  # 120s timeout for DDS
             # Only consider success if we got actual content (not just an error message)
             # Response can be either a dict or an IdlStruct object
             content = ""

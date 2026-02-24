@@ -1,145 +1,233 @@
 """
 DDS-LLM Orchestrator Client Examples
-Demonstra como conectar ao orchestrator via diferentes protocolos
+Demonstra como conectar ao orchestrator via HTTP ou DDS puro
 """
 
 import asyncio
-import aiohttp
-import requests
+import json
+import sys
+import time
+import uuid
+import argparse
 from typing import List, Dict, Any
 
+import aiohttp
+import requests
+
+
+# ============================================
+# HTTP Clients (legacy)
+# ============================================
 
 class OrchestratorClient:
-    """Cliente base para连接到 orchestrator"""
+    """Cliente async HTTP para o orchestrator"""
 
     def __init__(self, base_url: str = "http://localhost:8080"):
         self.base_url = base_url
 
     async def health_check(self) -> dict:
-        """Verifica saúde do orchestrator"""
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{self.base_url}/health") as resp:
                 return await resp.json()
 
     async def chat(self, messages: List[Dict], **kwargs) -> dict:
-        """Envia mensagem de chat"""
         payload = {
             "messages": messages,
             "max_tokens": kwargs.get("max_tokens", 256),
             "temperature": kwargs.get("temperature", 0.7),
             "task_type": kwargs.get("task_type", "chat"),
             "priority": kwargs.get("priority", 5),
-            "requires_vision": kwargs.get("requires_vision", False),
-            "requires_embedding": kwargs.get("requires_embedding", False),
         }
-
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{self.base_url}/chat", json=payload) as resp:
                 return await resp.json()
 
     async def generate(self, prompt: str, **kwargs) -> dict:
-        """Gera texto a partir de prompt"""
         messages = [{"role": "user", "content": prompt}]
         return await self.chat(messages, **kwargs)
 
-    async def get_task_status(self, task_id: str) -> dict:
-        """Verifica status de uma tarefa"""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.base_url}/tasks/{task_id}") as resp:
-                return await resp.json()
-
     async def list_agents(self) -> dict:
-        """Lista agentes disponíveis"""
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{self.base_url}/agents") as resp:
                 return await resp.json()
 
 
 class SyncOrchestratorClient:
-    """Cliente síncrono (sem async)"""
+    """Cliente síncrono HTTP"""
 
     def __init__(self, base_url: str = "http://localhost:8080"):
         self.base_url = base_url
 
-    def health_check(self) -> dict:
-        """Verifica saúde do orchestrator"""
-        resp = requests.get(f"{self.base_url}/health")
-        return resp.json()
-
     def chat(self, messages: List[Dict], **kwargs) -> dict:
-        """Envia mensagem de chat"""
         payload = {
             "messages": messages,
             "max_tokens": kwargs.get("max_tokens", 256),
             "temperature": kwargs.get("temperature", 0.7),
-            "task_type": kwargs.get("task_type", "chat"),
         }
         resp = requests.post(f"{self.base_url}/chat", json=payload)
         return resp.json()
 
     def generate(self, prompt: str, **kwargs) -> dict:
-        """Gera texto a partir de prompt"""
-        messages = [{"role": "user", "content": prompt}]
-        return self.chat(messages, **kwargs)
-
-    def list_agents(self) -> dict:
-        """Lista agentes disponíveis"""
-        resp = requests.get(f"{self.base_url}/agents")
-        return resp.json()
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
 
 
-# Exemplos de uso
-async def example_async():
-    """Exemplo de uso assíncrono"""
-    client = OrchestratorClient("http://localhost:8080")
+# ============================================
+# DDS Client (100% DDS, no HTTP)
+# ============================================
 
-    # Check health
-    health = await client.health_check()
-    print(f"Health: {health}")
+class DDSOrchestratorClient:
+    """
+    Pure DDS client for the orchestrator.
+    Communicates via client/request and client/response topics.
+    No HTTP involved in the data path.
+    """
 
-    # Chat simple
-    response = await client.chat([
-        {"role": "user", "content": "Olá, como você está?"}
-    ])
-    print(f"Chat response: {response}")
+    def __init__(self, domain_id: int = 0):
+        self.domain_id = domain_id
+        self.dds_available = False
+        self._init_dds()
 
-    # List agents
-    agents = await client.list_agents()
-    print(f"Agents: {agents}")
+    def _init_dds(self):
+        try:
+            from cyclonedds.domain import DomainParticipant
+            from cyclonedds.topic import Topic
+            from cyclonedds.pub import DataWriter
+            from cyclonedds.sub import DataReader
+            from cyclonedds.core import Policy
+            from cyclonedds.qos import Qos
+            from cyclonedds.util import duration
+
+            from orchestrator import ClientRequest, ClientResponse
+
+            self._ClientRequest = ClientRequest
+            self._ClientResponse = ClientResponse
+
+            self.participant = DomainParticipant(self.domain_id)
+
+            # Topics
+            self.topic_request = Topic(self.participant, "client/request", ClientRequest)
+            self.topic_response = Topic(self.participant, "client/response", ClientResponse)
+
+            # QoS matching orchestrator (Reliable, Volatile, KeepLast 1)
+            qos = Qos(
+                Policy.Reliability.Reliable(duration(seconds=10)),
+                Policy.Durability.Volatile,
+                Policy.History.KeepLast(1),
+            )
+
+            self.writer = DataWriter(self.participant, self.topic_request, qos)
+            self.reader = DataReader(self.participant, self.topic_response, qos)
+
+            self.dds_available = True
+            print(f"[DDS Client] Initialized on domain {self.domain_id}")
+            print(f"[DDS Client] Topics: client/request (write), client/response (read)")
+
+        except ImportError as e:
+            print(f"CycloneDDS not available: {e}")
+        except Exception as e:
+            print(f"Failed to initialize DDS client: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def chat(self, messages: List[Dict], timeout_s: float = 120.0) -> dict:
+        """Send chat request via DDS and wait for response"""
+        if not self.dds_available:
+            return {"error": "DDS not available"}
+
+        request_id = str(uuid.uuid4())
+        messages_json = json.dumps(messages)
+
+        req = self._ClientRequest(
+            request_id=request_id,
+            client_id="dds-client",
+            task_type="chat",
+            messages_json=messages_json,
+            priority=2,
+            timeout_ms=int(timeout_s * 1000),
+            requires_context=False,
+        )
+
+        print(f"[DDS Client] Publishing request {request_id}")
+        self.writer.write(req)
+
+        # Poll for response matching our request_id
+        start = time.time()
+        while time.time() - start < timeout_s:
+            try:
+                samples = self.reader.take()
+                for sample in samples:
+                    if sample and getattr(sample, "request_id", None) == request_id:
+                        elapsed = time.time() - start
+                        return {
+                            "request_id": request_id,
+                            "content": getattr(sample, "content", ""),
+                            "is_final": getattr(sample, "is_final", False),
+                            "prompt_tokens": getattr(sample, "prompt_tokens", 0),
+                            "completion_tokens": getattr(sample, "completion_tokens", 0),
+                            "processing_time_ms": getattr(sample, "processing_time_ms", 0),
+                            "success": getattr(sample, "success", False),
+                            "error_message": getattr(sample, "error_message", ""),
+                            "dds_roundtrip_ms": round(elapsed * 1000, 2),
+                        }
+            except Exception:
+                pass
+            time.sleep(0.005)  # 5ms poll
+
+        return {"error": "Timeout", "request_id": request_id}
+
+    def generate(self, prompt: str, **kwargs) -> dict:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self):
+        if hasattr(self, "participant"):
+            del self.participant
 
 
-def example_sync():
-    """Exemplo de uso síncrono"""
-    client = SyncOrchestratorClient("http://localhost:8080")
+# ============================================
+# CLI
+# ============================================
 
-    # Check health
-    health = client.health_check()
-    print(f"Health: {health}")
+def main():
+    parser = argparse.ArgumentParser(description="DDS-LLM Client")
+    parser.add_argument("prompt", nargs="*", help="Prompt text")
+    parser.add_argument("--dds", action="store_true", help="Use pure DDS (no HTTP)")
+    parser.add_argument("--http", action="store_true", help="Use HTTP client")
+    parser.add_argument("--domain", type=int, default=0, help="DDS domain ID")
+    parser.add_argument("--url", type=str, default="http://localhost:8080", help="Orchestrator URL (HTTP mode)")
+    parser.add_argument("--timeout", type=float, default=120.0, help="Timeout in seconds")
+    args = parser.parse_args()
 
-    # Chat simple
-    response = client.chat([
-        {"role": "user", "content": "Olá, como você está?"}
-    ])
-    print(f"Chat response: {response}")
-
-
-# CLI Example
-def example_cli():
-    """Exemplo de CLI"""
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python client_example.py <prompt>")
+    if not args.prompt:
+        parser.print_help()
         return
 
-    prompt = " ".join(sys.argv[1:])
-    client = SyncOrchestratorClient()
+    prompt = " ".join(args.prompt)
+    messages = [{"role": "user", "content": prompt}]
 
-    print(f"Sending prompt: {prompt}")
-    response = client.generate(prompt)
-    print(f"Response: {response}")
+    if args.dds:
+        print(f"=== DDS Client (domain {args.domain}) ===")
+        client = DDSOrchestratorClient(domain_id=args.domain)
+        t_start = time.time()
+        response = client.chat(messages, timeout_s=args.timeout)
+        t_total = time.time() - t_start
+        print(f"\nResponse ({t_total*1000:.0f}ms):")
+        if "error" in response and response.get("content", "") == "":
+            print(f"  ERROR: {response['error']}")
+        else:
+            print(f"  Content: {response.get('content', '')}")
+            print(f"  Success: {response.get('success')}")
+            print(f"  Tokens: {response.get('prompt_tokens', 0)} prompt + {response.get('completion_tokens', 0)} completion")
+            print(f"  DDS roundtrip: {response.get('dds_roundtrip_ms', 0)}ms")
+        client.close()
+    else:
+        print(f"=== HTTP Client ({args.url}) ===")
+        client = SyncOrchestratorClient(args.url)
+        t_start = time.time()
+        response = client.generate(prompt)
+        t_total = time.time() - t_start
+        print(f"\nResponse ({t_total*1000:.0f}ms):")
+        print(f"  {json.dumps(response, indent=2)}")
 
 
 if __name__ == "__main__":
-    # example_sync()
-    example_cli()
+    main()

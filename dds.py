@@ -10,9 +10,22 @@ import time
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, asdict
 
-# Import shared DDS types
-from dds_types import ClientRequestType, ClientResponseType
-from shared_types import TaskRequestType, TaskResponseType, AgentRegistrationType, AgentStatusType
+# Import generated DDS types (compatible with C++ and other Python components)
+import os
+import sys
+# Add paths for generated IDL types - support both Windows and WSL
+dds_orchestrator_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, dds_orchestrator_dir)
+sys.path.insert(0, r'E:\TI\git\tese\dds_orchestrator')
+sys.path.insert(0, '/mnt/e/TI/git/tese/dds_orchestrator')
+
+# Import types from generated IDL modules
+from orchestrator import (
+    TaskRequest, TaskResponse,
+    AgentRegistration, AgentStatus,
+    ClientRequest, ClientResponse
+)
+from llama import ChatMessage, ChatCompletionRequest, ChatCompletionResponse
 
 logger = logging.getLogger(__name__)
 
@@ -71,19 +84,6 @@ class ClientTaskResponse:
     processing_time_ms: int
     success: int
     error_message: Optional[str]
-
-
-@dataclass
-class AgentRegistration:
-    """Agent registration message"""
-    agent_id: str
-    hostname: str
-    port: int
-    model: str
-    vram_available_mb: int
-    slots_idle: int
-    vision_enabled: bool
-    capabilities: List[str]
 
 
 @dataclass
@@ -217,12 +217,12 @@ class DDSLayer:
 
         # Store types for later use
         self._topic_types = {
-            TOPIC_AGENT_REGISTER: AgentRegistrationType,
-            TOPIC_AGENT_STATUS: AgentStatusType,
-            TOPIC_AGENT_REQUEST: TaskRequestType,
-            TOPIC_AGENT_RESPONSE: TaskResponseType,
-            TOPIC_CLIENT_REQUEST: ClientRequestType,
-            TOPIC_CLIENT_RESPONSE: ClientResponseType,
+            TOPIC_AGENT_REGISTER: AgentRegistration,
+            TOPIC_AGENT_STATUS: AgentStatus,
+            TOPIC_AGENT_REQUEST: TaskRequest,
+            TOPIC_AGENT_RESPONSE: TaskResponse,
+            TOPIC_CLIENT_REQUEST: ClientRequest,
+            TOPIC_CLIENT_RESPONSE: ClientResponse,
         }
 
         # Create topics
@@ -295,10 +295,8 @@ class DDSLayer:
             try:
                 topic_type = self._topic_types.get(topic)
                 if topic_type:
-                    # Create message instance and write - IdlStruct needs empty init then assign
-                    msg = topic_type()
-                    for key, value in data.items():
-                        setattr(msg, key, value)
+                    # Create message instance with all fields via constructor
+                    msg = topic_type(**data)
                     self.publishers[topic].write(msg)
                     logger.info(f"Published to {topic}: {data}")
             except Exception as e:
@@ -451,10 +449,16 @@ class DDSLayer:
         """Subscribe to client requests"""
         await self.subscribe(TOPIC_CLIENT_REQUEST, handler)
 
-    async def publish_client_response(self, response: ClientTaskResponse):
-        """Publish response to client via DDS"""
-        data = asdict(response)
-        await self.publish(TOPIC_CLIENT_RESPONSE, data)
+    async def publish_client_response(self, response):
+        """Publish response to client via DDS (accepts IDL ClientResponse object directly)"""
+        if not self.dds_available:
+            return
+        if TOPIC_CLIENT_RESPONSE in self.publishers:
+            try:
+                self.publishers[TOPIC_CLIENT_RESPONSE].write(response)
+                logger.info(f"Published client response to {TOPIC_CLIENT_RESPONSE}")
+            except Exception as e:
+                logger.error(f"Failed to publish client response: {e}")
 
     async def subscribe_client_response(self, handler: Callable):
         """Subscribe to client responses"""
