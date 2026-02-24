@@ -12,7 +12,6 @@ from dataclasses import dataclass, asdict
 
 # Import shared DDS types
 from dds_types import ClientRequestType, ClientResponseType
-from shared_types import TaskRequestType, TaskResponseType, AgentRegistrationType, AgentStatusType
 
 logger = logging.getLogger(__name__)
 
@@ -212,8 +211,80 @@ class DDSLayer:
         """Create DDS topics"""
         from cyclonedds.topic import Topic
         from cyclonedds.idl import IdlStruct
-        # Use shared types from shared_types module
-        # These are imported at the top of the file
+        # Using new cyclonedds API - bounded_str[N] instead of string, int32 instead of long
+        # boolean doesn't exist in new API, use Python's bool
+        from cyclonedds.idl.types import bounded_str, int32, int64, uint8, sequence
+
+        # Define IDL types dynamically for Orchestrator topics
+        # Agent Registration
+        class AgentRegistrationType(IdlStruct):
+            agent_id: bounded_str[256]
+            hostname: bounded_str[256]
+            port: int32
+            model: bounded_str[256]
+            vram_available_mb: int32
+            slots_idle: int32
+            vision_enabled: bool
+            reasoning_enabled: bool
+            registered_at: int64
+
+        # Agent Status
+        class AgentStatusType(IdlStruct):
+            agent_id: bounded_str[256]
+            state: bounded_str[64]
+            current_slots: int32
+            idle_slots: int32
+            memory_usage_mb: int32
+            vram_usage_mb: int32
+            current_model: bounded_str[256]
+            last_heartbeat: int64
+
+        # Task Request
+        class TaskRequestType(IdlStruct):
+            task_id: bounded_str[256]
+            requester_id: bounded_str[256]
+            task_type: bounded_str[64]
+            messages_json: bounded_str[16384]
+            priority: int32
+            timeout_ms: int32
+            requires_context: int
+            context_id: bounded_str[256]
+            created_at: int64
+
+        # Task Response
+        class TaskResponseType(IdlStruct):
+            task_id: bounded_str[256]
+            agent_id: bounded_str[256]
+            content: bounded_str[16384]
+            is_final: int
+            prompt_tokens: int32
+            completion_tokens: int32
+            processing_time_ms: int32
+            success: int
+            error_message: bounded_str[1024]
+            created_at: int64
+
+        # Client request/response types
+        class ClientRequestType(IdlStruct):
+            request_id: bounded_str[256]
+            client_id: bounded_str[256]
+            task_type: bounded_str[64]
+            messages_json: bounded_str[16384]
+            priority: int32
+            timeout_ms: int32
+            requires_context: int
+            created_at: int64
+
+        class ClientResponseType(IdlStruct):
+            request_id: bounded_str[256]
+            client_id: bounded_str[256]
+            content: bounded_str[16384]
+            is_final: int
+            prompt_tokens: int32
+            completion_tokens: int32
+            processing_time_ms: int32
+            success: int
+            error_message: bounded_str[1024]
 
         # Store types for later use
         self._topic_types = {
@@ -312,8 +383,8 @@ class DDSLayer:
             return []
 
         try:
-            # Use take() to consume messages from the queue
-            samples = self.subscribers[topic].take()
+            # Use read() instead of take() with timeout - read returns available samples
+            samples = self.subscribers[topic].read()
             result = []
             for s in samples:
                 # Handle both DataSample objects and raw data

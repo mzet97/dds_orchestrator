@@ -164,7 +164,7 @@ async def chat_completions(request: ChatCompletionRequest):
         return await chat_completions_stream(request)
 
     # Find available agent
-    agent = await registry.find_agent(model=request.model)
+    agent = await registry.select_agent(requirements={"model": request.model})
 
     if not agent:
         raise HTTPException(status_code=503, detail="No available agents")
@@ -228,7 +228,7 @@ async def chat_completions_websocket(websocket: WebSocket):
         request = ChatCompletionRequest(**data)
 
         # Find available agent from registry
-        agent = await registry.find_agent(model=request.model)
+        agent = await registry.select_agent(requirements={"model": request.model})
         if not agent:
             await websocket.send_json({
                 "error": {"message": "No agents available", "type": "server_error"}
@@ -333,7 +333,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
     from fastapi.responses import StreamingResponse
 
     # Find available agent
-    agent = await registry.find_agent(model=request.model)
+    agent = await registry.select_agent(requirements={"model": request.model})
     if not agent:
         raise HTTPException(status_code=503, detail="No available agents")
 
@@ -551,3 +551,5 @@ async def delete_context(context_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="Context not found")
     return {"status": "deleted"}
+
+
