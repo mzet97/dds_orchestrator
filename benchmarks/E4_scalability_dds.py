@@ -76,12 +76,12 @@ class ScalabilityBenchmark:
     def get_orchestrator_resources(self) -> Dict:
         """Captura uso de CPU e memória do orchestrator."""
         # Encontrar processo do orchestrator
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_mb']):
+        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
             try:
                 if 'python' in proc.info['name'].lower():
                     return {
                         "cpu_percent": proc.cpu_percent(),
-                        "memory_mb": proc.memory_info().rss / 1024 / 1024
+                        "memory_mb": proc.info['memory_info'].rss / 1024 / 1024 if proc.info.get('memory_info') else 0
                     }
             except:
                 pass
@@ -122,8 +122,8 @@ async def run_benchmark(args):
         "successful_requests": successes,
         "throughput_req_s": successes / (max(latencies) / 1000) if latencies else 0,
         "latency_p50_ms": round(statistics.median(latencies), 2) if latencies else 0,
-        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0,
-        "latency_p99_ms": round(sorted(latencies)[int(len(latencies) * 0.99)] if latencies else 0,
+        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0, 2),
+        "latency_p99_ms": round(sorted(latencies)[int(len(latencies) * 0.99)] if latencies else 0, 2),
         "cpu_orchestrator_pct": round(resources.get("cpu_percent", 0), 2),
         "mem_orchestrator_mb": round(resources.get("memory_mb", 0), 2)
     }

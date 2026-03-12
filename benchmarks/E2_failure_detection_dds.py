@@ -31,8 +31,8 @@ class FailureDetectorDDS:
         """Inicia agente REAL."""
         # Iniciar agente em background
         proc = subprocess.Popen(
-            ["python3", "agent_llm.py", "--model-path", "../models/phi4-mini.gguf"],
-            cwd="/mnt/e/TI/git/tese/dds_agent/python",
+            ["python3", "agent_llm.py", "--model-path", "/home/oldds/models/Phi-4-mini-reasoning-Q4_K_M.gguf"],
+            cwd="/home/oldds/dds_agent/python",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
