@@ -28,14 +28,14 @@ plt.rcParams.update({
     'font.family': 'sans-serif',
 })
 
-# Cores profissionais
+# Cores profissionais (colorblind-friendly - sem red/green juntos)
 COLORS = {
-    'dds': '#2E7D32',      # Verde escuro
-    'http': '#C62828',      # Vermelho
-    'primary': '#1565C0',   # Azul
+    'dds': '#0072B2',      # Azul
+    'http': '#E69F00',     # Laranja
+    'primary': '#1565C0',  # Azul escuro
     'secondary': '#6A1B9A', # Roxo
-    'accent': '#00838F',    # Ciano
-    'warning': '#F57C00',   # Laranja
+    'accent': '#009E73',   # Verde-azulado
+    'warning': '#F57C00',  # Laranja
 }
 
 
@@ -49,81 +49,57 @@ def plot_e1_latency_breakdown():
     http_short = pd.read_csv(RESULTS_DIR / "E1_HTTP_phi4-mini_short.csv")
     http_long = pd.read_csv(RESULTS_DIR / "E1_HTTP_phi4-mini_long.csv")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Colunas de camadas
     layers = ['T1_serialization_ms', 'T2_transport_send_ms', 'T3_queue_ms',
                'T4_inference_ms', 'T5_transport_return_ms', 'T6_deserialization_ms']
-    layer_names = ['Serialization', 'Transport Send', 'Queue', 'Inference', 'Transport Return', 'Deserialization']
+    layer_names = ['Serialization', 'Transp Send', 'Queue', 'Inference', 'Transp Return', 'Deserial']
 
-    # DDS Short - barras empilhadas
-    dds_short_means = [dds_short[c].mean() for c in layers]
-    http_short_means = [http_short[c].mean() for c in layers]
-    dds_long_means = [dds_long[c].mean() for c in layers]
-    http_long_means = [http_long[c].mean() for c in layers]
+    # Calcular totais
+    dds_total_short = sum([dds_short[c].mean() for c in layers])
+    http_total_short = sum([http_short[c].mean() for c in layers])
+    dds_total_long = sum([dds_long[c].mean() for c in layers])
+    http_total_long = sum([http_long[c].mean() for c in layers])
 
-    # Plot 1: DDS vs HTTP - Short Prompt
-    x = np.arange(len(layer_names))
-    width = 0.35
-
-    axes[0, 0].bar(x - width/2, dds_short_means, width, label='DDS', color=COLORS['dds'], alpha=0.8)
-    axes[0, 0].bar(x + width/2, http_short_means, width, label='HTTP', color=COLORS['http'], alpha=0.8)
-    axes[0, 0].set_ylabel('Tempo (ms)')
-    axes[0, 0].set_title('Decomposição de Latência - Prompt Curto')
-    axes[0, 0].set_xticks(x)
-    axes[0, 0].set_xticklabels(layer_names, rotation=45, ha='right')
-    axes[0, 0].legend()
-    axes[0, 0].set_yscale('log')
-
-    # Plot 2: DDS vs HTTP - Long Prompt
-    axes[0, 1].bar(x - width/2, dds_long_means, width, label='DDS', color=COLORS['dds'], alpha=0.8)
-    axes[0, 1].bar(x + width/2, http_long_means, width, label='HTTP', color=COLORS['http'], alpha=0.8)
-    axes[0, 1].set_ylabel('Tempo (ms)')
-    axes[0, 1].set_title('Decomposição de Latência - Prompt Longo')
-    axes[0, 1].set_xticks(x)
-    axes[0, 1].set_xticklabels(layer_names, rotation=45, ha='right')
-    axes[0, 1].legend()
-    axes[0, 1].set_yscale('log')
-
-    # Plot 3: Tempo total - Comparação
-    dds_total_short = sum(dds_short_means)
-    http_total_short = sum(http_short_means)
-    dds_total_long = sum(dds_long_means)
-    http_total_long = sum(http_long_means)
-
-    categories = ['Short\nPrompt', 'Long\nPrompt']
+    # Plot 1: Comparação total
+    categories = ['Short Prompt', 'Long Prompt']
     dds_totals = [dds_total_short, dds_total_long]
     http_totals = [http_total_short, http_total_long]
 
     x = np.arange(len(categories))
-    axes[1, 0].bar(x - width/2, dds_totals, width, label='DDS', color=COLORS['dds'], alpha=0.8)
-    axes[1, 0].bar(x + width/2, http_totals, width, label='HTTP', color=COLORS['http'], alpha=0.8)
-    axes[1, 0].set_ylabel('Latência Total (ms)')
-    axes[1, 0].set_title('Latência Total - DDS vs HTTP')
-    axes[1, 0].set_xticks(x)
-    axes[1, 0].set_xticklabels(categories)
-    axes[1, 0].legend()
+    width = 0.35
+
+    bars1 = axes[0].bar(x - width/2, dds_totals, width, label='DDS', color=COLORS['dds'], alpha=0.8)
+    bars2 = axes[0].bar(x + width/2, http_totals, width, label='HTTP', color=COLORS['http'], alpha=0.8)
+    axes[0].set_ylabel('Latência Total (ms)', fontsize=12)
+    axes[0].set_title('Latência Total: DDS vs HTTP', fontsize=14, fontweight='bold')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(categories, fontsize=11)
+    axes[0].legend(fontsize=11)
+    axes[0].grid(True, alpha=0.3, axis='y')
 
     # Adicionar speedup
     for i, (d, h) in enumerate(zip(dds_totals, http_totals)):
         speedup = h / d
-        axes[1, 0].annotate(f'{speedup:.1f}x\nfaster', xy=(i, d + 0.5), ha='center',
-                            fontsize=10, color=COLORS['dds'], fontweight='bold')
+        axes[0].annotate(f'{speedup:.1f}x faster', xy=(i, max(d, h) * 0.9),
+                        ha='center', fontsize=12, fontweight='bold', color=COLORS['dds'])
 
-    # Plot 4: Overhead de Transporte
-    overhead_dds = [dds_short['transport_overhead_pct'].mean(), dds_long['transport_overhead_pct'].mean()]
-    overhead_http = [http_short['transport_overhead_pct'].mean(), http_long['transport_overhead_pct'].mean()]
+    # Plot 2: Breakdown por camada (apenas short prompt)
+    dds_short_means = [dds_short[c].mean() for c in layers]
+    http_short_means = [http_short[c].mean() for c in layers]
 
-    axes[1, 1].bar(x - width/2, overhead_dds, width, label='DDS', color=COLORS['dds'], alpha=0.8)
-    axes[1, 1].bar(x + width/2, overhead_http, width, label='HTTP', color=COLORS['http'], alpha=0.8)
-    axes[1, 1].set_ylabel('Overhead de Transporte (%)')
-    axes[1, 1].set_title('Overhead do Transporte na Latência Total')
-    axes[1, 1].set_xticks(x)
-    axes[1, 1].set_xticklabels(categories)
-    axes[1, 1].legend()
-    axes[1, 1].set_ylim(0, 100)
+    x2 = np.arange(len(layer_names))
+    axes[1].bar(x2 - width/2, dds_short_means, width, label='DDS', color=COLORS['dds'], alpha=0.8)
+    axes[1].bar(x2 + width/2, http_short_means, width, label='HTTP', color=COLORS['http'], alpha=0.8)
+    axes[1].set_ylabel('Tempo (ms)', fontsize=12)
+    axes[1].set_title('Decomposição por Camada (Short Prompt)', fontsize=14, fontweight='bold')
+    axes[1].set_xticks(x2)
+    axes[1].set_xticklabels(layer_names, rotation=30, ha='right', fontsize=9)
+    axes[1].legend(fontsize=11)
+    axes[1].set_yscale('log')
+    axes[1].grid(True, alpha=0.3, axis='y')
 
-    plt.suptitle('E1: Análise de Latência por Camada - DDS vs HTTP', fontweight='bold', fontsize=16)
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / "E1_latency_breakdown.png", dpi=150, bbox_inches='tight')
     plt.close()
