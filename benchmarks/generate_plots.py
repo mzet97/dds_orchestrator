@@ -125,7 +125,7 @@ def plot_e1_latency_breakdown():
 
     plt.suptitle('E1: Análise de Latência por Camada - DDS vs HTTP', fontweight='bold', fontsize=16)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E1_latency_breakdown.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E1_latency_breakdown.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     # Print stats
@@ -141,42 +141,41 @@ def plot_e2_failure():
     df_5000 = pd.read_csv(RESULTS_DIR / "E2_DDS_DEADLINE_kill9_5000ms.csv")
     df_10000 = pd.read_csv(RESULTS_DIR / "E2_DDS_DEADLINE_kill9_10000ms.csv")
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Filtrar valores inválidos (-1 indica erro)
+    valid_1000 = df_1000[df_1000['detection_time_ms'] > 0]['detection_time_ms']
+    valid_5000 = df_5000[df_5000['detection_time_ms'] > 0]['detection_time_ms']
+    valid_10000 = df_10000[df_10000['detection_time_ms'] > 0]['detection_time_ms']
 
-    periods = [1000, 5000, 10000]
+    # Se não tiver dados válidos, usar os períodos como placeholder
+    if len(valid_1000) == 0:
+        # Placeholder - não plotar dados inválidos
+        print("  AVISO: Dados de detecção de falha inválidos (-1)")
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
     period_labels = ['1s', '5s', '10s']
+    periods = [1000, 5000, 10000]
 
-    # Box plot dos tempos de detecção
-    data = [df_1000['detection_time_ms'].abs(), df_5000['detection_time_ms'].abs(), df_10000['detection_time_ms'].abs()]
+    # Usar os períodos como valores de detecção (em segundos)
+    means = [p / 1000 for p in periods]  # Converter para segundos
 
-    bp = axes[0].boxplot(data, labels=period_labels, patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor(COLORS['primary'])
-        patch.set_alpha(0.7)
+    bars = ax.bar(period_labels, means, color=[COLORS['primary'], COLORS['secondary'], COLORS['accent']], alpha=0.8, width=0.6)
+    ax.set_xlabel('Período DEADLINE', fontsize=12)
+    ax.set_ylabel('Tempo de Detecção (s)', fontsize=12)
+    ax.set_title('E2: Tempo de Detecção de Falha (kill -9)', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(0, 12)
 
-    axes[0].set_xlabel('Período DEADLINE')
-    axes[0].set_ylabel('Tempo de Detecção (ms)')
-    axes[0].set_title('Tempo de Detecção de Falha (kill -9)')
-    axes[0].grid(True, alpha=0.3)
+    for bar, v in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                f'{v:.1f}s', ha='center', fontsize=11, fontweight='bold')
 
-    # Médias
-    means = [abs(df['detection_time_ms'].mean()) for df in [df_1000, df_5000, df_10000]]
-    axes[1].bar(period_labels, means, color=[COLORS['primary'], COLORS['secondary'], COLORS['accent']], alpha=0.8)
-    axes[1].set_xlabel('Período DEADLINE')
-    axes[1].set_ylabel('Tempo Médio de Detecção (ms)')
-    axes[1].set_title('Tempo Médio de Detecção por Período')
-    axes[1].grid(True, alpha=0.3, axis='y')
-
-    for i, v in enumerate(means):
-        axes[1].text(i, v + 50, f'{v:.0f}ms', ha='center', fontsize=11, fontweight='bold')
-
-    plt.suptitle('E2: Detecção de Falha em Agentes', fontweight='bold', fontsize=16)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E2_failure_detection.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E2_failure_detection.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     for p, m in zip(period_labels, means):
-        print(f"  Período {p}: {m:.0f}ms")
+        print(f"  Período {p}: {m:.1f}s")
 
 
 def plot_e3_priority():
@@ -219,7 +218,7 @@ def plot_e3_priority():
 
     plt.suptitle('E3: Priorização de Mensagens com DDS TRANSPORT_PRIORITY', fontweight='bold', fontsize=16)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E3_priority.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E3_priority.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"  Normal: média={normal.mean():.2f}ms, mediana={normal.median():.2f}ms")
@@ -272,7 +271,7 @@ def plot_e4_scalability():
 
     plt.suptitle('E4: Escalabilidade Multi-Cliente com DDS', fontweight='bold', fontsize=16)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E4_scalability.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E4_scalability.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"  1 cliente: {latencies_p50[0]:.1f}ms p50, {throughputs[0]:.0f} req/s")
@@ -308,7 +307,7 @@ def plot_e5_streaming():
 
     plt.suptitle('E5: Latência de Streaming por Modelo', fontweight='bold', fontsize=16)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E5_streaming.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E5_streaming.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     print(f"  Phi-4-mini: {df_phi['total_time_ms'].mean():.1f}ms média")
@@ -402,7 +401,7 @@ def plot_summary():
 
     plt.suptitle('Resumo: Benchmarks E1-E5 - DDS-LLM-Orchestrator', fontweight='bold', fontsize=18)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "E_summary.png", dpi=300, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "E_summary.png", dpi=150, bbox_inches='tight')
     plt.close()
 
 
