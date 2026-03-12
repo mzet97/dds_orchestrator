@@ -29,7 +29,7 @@ try:
     from cyclonedds.topic import Topic
     from cyclonedds.util import duration
     from cyclonedds.idl import IdlStruct
-    from cyclonedds.idl.types import bounded_str, int32
+    from cyclonedds.idl.types import bounded_str, int32, int64
     DDS_AVAILABLE = True
 except ImportError:
     DDS_AVAILABLE = False
@@ -130,7 +130,7 @@ class DDSTaskRequest(IdlStruct):
     timeout_ms: int32 = 30000
     requires_context: bool = False
     context_id: bounded_str[256] = ""
-    created_at: int32 = 0
+    created_at: int64 = 0
 
     def to_model(self) -> AgentTaskRequest:
         from .models import ChatMessage, TaskType
@@ -175,7 +175,7 @@ class DDSTaskResponse(IdlStruct):
     processing_time_ms: int32 = 0
     success: bool = True
     error_message: bounded_str[1024] = ""
-    created_at: int32 = 0
+    created_at: int64 = 0
 
     def to_model(self) -> AgentTaskResponse:
         return AgentTaskResponse(

@@ -54,6 +54,7 @@ class OrchestratorServer:
         self.app.router.add_get('/agents', self.handle_list_agents)
         self.app.router.add_get('/agents/{agent_id}', self.handle_get_agent)
         self.app.router.add_post('/agents/register', self.handle_register_agent)
+        self.app.router.add_post('/agents/{agent_id}/heartbeat', self.handle_agent_heartbeat)
         self.app.router.add_delete('/agents/{agent_id}', self.handle_unregister_agent)
 
         # API v1 compatibility
@@ -369,6 +370,20 @@ class OrchestratorServer:
             "success": True,
             "agent_id": agent_info.agent_id
         })
+
+    async def handle_agent_heartbeat(self, request: web.Request) -> web.Response:
+        """Handle agent heartbeat"""
+        agent_id = request.match_info['agent_id']
+        try:
+            data = await request.json()
+            status = data.get("status", "idle")
+            slots_idle = data.get("slots_idle", 1)
+        except:
+            status = "idle"
+            slots_idle = 1
+
+        success = await self.registry.update_heartbeat(agent_id, status=status, slots_idle=slots_idle)
+        return web.json_response({"success": success})
 
     async def handle_unregister_agent(self, request: web.Request) -> web.Response:
         """Unregister an agent"""

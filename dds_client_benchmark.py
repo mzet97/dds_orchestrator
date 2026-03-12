@@ -21,7 +21,7 @@ from cyclonedds.sub import Subscriber
 from cyclonedds.topic import Topic
 from cyclonedds.qos import QoS, Policy
 from cyclonedds.idl import IdlStruct
-from cyclonedds.idl.types import bounded_str, int32, bool_
+from cyclonedds.idl.types import bounded_str, int32, int64, bool_
 
 
 class ClientRequestType(IdlStruct):
@@ -33,7 +33,7 @@ class ClientRequestType(IdlStruct):
     priority: int32
     timeout_ms: int32
     requires_context: bool_
-    created_at: int32
+    created_at: int64
 
 
 class ClientResponseType(IdlStruct):

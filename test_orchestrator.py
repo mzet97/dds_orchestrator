@@ -10,12 +10,15 @@ import os
 # Add current dir to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Set DDS config for real DDS
+os.environ.setdefault('CYCLONEDDS_URI', 'file:///mnt/e/TI/git/tese/llama.cpp_dds/dds/cyclonedds-local.xml')
+
 from config import OrchestratorConfig
 from models import AgentRegistration, AgentTaskRequest, TaskType, ChatMessage
 from registry import AgentRegistry
 from scheduler import TaskScheduler, Task, TaskPriority
 from context import ContextManager
-from dds_client import MockDDSClient
+from dds_client import DDSClient  # Use REAL DDS client, not mock
 from http_client import HTTPClient
 
 
@@ -23,7 +26,7 @@ async def test_registry():
     """Test agent registry"""
     print("\n=== Testing Agent Registry ===")
 
-    dds_client = MockDDSClient()
+    dds_client = DDSClient()  # Use REAL DDS client - initializes in __init__
     registry = AgentRegistry(dds_client)
 
     # Register agent

@@ -62,7 +62,7 @@ class TaskRequest(idl.IdlStruct, typename="orchestrator.TaskRequest"):
     timeout_ms: types.int32
     requires_context: bool
     context_id: str
-    created_at: types.int32
+    created_at: types.int64
 
 
 @dataclass
@@ -78,7 +78,7 @@ class TaskResponse(idl.IdlStruct, typename="orchestrator.TaskResponse"):
     processing_time_ms: types.int32
     success: bool
     error_message: str
-    created_at: types.int32
+    created_at: types.int64
 
 
 @dataclass

@@ -2,7 +2,7 @@
 # This module should be imported by both client and orchestrator
 
 from cyclonedds.idl import IdlStruct
-from cyclonedds.idl.types import bounded_str, int32
+from cyclonedds.idl.types import bounded_str, int32, int64
 from dataclasses import dataclass
 
 @dataclass
@@ -15,7 +15,7 @@ class ClientRequestType(IdlStruct):
     priority: int32 = 0
     timeout_ms: int32 = 0
     requires_context: int = 0
-    created_at: int32 = 0
+    created_at: int64 = 0  # Changed to int64 to handle large timestamps
 
 
 @dataclass
