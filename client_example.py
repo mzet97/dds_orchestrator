@@ -64,7 +64,7 @@ class SyncOrchestratorClient:
             "max_tokens": kwargs.get("max_tokens", 256),
             "temperature": kwargs.get("temperature", 0.7),
         }
-        resp = requests.post(f"{self.base_url}/chat", json=payload)
+        resp = requests.post(f"{self.base_url}/chat", json=payload, timeout=30)
         return resp.json()
 
     def generate(self, prompt: str, **kwargs) -> dict:
@@ -179,6 +179,10 @@ class DDSOrchestratorClient:
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
 
     def close(self):
+        if hasattr(self, "writer"):
+            del self.writer
+        if hasattr(self, "reader"):
+            del self.reader
         if hasattr(self, "participant"):
             del self.participant
 
@@ -211,8 +215,8 @@ def main():
         response = client.chat(messages, timeout_s=args.timeout)
         t_total = time.time() - t_start
         print(f"\nResponse ({t_total*1000:.0f}ms):")
-        if "error" in response and response.get("content", "") == "":
-            print(f"  ERROR: {response['error']}")
+        if response.get("success") is False or "error" in response:
+            print(f"  ERROR: {response.get('error', response.get('error_message', 'unknown'))}")
         else:
             print(f"  Content: {response.get('content', '')}")
             print(f"  Success: {response.get('success')}")

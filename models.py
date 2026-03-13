@@ -2,7 +2,6 @@
 """
 Pydantic models for DDS-LLM-Orchestrator
 """
-from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -49,6 +48,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(1.0, ge=0.0, le=1.0)
     n: int = Field(1, ge=1)
     stop: Optional[List[str]] = None
+    priority: int = Field(5, ge=1, le=10)
 
 
 class ChatCompletionChoice(BaseModel):

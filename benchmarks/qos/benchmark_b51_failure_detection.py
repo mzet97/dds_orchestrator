@@ -3,7 +3,7 @@
 B5.1: Failure Detection Benchmark
 =================================
 Compares agent failure detection time between:
-- DDS DEADLINE policy (native)
+- DDS DEADLINE policy (using Listener.on_requested_deadline_missed)
 - HTTP Heartbeat (Python threads)
 - gRPC Health Checking (native protocol)
 
@@ -34,18 +34,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Add parent directory to path
+# Add parent directories to path so we can import orchestrator types
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from cyclonedds.domain import DomainParticipant
-from cyclonedds.topic import Topic
-from cyclonedds.pub import DataWriter
-from cyclonedds.sub import DataReader
-from cyclonedds.core import Policy
-from cyclonedds.qos import Qos
-from cyclonedds.util import duration
+try:
+    from cyclonedds.domain import DomainParticipant
+    from cyclonedds.topic import Topic
+    from cyclonedds.pub import DataWriter
+    from cyclonedds.sub import DataReader, Subscriber
+    from cyclonedds.core import Listener, Policy
+    from cyclonedds.qos import Qos
+    from cyclonedds.util import duration
 
-from orchestrator import ClientRequest, ClientResponse, AgentStatus
+    _DDS_AVAILABLE = True
+except ImportError:
+    _DDS_AVAILABLE = False
+
+try:
+    from dds_types import AgentStatusType as AgentStatus
+except ImportError:
+    try:
+        from orchestrator import AgentStatus
+    except ImportError:
+        AgentStatus = None
 
 
 @dataclass
@@ -80,14 +92,23 @@ class BenchmarkResults:
             self.max_ms = max(self.detection_times)
             self.mean_ms = statistics.mean(self.detection_times)
             self.std_ms = statistics.stdev(self.detection_times) if len(self.detection_times) > 1 else 0
-            self.p50_ms = self.detection_times[len(self.detection_times) // 2]
-            self.p95_ms = self.detection_times[int(len(self.detection_times) * 0.95)]
-            self.p99_ms = self.detection_times[int(len(self.detection_times) * 0.99)]
+            self.p50_ms = statistics.median(self.detection_times)
+            if len(self.detection_times) >= 20:
+                self.p95_ms = statistics.quantiles(self.detection_times, n=20)[18]
+            else:
+                self.p95_ms = max(self.detection_times)
+            if len(self.detection_times) >= 100:
+                self.p99_ms = statistics.quantiles(self.detection_times, n=100)[98]
+            else:
+                self.p99_ms = max(self.detection_times)
 
 
 class DDSFailureDetector:
-    """DDS-based failure detection using polling (simpler approach).
-    This measures detection time when heartbeat stops.
+    """DDS-based failure detection using DEADLINE QoS policy with Listener callback.
+
+    When an agent stops publishing heartbeats within the DEADLINE period,
+    the DDS middleware triggers on_requested_deadline_missed, which records
+    the detection time.
     """
 
     def __init__(self, domain_id: int = 0):
@@ -96,20 +117,46 @@ class DDSFailureDetector:
         self.writer = None
         self.reader = None
         self.last_heartbeat_time = None
+        self._deadline_missed_time = None
+        self._deadline_event = None
 
     def setup(self, deadline_interval_ms: int = 1000):
-        """Setup DDS entities."""
+        """Setup DDS entities with DEADLINE QoS."""
+        if not _DDS_AVAILABLE:
+            raise RuntimeError("CycloneDDS not available. Install cyclonedds-python.")
+        if AgentStatus is None:
+            raise RuntimeError("AgentStatus IDL type not found. Check imports.")
+
+        import threading
+        self._deadline_event = threading.Event()
+        self._deadline_missed_time = None
+
+        detector = self  # capture reference for listener
+
+        class DeadlineListener(Listener):
+            def on_requested_deadline_missed(self, reader, status):
+                detector._deadline_missed_time = time.perf_counter()
+                detector._deadline_event.set()
+
         self.participant = DomainParticipant(self.domain_id)
 
         topic = Topic(self.participant, "agent/status", AgentStatus)
 
-        qos = Qos(
+        writer_qos = Qos(
             Policy.Reliability.Reliable(duration(seconds=10)),
             Policy.Durability.Volatile,
+            Policy.Deadline(duration(milliseconds=deadline_interval_ms)),
         )
 
-        self.writer = DataWriter(self.participant, topic, qos)
-        self.reader = DataReader(self.participant, topic, qos)
+        reader_qos = Qos(
+            Policy.Reliability.Reliable(duration(seconds=10)),
+            Policy.Durability.Volatile,
+            Policy.Deadline(duration(milliseconds=deadline_interval_ms)),
+        )
+
+        self.writer = DataWriter(self.participant, topic, writer_qos)
+        self._listener = DeadlineListener()
+        self.reader = DataReader(self.participant, topic, reader_qos, listener=self._listener)
 
     def send_heartbeat(self):
         """Send heartbeat to keep agent alive."""
@@ -128,28 +175,30 @@ class DDSFailureDetector:
             self.last_heartbeat_time = time.time()
 
     def detect_failure(self, timeout_ms: int = 5000) -> float:
-        """Detect failure by checking for heartbeats.
-        Returns detection time in ms, or -1 if heartbeat received.
+        """Detect failure using DEADLINE QoS callback.
+
+        Waits for on_requested_deadline_missed to fire. Returns detection
+        time in ms from when we stopped sending heartbeats, or timeout_ms
+        if no callback fires within the timeout window.
         """
-        start = time.perf_counter()
-        deadline_sec = timeout_ms / 1000
+        stop_time = time.perf_counter()
+        self._deadline_event.clear()
+        self._deadline_missed_time = None
 
-        while (time.perf_counter() - start) < deadline_sec:
-            # Try to read samples
-            samples = self.reader.take(N=1)
-            if samples:
-                # Got heartbeat - agent still alive
-                self.last_heartbeat_time = time.time()
-                return -1
-            time.sleep(0.01)
+        # Wait for the deadline missed callback
+        fired = self._deadline_event.wait(timeout=timeout_ms / 1000)
 
-        # No heartbeat received within timeout
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return elapsed_ms
+        if fired and self._deadline_missed_time is not None:
+            return (self._deadline_missed_time - stop_time) * 1000
+        else:
+            # Fallback: no callback received, return full timeout
+            return (time.perf_counter() - stop_time) * 1000
 
     def cleanup(self):
         """Cleanup DDS entities."""
-        pass
+        self.writer = None
+        self.reader = None
+        self.participant = None
 
 
 class HTTPHeartbeatDetector:
@@ -166,10 +215,12 @@ class HTTPHeartbeatDetector:
         """Check agent health via HTTP."""
         import aiohttp
         try:
-            async with aiohttp.ClientTimeout(total=1) as timeout:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{self.agent_url}/health") as resp:
-                        return resp.status == 200
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.agent_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=1)
+                ) as resp:
+                    return resp.status == 200
         except Exception:
             return False
 
@@ -183,8 +234,6 @@ class HTTPHeartbeatDetector:
 
     def detect_failure(self, interval_ms: int = 1000, timeout_ms: int = 5000) -> float:
         """Detect failure via HTTP polling."""
-        import aiohttp
-
         start = time.perf_counter()
         interval = interval_ms / 1000
 
@@ -309,7 +358,7 @@ def run_benchmark(
                     time.sleep(0.1)
 
                 # Simulate failure by NOT sending more heartbeats
-                # The reader will timeout after deadline_interval_ms
+                # The DEADLINE QoS listener will fire after interval_ms
                 detection_time = detector.detect_failure(timeout_ms=interval_ms * 3)
 
                 detector.cleanup()
@@ -324,7 +373,7 @@ def run_benchmark(
 
             elif method == "gRPC":
                 detector = gRPCHealthDetector()
-                detection_time = detector.detector_failure(
+                detection_time = detector.detect_failure(
                     interval_ms=interval_ms,
                     timeout_ms=interval_ms * 3
                 )

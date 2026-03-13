@@ -3,10 +3,9 @@
 B5.3: Load Balancing Benchmark
 =============================
 Compares load balancing between:
-- DDS OWNERSHIP (partition-based ownership)
-- Python Round-Robin
+- DDS OWNERSHIP (via orchestrator HTTP API -- the orchestrator uses DDS OWNERSHIP internally)
+- Python Round-Robin (direct HTTP to agent URLs)
 - Nginx Load Balancer
-- Kubernetes Service
 
 Metrics:
 - Request distribution standard deviation (lower = better)
@@ -14,16 +13,14 @@ Metrics:
 - Failover behavior when replica fails
 
 Usage:
-    python benchmark_b53_load_balancing.py --mode all
-    python benchmark_b53_load_balancing.py --mode dds
+    python benchmark_b53_load_balancing.py --mode all --url http://localhost:8080
+    python benchmark_b53_load_balancing.py --mode dds --url http://localhost:8080
 """
 
 import argparse
 import json
 import os
-import random
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -32,6 +29,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import requests as req_lib
 
 
 @dataclass
@@ -58,130 +57,175 @@ class BenchmarkResults:
 
 
 class DDSOwnershipBalancer:
-    """DDS-based load balancing using OWNERSHIP."""
+    """Uses the DDS orchestrator (via HTTP API) which performs load balancing
+    internally using DDS OWNERSHIP QoS.
 
-    def __init__(self, domain_id: int = 0):
-        self.domain_id = domain_id
-        self.participant = None
-        self.writers = []
-        self.reader = None
+    Requests go through: client -> orchestrator HTTP -> DDS -> agent (selected by OWNERSHIP).
+    The orchestrator's internal DDS layer handles agent selection.
+    """
+
+    def __init__(self, orchestrator_url: str):
+        self.orchestrator_url = orchestrator_url.rstrip("/")
+        self.session = req_lib.Session()
+        self._request_counter = 0
 
     def setup(self, num_replicas: int):
-        """Setup DDS with multiple writer instances for ownership."""
-        from cyclonedds.domain import DomainParticipant
-        from cyclonedds.topic import Topic
-        from cyclonedds.pub import DataWriter
-        from cyclonedds.core import Policy
-        from cyclonedds.qos import Qos
-        from cyclonedds.util import duration
+        """No setup needed -- orchestrator manages agents."""
+        pass
 
-        self.participant = DomainParticipant(self.domain_id)
-        topic = Topic(self.participant, "loadbalance/requests", dict)
-
-        # Create writers for each replica with ownership
-        for i in range(num_replicas):
-            qos = Qos(
-                Policy.Reliability.Reliable(duration(seconds=10)),
-                Policy.Durability.Volatile,
-                Policy.Ownership(i),  # Ownership strength based on replica ID
+    def send_request(self, request_id: str) -> dict:
+        """Send request to orchestrator which routes via DDS OWNERSHIP."""
+        start = time.perf_counter()
+        try:
+            resp = self.session.post(
+                f"{self.orchestrator_url}/v1/chat/completions",
+                json={
+                    "model": "phi4-mini",
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 5,
+                },
+                timeout=30
             )
-            writer = DataWriter(self.participant, topic, qos)
-            self.writers.append(writer)
-
-        # Reader
-        reader_qos = Qos(
-            Policy.Reliability.Reliable(duration(seconds=10)),
-            Policy.Durability.Volatile,
-        )
-        self.reader = DataReader(self.participant, topic, reader_qos)
-
-    def send_request(self, request_id: str) -> int:
-        """Send request - DDS will route based on ownership."""
-        # Round-robin across writers (simulating different replicas)
-        writer = self.writers[request_id % len(self.writers)]
-        writer.write({
-            "id": request_id,
-            "timestamp": time.time(),
-        })
-        return request_id % len(self.writers)
+            latency = (time.perf_counter() - start) * 1000
+            # Try to extract which agent handled the request from response headers or body
+            agent_id = -1
+            try:
+                body = resp.json()
+                agent_id = hash(body.get("model", "")) % 100  # proxy for agent identity
+            except Exception:
+                pass
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": resp.ok,
+                "agent_id": agent_id,
+            }
+        except Exception as e:
+            latency = (time.perf_counter() - start) * 1000
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": False,
+                "agent_id": -1,
+                "error": str(e),
+            }
 
     def cleanup(self):
-        """Cleanup DDS entities."""
-        for writer in self.writers:
-            writer.close()
-        if self.reader:
-            self.reader.close()
-        if self.participant:
-            self.participant.close()
+        """Cleanup session."""
+        self.session.close()
 
 
 class PythonRoundRobinBalancer:
-    """Python-based round-robin load balancer."""
+    """Python-based round-robin load balancer using real HTTP requests
+    to agent endpoints."""
 
     def __init__(self, replica_urls: List[str]):
         self.replica_urls = replica_urls
         self.current_index = 0
         self.lock = threading.Lock()
         self.request_counts = defaultdict(int)
+        self.session = req_lib.Session()
 
-    def send_request(self, request_id: str) -> int:
-        """Send request using round-robin."""
+    def send_request(self, request_id: str) -> dict:
+        """Send request using round-robin across agent URLs."""
         with self.lock:
             replica_id = self.current_index
+            url = self.replica_urls[self.current_index]
             self.current_index = (self.current_index + 1) % len(self.replica_urls)
             self.request_counts[replica_id] += 1
 
-        # Simulate network latency
-        latency = random.uniform(10, 50)
-        time.sleep(latency / 1000)
-
-        return replica_id
+        start = time.perf_counter()
+        try:
+            resp = self.session.post(
+                f"{url}/v1/chat/completions",
+                json={
+                    "model": "phi4-mini",
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 5,
+                },
+                timeout=30
+            )
+            latency = (time.perf_counter() - start) * 1000
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": resp.ok,
+                "replica_id": replica_id,
+            }
+        except Exception as e:
+            latency = (time.perf_counter() - start) * 1000
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": False,
+                "replica_id": replica_id,
+                "error": str(e),
+            }
 
     def get_distribution(self) -> Dict[int, int]:
         """Get request distribution across replicas."""
         return dict(self.request_counts)
 
+    def cleanup(self):
+        """Cleanup session."""
+        self.session.close()
+
 
 class NginxBalancer:
     """Nginx-based load balancer (requires nginx running)."""
 
-    def __init__(self, nginx_port: int = 8080):
-        self.nginx_port = nginx_port
-        self.base_url = f"http://localhost:{nginx_port}"
+    def __init__(self, nginx_url: str = "http://localhost:8080"):
+        self.base_url = nginx_url.rstrip("/")
+        self.session = req_lib.Session()
 
-    def send_request(self, request_id: str) -> int:
+    def send_request(self, request_id: str) -> dict:
         """Send request through nginx."""
-        import urllib.request
-
+        start = time.perf_counter()
         try:
-            req = urllib.request.Request(f"{self.base_url}/api/request")
-            urllib.request.urlopen(req, timeout=5)
-            # Nginx distributes to backend - we can't know which one
-            return -1
+            resp = self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": "phi4-mini",
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 5,
+                },
+                timeout=30
+            )
+            latency = (time.perf_counter() - start) * 1000
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": resp.ok,
+                "replica_id": -1,  # Cannot determine which backend nginx chose
+            }
         except Exception as e:
-            print(f"Error: {e}")
-            return -1
+            latency = (time.perf_counter() - start) * 1000
+            return {
+                "request_id": request_id,
+                "latency_ms": latency,
+                "success": False,
+                "replica_id": -1,
+                "error": str(e),
+            }
+
+    def cleanup(self):
+        """Cleanup session."""
+        self.session.close()
 
 
-class KubernetesBalancer:
-    """Kubernetes Service load balancer (requires k8s cluster)."""
-
-    def __init__(self, service_name: str, namespace: str = "default"):
-        self.service_name = service_name
-        self.namespace = namespace
-        self.service_url = f"{service_name}.{namespace}.svc.cluster.local"
-
-    def send_request(self, request_id: str) -> int:
-        """Send request through Kubernetes service."""
-        # Requires kubectl port-forward or internal cluster access
-        # This is a simulation
-        return random.randint(0, 2)
+# NOTE: KubernetesBalancer has been removed. Kubernetes load balancing requires
+# a running k8s cluster with configured Services, which cannot be benchmarked
+# without the infrastructure. To test Kubernetes, deploy the orchestrator as a
+# k8s Service and use the NginxBalancer or DDSOwnershipBalancer pointed at the
+# cluster endpoint.
 
 
 def run_benchmark(
     method: str,
     num_replicas: int = 3,
     num_requests: int = 1000,
+    orchestrator_url: str = "http://localhost:8080",
+    agent_urls: Optional[List[str]] = None,
 ) -> BenchmarkResults:
     """Run load balancing benchmark."""
 
@@ -194,60 +238,58 @@ def run_benchmark(
     latencies = []
 
     if method == "DDS":
-        balancer = DDSOwnershipBalancer()
+        balancer = DDSOwnershipBalancer(orchestrator_url)
         balancer.setup(num_replicas)
 
         for i in range(num_requests):
             request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
-
-            # Simulate processing latency
-            latency = random.uniform(10, 50)
-            latencies.append(latency)
-            time.sleep(0.001)
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+                distribution[result["agent_id"]] += 1
 
         balancer.cleanup()
 
     elif method == "Python":
-        replica_urls = [f"http://localhost:{8081+i}" for i in range(num_replicas)]
-        balancer = PythonRoundRobinBalancer(replica_urls)
+        if agent_urls is None:
+            agent_urls = [f"http://localhost:{8081+i}" for i in range(num_replicas)]
+        balancer = PythonRoundRobinBalancer(agent_urls)
 
-        def sender_task(count: int):
+        def sender_task(start_idx: int, count: int):
             for i in range(count):
-                request_id = f"req_{i}"
-                replica_id = balancer.send_request(request_id)
-                distribution[replica_id] += 1
+                request_id = f"req_{start_idx}_{i}"
+                result = balancer.send_request(request_id)
+                if result["success"]:
+                    with lock:
+                        latencies.append(result["latency_ms"])
+                        distribution[result["replica_id"]] += 1
+
+        lock = threading.Lock()
 
         # Use multiple threads for concurrent requests
         threads = []
         requests_per_thread = num_requests // 4
         for t in range(4):
-            thread = threading.Thread(target=sender_task, args=(requests_per_thread,))
+            thread = threading.Thread(target=sender_task, args=(t, requests_per_thread))
             threads.append(thread)
             thread.start()
 
         for thread in threads:
             thread.join()
 
-        distribution = balancer.get_distribution()
+        balancer.cleanup()
 
     elif method == "Nginx":
-        balancer = NginxBalancer()
+        balancer = NginxBalancer(orchestrator_url)
 
         for i in range(num_requests):
             request_id = f"req_{i}"
-            balancer.send_request(request_id)
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
             # Cannot track distribution without nginx access log
 
-    elif method == "Kubernetes":
-        balancer = KubernetesBalancer("llm-agent-service")
-
-        for i in range(num_requests):
-            request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
-            time.sleep(0.001)
+        balancer.cleanup()
 
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -269,7 +311,6 @@ def run_benchmark(
     # Calculate distribution standard deviation
     if distribution:
         counts = list(distribution.values())
-        expected = num_requests / num_replicas
         result.distribution_std = statistics.stdev(counts) if len(counts) > 1 else 0
 
     print(f"\nDistribution: {distribution}")
@@ -283,6 +324,8 @@ def run_failover_test(
     method: str,
     num_replicas: int = 3,
     num_requests: int = 500,
+    orchestrator_url: str = "http://localhost:8080",
+    agent_urls: Optional[List[str]] = None,
 ) -> BenchmarkResults:
     """Test failover when a replica fails."""
 
@@ -291,50 +334,64 @@ def run_failover_test(
     print(f"{'='*60}")
 
     distribution = defaultdict(int)
+    latencies = []
 
     if method == "DDS":
-        balancer = DDSOwnershipBalancer()
+        balancer = DDSOwnershipBalancer(orchestrator_url)
         balancer.setup(num_replicas)
 
         # Send some requests
         for i in range(num_requests // 2):
             request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+                distribution[result["agent_id"]] += 1
 
-        # Simulate replica failure (close one writer)
-        if len(balancer.writers) > 1:
-            print("Simulating replica failure...")
-            balancer.writers[1].close()
-            balancer.writers.pop(1)
+        # In a real scenario, one agent would be killed here.
+        # The orchestrator detects the failure via DDS DEADLINE and
+        # redistributes via OWNERSHIP.
+        print("NOTE: To test real failover, kill one agent process now.")
+        print("Continuing to send requests after 2s pause...")
+        time.sleep(2)
 
         # Send more requests after failure
         for i in range(num_requests // 2, num_requests):
             request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+                distribution[result["agent_id"]] += 1
 
         balancer.cleanup()
 
     elif method == "Python":
-        replica_urls = [f"http://localhost:{8081+i}" for i in range(num_replicas)]
-        balancer = PythonRoundRobinBalancer(replica_urls)
+        if agent_urls is None:
+            agent_urls = [f"http://localhost:{8081+i}" for i in range(num_replicas)]
+        balancer = PythonRoundRobinBalancer(agent_urls)
 
         # Send some requests
         for i in range(num_requests // 2):
             request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+                distribution[result["replica_id"]] += 1
 
         # Simulate failure by removing a replica
-        print("Simulating replica failure...")
-        balancer.replica_urls.pop(1)
+        print("Simulating replica failure by removing one URL...")
+        if len(balancer.replica_urls) > 1:
+            balancer.replica_urls.pop(1)
 
         # Send more requests
         for i in range(num_requests // 2, num_requests):
             request_id = f"req_{i}"
-            replica_id = balancer.send_request(request_id)
-            distribution[replica_id] += 1
+            result = balancer.send_request(request_id)
+            if result["success"]:
+                latencies.append(result["latency_ms"])
+                distribution[result["replica_id"]] += 1
+
+        balancer.cleanup()
 
     result = BenchmarkResults(
         method=method,
@@ -342,6 +399,16 @@ def run_failover_test(
         num_requests=num_requests,
         distribution=dict(distribution),
     )
+
+    if latencies:
+        result.mean_latency_ms = statistics.mean(latencies)
+        result.std_latency_ms = statistics.stdev(latencies) if len(latencies) > 1 else 0
+        result.min_latency_ms = min(latencies)
+        result.max_latency_ms = max(latencies)
+
+    if distribution:
+        counts = list(distribution.values())
+        result.distribution_std = statistics.stdev(counts) if len(counts) > 1 else 0
 
     print(f"\nDistribution after failover: {distribution}")
 
@@ -352,7 +419,7 @@ def main():
     parser = argparse.ArgumentParser(description="B5.3 Load Balancing Benchmark")
     parser.add_argument(
         "--mode",
-        choices=["all", "dds", "python", "nginx", "kubernetes"],
+        choices=["all", "dds", "python", "nginx"],
         default="all",
         help="Benchmark mode"
     )
@@ -374,6 +441,18 @@ def main():
         help="Run failover test"
     )
     parser.add_argument(
+        "--url",
+        type=str,
+        default="http://localhost:8080",
+        help="Orchestrator URL"
+    )
+    parser.add_argument(
+        "--agent-urls",
+        type=str,
+        default=None,
+        help="Comma-separated agent URLs for round-robin mode"
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="benchmark_results",
@@ -384,9 +463,13 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
+    agent_urls = None
+    if args.agent_urls:
+        agent_urls = [u.strip() for u in args.agent_urls.split(",")]
+
     results = []
 
-    modes = ["DDS", "Python"]  # Nginx and K8s need special setup
+    modes = ["DDS", "Python"] if args.mode == "all" else [args.mode.upper()]
 
     for method in modes:
         if args.failover:
@@ -394,12 +477,16 @@ def main():
                 method=method,
                 num_replicas=args.replicas,
                 num_requests=args.requests,
+                orchestrator_url=args.url,
+                agent_urls=agent_urls,
             )
         else:
             result = run_benchmark(
                 method=method,
                 num_replicas=args.replicas,
                 num_requests=args.requests,
+                orchestrator_url=args.url,
+                agent_urls=agent_urls,
             )
         results.append(result)
 

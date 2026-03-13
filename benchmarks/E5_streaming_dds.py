@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-E5: Streaming Token-a-Token
-==============================
-Mede TTFT (Time-to-First-Token) e ITL (Inter-Token Latency)
-100% REAL - streaming real do servidor LLM
+E5: Streaming Token-a-Token - DDS (via Orquestrador)
+=====================================================
+Mede TTFT (Time-to-First-Token) e ITL (Inter-Token Latency).
+
+Rota: Cliente -> Orquestrador HTTP -> DDS -> Agente -> DDS -> Orquestrador -> SSE -> Cliente
+
+O cliente envia a requisicao ao Orquestrador via HTTP. O Orquestrador roteia
+internamente via DDS pub/sub para o Agente, que executa a inferencia e retorna
+tokens via DDS. O Orquestrador entrega os tokens ao cliente via SSE (Server-Sent Events).
+
+Comparar com E5_streaming_http.py (HTTP direto ao agente, sem orquestrador DDS).
+
+Metricas:
+  TTFT = tempo ate receber o primeiro token (ms)
+  ITL  = tempo entre tokens consecutivos (ms); mede jitter de entrega
 
 Usage:
-    python E5_streaming_dds.py --model phi4 --n 50
+    python E5_streaming_dds.py --url http://localhost:8080 --model phi4-mini --n 50
 """
 
 import argparse
@@ -19,15 +30,15 @@ from typing import Dict, List
 import aiohttp
 
 
-class StreamingBenchmark:
-    """Benchmark de streaming token-a-token."""
+class StreamingBenchmarkDDS:
+    """Benchmark de streaming token-a-token via DDS (orquestrador)."""
 
     def __init__(self, base_url: str):
         self.base_url = base_url
 
     async def measure_streaming(self, model: str, prompt: str, max_tokens: int = 200) -> Dict:
         """
-        Mede TTFT e ITL com streaming REAL.
+        Mede TTFT e ITL com streaming REAL via orquestrador DDS.
         """
         ttft = None  # Time-to-First-Token
         itl_list = []  # Inter-Token Latency
@@ -49,34 +60,46 @@ class StreamingBenchmark:
                 ) as resp:
                     previous_time = time.perf_counter()
 
-                    async for line in resp.content:
-                        if not line:
-                            continue
+                    # Buffer para parse correto de SSE (chunks podem conter múltiplas linhas)
+                    sse_buffer = b""
+                    _done = False
+                    async for chunk in resp.content.iter_any():
+                        sse_buffer += chunk
+                        while b"\n" in sse_buffer:
+                            raw_line, sse_buffer = sse_buffer.split(b"\n", 1)
+                            line = raw_line.rstrip(b"\r")
+                            if not line:
+                                continue
 
-                        # Parse SSE line
-                        if line.startswith(b"data: "):
-                            data = line[6:]
-                            if data == b"[DONE]":
-                                break
+                            if line.startswith(b"data: "):
+                                data = line[6:]
+                                if data.strip() == b"[DONE]":
+                                    _done = True
+                                    break
 
-                            try:
-                                parsed = json.loads(data)
-                                current_time = time.perf_counter()
+                                try:
+                                    parsed = json.loads(data)
+                                    delta = parsed.get("choices", [{}])[0].get("delta", {})
+                                    token = delta.get("content", "")
+                                    if not token:
+                                        continue
+                                    current_time = time.perf_counter()
 
-                                # Primeira token = TTFT
-                                if ttft is None:
-                                    ttft = (current_time - start) * 1000  # ms
+                                    if ttft is None:
+                                        ttft = (current_time - start) * 1000
 
-                                # Tokens subsequentes = ITL
-                                else:
-                                    itl = (current_time - previous_time) * 1000  # ms
-                                    itl_list.append(itl)
+                                    else:
+                                        itl = (current_time - previous_time) * 1000
+                                        itl_list.append(itl)
 
-                                previous_time = current_time
-                                total_tokens += 1
+                                    previous_time = current_time
+                                    total_tokens += 1
 
-                            except:
-                                pass
+                                except Exception:
+                                    pass
+
+                        if _done:
+                            break
 
         except Exception as e:
             return {"error": str(e)}
@@ -96,19 +119,20 @@ class StreamingBenchmark:
 
 
 async def run_benchmark(args):
-    """Executa benchmark de streaming."""
+    """Executa benchmark de streaming via orquestrador DDS."""
 
-    benchmark = StreamingBenchmark(base_url=args.url)
+    benchmark = StreamingBenchmarkDDS(base_url=args.url)
 
     # Prompt padronizado
-    prompt = "Conte uma história sobre um robô que aprende a sentir emoções. Com pelo menos 200 palavras."
+    prompt = "Conte uma historia sobre um robo que aprende a sentir emocoes. Com pelo menos 200 palavras."
 
     results = []
 
-    print(f"E5: Streaming Token-a-Token")
+    print(f"E5: Streaming Token-a-Token - DDS (via orquestrador)")
+    print(f"Rota: Cliente -> Orquestrador HTTP -> DDS -> Agente -> DDS -> Orquestrador -> SSE -> Cliente")
     print(f"URL: {args.url}")
     print(f"Modelo: {args.model}")
-    print(f"Iterações: {args.n}")
+    print(f"Iteracoes: {args.n}")
     print("-" * 50)
 
     for i in range(args.n):
@@ -125,18 +149,18 @@ async def run_benchmark(args):
                 "total_time_ms": result["total_time_ms"]
             })
 
-            print(f"Iteração {i+1}/{args.n}: TTFT={result['ttft_ms']:.1f}ms, ITL={result['itl_mean_ms']:.2f}ms, Tokens={result['tokens']}")
+            print(f"Iteracao {i+1}/{args.n}: TTFT={result['ttft_ms']:.1f}ms, ITL={result['itl_mean_ms']:.2f}ms, Tokens={result['tokens']}")
         else:
-            print(f"Iteração {i+1}/{args.n}: ERRO - {result['error']}")
+            print(f"Iteracao {i+1}/{args.n}: ERRO - {result['error']}")
 
-    # Estatísticas
+    # Estatisticas
     ttft_values = [r["ttft_ms"] for r in results]
     itl_mean_values = [r["itl_mean_ms"] for r in results]
     itl_p99_values = [r["itl_p99_ms"] for r in results]
     tokens_values = [r["tokens"] for r in results]
 
     summary = {
-        "protocol": "DDS_STREAMING",
+        "protocol": "DDS_VIA_ORCHESTRADOR",
         "model": args.model,
         "n": len(results),
         "ttft": {
@@ -157,8 +181,8 @@ async def run_benchmark(args):
         }
     }
 
-    # Salvar CSV
-    csv_file = f"results/E5_streaming_{args.model}.csv"
+    # Salvar CSV - nome distinto para DDS
+    csv_file = f"results/E5_DDS_VIA_ORCH_streaming_{args.model}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
@@ -167,13 +191,13 @@ async def run_benchmark(args):
             f.write(f"{r['iteration']},{r['ttft_ms']},{r['itl_mean_ms']},{r['itl_median_ms']},{r['itl_p99_ms']},{r['tokens']},{r['total_time_ms']}\n")
 
     # Salvar JSON
-    json_file = f"results/E5_streaming_{args.model}_summary.json"
+    json_file = f"results/E5_DDS_VIA_ORCH_streaming_{args.model}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\nResultados:")
-    print(f"TTFT médio: {summary['ttft']['mean_ms']:.2f}ms")
-    print(f"ITL médio: {summary['itl_mean']['mean_ms']:.2f}ms")
+    print(f"TTFT medio: {summary['ttft']['mean_ms']:.2f}ms")
+    print(f"ITL medio: {summary['itl_mean']['mean_ms']:.2f}ms")
     print(f"ITL p99: {summary['itl_p99']['mean_ms']:.2f}ms")
     print(f"\nCSV: {csv_file}")
     print(f"JSON: {json_file}")
@@ -182,10 +206,10 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token")
+    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - DDS (via orquestrador)")
     parser.add_argument("--model", default="phi4-mini", help="Modelo a usar")
-    parser.add_argument("--url", default="http://localhost:8080", help="URL do servidor")
-    parser.add_argument("--n", type=int, default=50, help="Número de iterações")
+    parser.add_argument("--url", default="http://localhost:8080", help="URL do orquestrador DDS")
+    parser.add_argument("--n", type=int, default=50, help="Numero de iteracoes")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

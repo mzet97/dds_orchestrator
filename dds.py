@@ -10,24 +10,21 @@ import time
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, asdict
 
-# Import generated DDS types (compatible with C++ and other Python components)
+# Ensure orchestrator package is importable
 import os
 import sys
-# Add paths for generated IDL types - support both Windows and WSL
-dds_orchestrator_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, dds_orchestrator_dir)
-sys.path.insert(0, r'E:\TI\git\tese\dds_orchestrator')
-sys.path.insert(0, '/mnt/e/TI/git/tese/dds_orchestrator')
-
-# Import types from generated IDL modules
-from orchestrator import (
-    TaskRequest, TaskResponse,
-    AgentRegistration, AgentStatus,
-    ClientRequest, ClientResponse
-)
-from llama import ChatMessage, ChatCompletionRequest, ChatCompletionResponse
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 logger = logging.getLogger(__name__)
+
+# IDL types are imported lazily inside _init_dds() to avoid crashing the
+# entire module when cyclonedds is not installed (HTTP-only mode).
+TaskRequest = None
+TaskResponse = None
+AgentRegistration = None
+AgentStatus = None
+ClientRequest = None
+ClientResponse = None
 
 
 # DDS Topic Names
@@ -45,10 +42,11 @@ TOPIC_AGENT_CONTEXT = "agent/context"
 # Orchestrator commands
 TOPIC_ORCHESTRATOR_COMMAND = "orchestrator/command"
 
-# Agent <-> LLM
-TOPIC_LLM_REQUEST = "llm/request"
-TOPIC_LLM_RESPONSE = "llm/response"
-TOPIC_LLM_STATUS = "llm/status"
+# Agent <-> LLM (not used by orchestrator; listed for reference only)
+# Actual topic names used by agent_llm_dds.py and C++ llama-server:
+#   "llama_chat_completion_request"
+#   "llama_chat_completion_response"
+#   "llama_server_status"
 
 
 @dataclass
@@ -69,7 +67,7 @@ class ClientTaskRequest:
     messages_json: str  # JSON string of messages
     priority: int
     timeout_ms: int
-    requires_context: int
+    requires_context: bool
 
 
 @dataclass
@@ -78,11 +76,11 @@ class ClientTaskResponse:
     request_id: str
     client_id: str
     content: str
-    is_final: int
+    is_final: bool
     prompt_tokens: int
     completion_tokens: int
     processing_time_ms: int
-    success: int
+    success: bool
     error_message: Optional[str]
 
 
@@ -95,7 +93,8 @@ class AgentTaskRequest:
     messages: List[dict]
     priority: int
     timeout_ms: int
-    requires_context: int
+    requires_context: bool
+    stream: bool = False
 
 
 @dataclass
@@ -104,11 +103,11 @@ class AgentTaskResponse:
     task_id: str
     agent_id: str
     content: str
-    is_final: int
+    is_final: bool
     prompt_tokens: int
     completion_tokens: int
     processing_time_ms: int
-    success: int
+    success: bool
     error_message: Optional[str]
 
 
@@ -173,6 +172,14 @@ class DDSLayer:
         self.publishers: Dict[str, Any] = {}
         self.subscribers: Dict[str, Any] = {}
         self.handlers: Dict[str, Callable] = {}
+        self.topics: Dict[str, Any] = {}
+        self._topic_types: Dict[str, Any] = {}
+        # Per-task waiters for agent responses: task_id -> (asyncio.Event, [result])
+        self._pending_agent_responses: Dict[str, Any] = {}
+        # Per-request waiters for client responses: request_id -> (asyncio.Event, [result])
+        self._pending_client_responses: Dict[str, Any] = {}
+        # Event loop reference captured when DDS is initialized (for thread-safe callbacks)
+        self._event_loop = None
 
         # Initialize DDS if available
         if config.dds_enabled:
@@ -189,6 +196,17 @@ class DDSLayer:
             from cyclonedds.idl import IdlStruct
             from cyclonedds.idl.types import sequence
 
+            # Import IDL types now that we know cyclonedds is available.
+            # These are assigned to module-level names so other code can
+            # reference them without guarding against ImportError.
+            global TaskRequest, TaskResponse, AgentRegistration, AgentStatus
+            global ClientRequest, ClientResponse
+            from orchestrator import (
+                TaskRequest, TaskResponse,
+                AgentRegistration, AgentStatus,
+                ClientRequest, ClientResponse,
+            )
+
             # Create domain participant
             self.participant = DomainParticipant(self.config.dds_domain)
 
@@ -197,6 +215,12 @@ class DDSLayer:
 
             # Create publishers and subscribers
             self._create_pubsub()
+
+            # Capture the running event loop for thread-safe callbacks from DDS listener threads
+            try:
+                self._event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._event_loop = None
 
             self.dds_available = True
             logger.info(f"DDS initialized on domain {self.config.dds_domain}")
@@ -212,8 +236,7 @@ class DDSLayer:
         """Create DDS topics"""
         from cyclonedds.topic import Topic
         from cyclonedds.idl import IdlStruct
-        # Use shared types from shared_types module
-        # These are imported at the top of the file
+        # Use IDL-generated types from orchestrator module (imported in _init_dds)
 
         # Store types for later use
         self._topic_types = {
@@ -232,18 +255,25 @@ class DDSLayer:
             logger.info(f"Created topic: {topic_name}")
 
     def _create_pubsub(self):
-        """Create publishers and subscribers"""
+        """Create publishers and subscribers for orchestrator role.
+
+        The orchestrator:
+        - Reads from: client/request, agent/register, agent/response, agent/status
+        - Writes to: agent/request, client/response
+        """
         from cyclonedds.pub import DataWriter
         from cyclonedds.sub import DataReader
         from cyclonedds.core import Policy
         from cyclonedds.qos import Qos
         from cyclonedds.util import duration
 
-        # QoS for reliable communication (requests, responses)
+        # QoS for reliable communication (requests, responses).
+        # KeepLast(8): buffer up to 8 undelivered messages so that rapid
+        # back-to-back writes under multi-client load are not silently dropped.
         self.qos_reliable = Qos(
             Policy.Reliability.Reliable(duration(seconds=10)),
             Policy.Durability.Volatile,
-            Policy.History.KeepLast(1),
+            Policy.History.KeepLast(8),
         )
 
         # QoS for best effort (status, heartbeat)
@@ -253,32 +283,29 @@ class DDSLayer:
             Policy.History.KeepLast(5),
         )
 
-        # Create publishers (for sending responses to clients and agents)
+        # Create publishers (orchestrator sends to agents and clients)
         self.publishers = {
             TOPIC_AGENT_REQUEST: DataWriter(
                 self.participant, self.topics[TOPIC_AGENT_REQUEST], self.qos_reliable
             ),
-            TOPIC_AGENT_REGISTER: DataWriter(
-                self.participant, self.topics[TOPIC_AGENT_REGISTER], self.qos_reliable
-            ),
             TOPIC_CLIENT_RESPONSE: DataWriter(
                 self.participant, self.topics[TOPIC_CLIENT_RESPONSE], self.qos_reliable
             ),
-            TOPIC_CLIENT_REQUEST: DataWriter(
-                self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_reliable
-            ),
         }
 
-        # Create subscribers with readers (for receiving from clients and agents)
+        # Create subscribers/readers (orchestrator receives from clients, agents)
         self.subscribers = {
-            TOPIC_AGENT_STATUS: DataReader(
-                self.participant, self.topics[TOPIC_AGENT_STATUS], self.qos_best_effort
-            ),
             TOPIC_CLIENT_REQUEST: DataReader(
                 self.participant, self.topics[TOPIC_CLIENT_REQUEST], self.qos_reliable
             ),
+            TOPIC_AGENT_REGISTER: DataReader(
+                self.participant, self.topics[TOPIC_AGENT_REGISTER], self.qos_reliable
+            ),
             TOPIC_AGENT_RESPONSE: DataReader(
                 self.participant, self.topics[TOPIC_AGENT_RESPONSE], self.qos_reliable
+            ),
+            TOPIC_AGENT_STATUS: DataReader(
+                self.participant, self.topics[TOPIC_AGENT_STATUS], self.qos_best_effort
             ),
         }
 
@@ -310,8 +337,9 @@ class DDSLayer:
             return []
 
         try:
-            # Use take() to consume messages from the queue
-            samples = self.subscribers[topic].take()
+            from cyclonedds.util import duration
+            # Use take() with timeout to consume messages from the queue
+            samples = self.subscribers[topic].take(timeout=duration(milliseconds=timeout_ms))
             result = []
             for s in samples:
                 # Handle both DataSample objects and raw data
@@ -327,6 +355,10 @@ class DDSLayer:
             logger.debug(f"No messages from {topic}: {e}")
             return []
 
+    async def read_registrations(self, timeout_ms: int = 100) -> list:
+        """Read agent registration messages"""
+        return self.read_messages(TOPIC_AGENT_REGISTER, timeout_ms)
+
     async def read_status_updates(self, timeout_ms: int = 100) -> list:
         """Read agent status updates"""
         return self.read_messages(TOPIC_AGENT_STATUS, timeout_ms)
@@ -340,65 +372,167 @@ class DDSLayer:
         return self.read_messages(TOPIC_CLIENT_REQUEST, timeout_ms)
 
     async def wait_for_client_response(self, request_id: str, timeout_ms: int = 60000) -> dict:
-        """Wait for a specific client response by request_id"""
-        import asyncio
+        """Wait for a specific client response by request_id.
 
+        Uses a per-request (event, result) pair stored in _pending_client_responses.
+        The event is set by dispatch_client_responses() which runs as a background
+        loop and is the only consumer of the TOPIC_CLIENT_RESPONSE reader.
+        """
         if not self.dds_available:
             logger.warning("DDS not available, cannot wait for response")
             return {"content": "", "error": "DDS not available"}
 
-        start_time = time.time()
-        timeout_seconds = timeout_ms / 1000.0
+        event = asyncio.Event()
+        result_container = [None]
+        self._pending_client_responses[request_id] = (event, result_container)
 
-        while time.time() - start_time < timeout_seconds:
-            responses = self.read_messages(TOPIC_CLIENT_RESPONSE, timeout_ms=100)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_ms / 1000.0)
+            logger.info(f"Received response for client request {request_id}")
+            return result_container[0]
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for response for client request {request_id}")
+            return {"content": "", "error": "Timeout waiting for response"}
+        finally:
+            self._pending_client_responses.pop(request_id, None)
 
-            for response in responses:
-                resp_id = getattr(response, "request_id", None)
-                if resp_id == request_id:
-                    logger.info(f"Received response for client request {request_id}")
-                    return response
+    def prepare_agent_response_waiter(self, task_id: str):
+        """Pre-register a waiter for the given task_id.
 
-            await asyncio.sleep(0.01)
-
-        logger.warning(f"Timeout waiting for response for client request {request_id}")
-        return {"content": "", "error": "Timeout waiting for response"}
+        Call this BEFORE publishing the agent request so that a response
+        arriving between publish and wait is not discarded by the
+        dispatch_agent_responses loop.
+        """
+        if task_id not in self._pending_agent_responses:
+            event = asyncio.Event()
+            result_container = [None]
+            self._pending_agent_responses[task_id] = (event, result_container)
 
     async def wait_for_agent_response(self, task_id: str, timeout_ms: int = 60000) -> dict:
-        """Wait for a specific agent response by task_id"""
-        import asyncio
+        """Wait for a specific agent response by task_id.
 
+        Uses a per-task (event, result) pair stored in _pending_agent_responses.
+        The event is set by dispatch_agent_responses() which runs as a background
+        loop and is the only consumer of the TOPIC_AGENT_RESPONSE reader — this
+        avoids race conditions caused by multiple concurrent callers each calling
+        take() and stealing each other's samples.
+
+        If prepare_agent_response_waiter() was called beforehand, reuses the
+        existing registration; otherwise registers a new one.
+        """
         if not self.dds_available:
             logger.warning("DDS not available, cannot wait for response")
             return {"content": "", "error": "DDS not available"}
 
-        start_time = time.time()
-        timeout_seconds = timeout_ms / 1000.0
+        if task_id in self._pending_agent_responses:
+            event, result_container = self._pending_agent_responses[task_id]
+        else:
+            event = asyncio.Event()
+            result_container = [None]
+            self._pending_agent_responses[task_id] = (event, result_container)
 
-        while time.time() - start_time < timeout_seconds:
-            responses = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=100)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_ms / 1000.0)
+            logger.info(f"Received response for task {task_id}")
+            return result_container[0]
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for response for task {task_id}")
+            return {"content": "", "error": "Timeout waiting for response"}
+        finally:
+            self._pending_agent_responses.pop(task_id, None)
 
-            for response in responses:
-                resp_task_id = getattr(response, "task_id", None)
-                if resp_task_id == task_id:
-                    logger.info(f"Received response for task {task_id}")
-                    return response
+    async def dispatch_client_responses(self):
+        """Background loop: sole reader of TOPIC_CLIENT_RESPONSE.
 
-            await asyncio.sleep(0.01)  # Small sleep to avoid CPU spinning
+        Reads samples and dispatches each one to the matching waiter in
+        _pending_client_responses.  Running as a single consumer avoids the
+        race condition where multiple concurrent wait_for_client_response()
+        callers each call take() and steal each other's samples.
+        """
+        while True:
+            try:
+                if self.dds_available and TOPIC_CLIENT_RESPONSE in self.subscribers:
+                    samples = self.read_messages(TOPIC_CLIENT_RESPONSE, timeout_ms=20)
+                    for sample in samples:
+                        request_id = getattr(sample, "request_id", None)
+                        if request_id and request_id in self._pending_client_responses:
+                            event, container = self._pending_client_responses[request_id]
+                            container[0] = sample
+                            event.set()
+                        else:
+                            logger.debug(f"[DDS] Client response for unknown request_id={request_id} discarded")
+            except Exception as e:
+                logger.debug(f"dispatch_client_responses error: {e}")
+            await asyncio.sleep(0.02)
 
-        logger.warning(f"Timeout waiting for response for task {task_id}")
-        return {"content": "", "error": "Timeout waiting for response"}
+    async def dispatch_agent_responses(self):
+        """Background loop: sole reader of TOPIC_AGENT_RESPONSE.
+
+        Reads samples and dispatches each one to the matching waiter in
+        _pending_agent_responses.  Running as a single consumer avoids the
+        race condition where two concurrent wait_for_agent_response() calls
+        each call take() and steal the other's sample.
+        """
+        while True:
+            try:
+                if self.dds_available and TOPIC_AGENT_RESPONSE in self.subscribers:
+                    samples = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=20)
+                    for sample in samples:
+                        task_id = getattr(sample, "task_id", None)
+                        if task_id and task_id in self._pending_agent_responses:
+                            event, container = self._pending_agent_responses[task_id]
+                            container[0] = sample
+                            event.set()
+                        else:
+                            logger.debug(f"[DDS] Response for unknown task_id={task_id} discarded")
+            except Exception as e:
+                logger.debug(f"dispatch_agent_responses error: {e}")
+            await asyncio.sleep(0.02)
 
     async def subscribe(self, topic: str, handler: Callable):
-        """Subscribe to topic with handler"""
+        """Subscribe to topic with handler - creates a DataReader with Listener"""
         self.handlers[topic] = handler
 
         if not self.dds_available:
             logger.warning(f"DDS unavailable, {topic} subscription will not receive messages")
             return
 
-        # In production, this would create a DataReader and listener
-        logger.info(f"Subscribed to {topic}")
+        topic_obj = self.topics.get(topic)
+        if not topic_obj:
+            logger.warning(f"Topic {topic} not found, cannot subscribe")
+            return
+
+        try:
+            from cyclonedds.sub import DataReader, Subscriber
+            from cyclonedds.core import Listener
+
+            handler_ref = handler
+
+            captured_loop = self._event_loop
+
+            class TopicListener(Listener):
+                def on_data_available(self, reader):
+                    if captured_loop is None or captured_loop.is_closed():
+                        return
+                    samples = reader.take()
+                    for sample in samples:
+                        valid = (
+                            (hasattr(sample, 'sample_info') and sample.sample_info.valid_data)
+                            or (not hasattr(sample, 'sample_info') and sample)
+                        )
+                        if valid:
+                            captured_loop.call_soon_threadsafe(
+                                lambda s=sample: captured_loop.create_task(handler_ref(s))
+                            )
+
+            listener = TopicListener()
+            qos = self.qos_reliable if topic not in (TOPIC_AGENT_STATUS,) else self.qos_best_effort
+            reader = DataReader(Subscriber(self.participant), topic_obj, qos=qos, listener=listener)
+            self.subscribers[topic] = reader
+            logger.info(f"Subscribed to {topic} with listener")
+        except Exception as e:
+            logger.error(f"Failed to create subscription for {topic}: {e}")
+            logger.info(f"Subscribed to {topic} (handler registered, no listener)")
 
     async def publish_agent_request(self, request: AgentTaskRequest):
         """Publish task request to agents"""
@@ -411,9 +545,10 @@ class DDSLayer:
             "messages_json": json.dumps(request.messages),
             "priority": request.priority,
             "timeout_ms": request.timeout_ms,
-            "requires_context": request.requires_context,
+            "requires_context": bool(request.requires_context),
             "context_id": "",
             "created_at": int(time.time()),
+            "stream": request.stream,
         }
         await self.publish(TOPIC_AGENT_REQUEST, data)
 
@@ -421,6 +556,12 @@ class DDSLayer:
                                           target_agent_id: str,
                                           action: str, payload: str):
         """Publish command to agent(s)"""
+        if not self.dds_available:
+            logger.warning(
+                f"[DDS] publish_orchestrator_command skipped (DDS unavailable): "
+                f"command_id={command_id}, action={action}, target={target_agent_id}"
+            )
+            return
         data = {
             "command_id": command_id,
             "target_agent_id": target_agent_id,
@@ -498,15 +639,27 @@ class DDSLayer:
             return {"available": False, "error": str(e)}
 
     def close(self):
-        """Close DDS connections and release resources"""
+        """Close DDS connections and release resources.
+
+        CycloneDDS Python bindings release C entities when the Python object
+        is garbage-collected.  Clearing the dicts drops all references so
+        the GC can finalize them.  The participant must be cleared last
+        because deleting it recursively deletes all child entities.
+        """
+        self.publishers.clear()
+        self.subscribers.clear()
+        self.topics.clear()
+
         if self.participant:
             try:
-                # cyclonedds-python DomainParticipant doesn't have close() method
-                # Just delete the reference for garbage collection
                 del self.participant
-                logger.info("DDS participant released")
             except Exception as e:
                 logger.error(f"Error closing DDS participant: {e}")
+            self.participant = None
+            logger.info("DDS participant released")
+
+        self.handlers.clear()
+        self.dds_available = False
 
     def is_available(self) -> bool:
         """Check if DDS is available"""

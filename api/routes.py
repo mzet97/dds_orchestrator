@@ -28,7 +28,7 @@ from models import (
     StreamChunk,
     TaskType,
 )
-from registry import AgentRegistry
+from registry import AgentRegistry, AgentInfo as RegistryAgentInfo
 from scheduler import TaskScheduler
 from context import ContextManager
 from dds_client import DDSClient
@@ -51,14 +51,17 @@ http_client: HTTPClient = None
 start_time: int = 0
 
 
-def init_routes(
+async def init_routes(
     reg: AgentRegistry,
     sched: TaskScheduler,
     ctx: ContextManager,
     dds: DDSClient,
     http: HTTPClient,
 ):
-    """Initialize routes with dependencies"""
+    """Initialize routes with dependencies.
+    Opens a persistent HTTP session for the http_client singleton.
+    Call shutdown_routes() on application shutdown to close it.
+    """
     global registry, scheduler, context_manager, dds_client, http_client, start_time
     registry = reg
     scheduler = sched
@@ -66,6 +69,16 @@ def init_routes(
     dds_client = dds
     http_client = http
     start_time = int(time.time())
+    # Initialize persistent HTTP session
+    if http_client:
+        await http_client.__aenter__()
+
+
+async def shutdown_routes():
+    """Shutdown routes - close persistent HTTP session"""
+    global http_client
+    if http_client:
+        await http_client.__aexit__(None, None, None)
 
 
 # ============================================
@@ -95,8 +108,21 @@ async def health_check():
 async def register_agent(registration: AgentRegistration):
     """Register a new agent"""
     registration.registered_at = int(time.time())
-    agent_id = await registry.register_agent(registration)
-    return {"agent_id": agent_id, "status": "registered"}
+    # Convert Pydantic AgentRegistration to registry's AgentInfo dataclass
+    agent_info = RegistryAgentInfo(
+        agent_id=registration.agent_id,
+        hostname=registration.hostname,
+        port=registration.port,
+        model=registration.model,
+        vram_available_mb=registration.vram_available_mb,
+        slots_idle=registration.slots_idle,
+        slots_total=registration.slots_total,
+        vision_enabled=registration.vision_enabled,
+        capabilities=registration.capabilities,
+        registered_at=registration.registered_at,
+    )
+    await registry.register_agent(agent_info)
+    return {"agent_id": agent_info.agent_id, "status": "registered"}
 
 
 @router.get("/agents", response_model=List[AgentInfo])
@@ -130,23 +156,22 @@ async def send_task_to_agent(agent_id: str, task: AgentTaskRequest):
         raise HTTPException(status_code=404, detail="Agent not found")
 
     # Check if agent is available
-    if agent.state != AgentState.IDLE or agent.idle_slots == 0:
+    if agent.status != "idle" or agent.slots_idle == 0:
         raise HTTPException(status_code=503, detail="Agent is busy")
 
     # Send task via HTTP (fallback)
-    async with http_client:
-        # Build messages
-        messages = [m.model_dump() for m in task.messages]
+    # Build messages
+    messages = [m.model_dump() for m in task.messages]
 
-        response = await http_client.send_chat_request(
-            host=agent.hostname,
-            port=agent.port,
-            messages=messages,
-            model=agent.model,
-        )
+    response = await http_client.send_chat_request(
+        host=agent.hostname,
+        port=agent.port,
+        messages=messages,
+        model=agent.model,
+    )
 
-        if response:
-            return response
+    if response:
+        return response
 
     raise HTTPException(status_code=500, detail="Failed to send task")
 
@@ -176,21 +201,20 @@ async def chat_completions(request: ChatCompletionRequest):
         requester_id="api",
         task_type=TaskType.CHAT,
         messages=request.messages,
-        priority=5,
+        priority=request.priority,
         timeout_ms=request.max_tokens * 100,  # Estimate
     )
 
     # Send via HTTP
-    async with http_client:
-        messages_dict = [m.model_dump() for m in request.messages]
-        response = await http_client.send_chat_request(
-            host=agent.hostname,
-            port=agent.port,
-            messages=messages_dict,
-            model=request.model,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
+    messages_dict = [m.model_dump() for m in request.messages]
+    response = await http_client.send_chat_request(
+        host=agent.hostname,
+        port=agent.port,
+        messages=messages_dict,
+        model=request.model,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+    )
 
     if not response or not response.success:
         raise HTTPException(status_code=500, detail=response.error_message if response else "Task failed")
@@ -255,17 +279,17 @@ async def chat_completions_websocket(websocket: WebSocket):
         })
 
         # Send request to agent and relay response
-        async with http_client:
-            messages_dict = [m.model_dump() for m in request.messages]
-            response = await http_client.send_chat_request(
-                host=agent.hostname,
-                port=agent.port,
-                messages=messages_dict,
-                model=request.model,
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-            )
+        messages_dict = [m.model_dump() for m in request.messages]
+        response = await http_client.send_chat_request(
+            host=agent.hostname,
+            port=agent.port,
+            messages=messages_dict,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
 
+        # TODO: implement real SSE streaming -- currently buffers full response
         if response and response.success:
             content = response.content
             # Stream content in chunks
@@ -402,16 +426,15 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         except Exception as e:
             # Fallback: request via HTTP client (non-streaming), then chunk it
             try:
-                async with http_client:
-                    messages_dict = [m.model_dump() for m in request.messages]
-                    response = await http_client.send_chat_request(
-                        host=agent.hostname,
-                        port=agent.port,
-                        messages=messages_dict,
-                        model=request.model,
-                        temperature=request.temperature,
-                        max_tokens=request.max_tokens,
-                    )
+                messages_dict = [m.model_dump() for m in request.messages]
+                response = await http_client.send_chat_request(
+                    host=agent.hostname,
+                    port=agent.port,
+                    messages=messages_dict,
+                    model=request.model,
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                )
 
                 if response and response.success:
                     content = response.content
@@ -471,7 +494,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
 @router.get("/v1/models", response_model=ModelListResponse)
 async def list_models():
     """List available models"""
-    agents = await registry.get_online_agents()
+    agents = await registry.get_all_agents()
 
     # Get unique models
     models_seen = set()
@@ -493,7 +516,8 @@ async def list_models():
 @router.get("/v1/models/{model_id}")
 async def get_model(model_id: str):
     """Get model info"""
-    agents = await registry.find_agents_by_model(model_id)
+    all_agents = await registry.get_all_agents()
+    agents = [a for a in all_agents if a.model == model_id]
 
     if not agents:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -507,8 +531,8 @@ async def get_model(model_id: str):
         "agent": {
             "agent_id": agent.agent_id,
             "hostname": agent.hostname,
-            "state": agent.state.value,
-            "idle_slots": agent.idle_slots,
+            "state": agent.status,
+            "idle_slots": agent.slots_idle,
         },
     }
 

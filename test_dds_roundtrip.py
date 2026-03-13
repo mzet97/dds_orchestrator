@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Test DDS Round-Trip — Verifica que mensagens publicadas chegam ao subscriber.
-Testa publish → subscribe com dois participantes no mesmo domínio.
+Test DDS Round-Trip -- Verifica que mensagens publicadas chegam ao subscriber.
+Testa publish -> subscribe com dois participantes no mesmo dominio.
+
+NOTA: Estes testes medem "loopback local" (self-delivery) e comunicacao
+entre dois DomainParticipants no mesmo processo. Nao sao round-trip reais
+entre dois processos separados.
 
 Uso:
     python test_dds_roundtrip.py
@@ -19,8 +23,12 @@ from dds import DDSLayer, TOPIC_AGENT_REQUEST, TOPIC_AGENT_RESPONSE, TOPIC_AGENT
 
 
 async def test_dds_roundtrip_same_participant():
-    """Test publish → read with same DDS participant (self-loopback)"""
-    print("\n=== Test: DDS Round-Trip (Same Participant) ===")
+    """
+    Test publish -> read with same DDS participant (self-loopback).
+    NOTE: This is local self-delivery, not a real round-trip between processes.
+    """
+    print("\n=== Test: DDS Loopback (Same Participant) ===")
+    print("  NOTE: This is local self-delivery, not a real inter-process round-trip.")
 
     config = OrchestratorConfig(dds_enabled=True, dds_domain=0)
     dds = DDSLayer(config)
@@ -58,17 +66,22 @@ async def test_dds_roundtrip_same_participant():
     dds.close()
 
     if len(messages) > 0:
-        print("[OK] Round-trip test passed (self-loopback working)")
+        print("[PASS] Loopback test passed (self-delivery working)")
     else:
-        print("[INFO] Self-loopback not received (expected in some DDS configs)")
-        print("[OK] Test completed — use two separate participants for full round-trip")
+        print("[SKIP] Self-loopback not received (expected in some DDS configs)")
+        print("  Use two separate participants for inter-process round-trip")
 
     return True
 
 
 async def test_dds_roundtrip_two_participants():
-    """Test publish → subscribe with two separate DDS participants"""
-    print("\n=== Test: DDS Round-Trip (Two Participants) ===")
+    """
+    Test publish -> subscribe with two separate DDS participants.
+    NOTE: Both participants are in the same process -- this tests local
+    inter-participant delivery, not real inter-process communication.
+    """
+    print("\n=== Test: DDS Delivery (Two Participants, Same Process) ===")
+    print("  NOTE: Both participants in same process (not inter-process round-trip).")
 
     config = OrchestratorConfig(dds_enabled=True, dds_domain=0)
 
@@ -114,17 +127,24 @@ async def test_dds_roundtrip_two_participants():
     sub_layer.close()
 
     if len(messages) > 0:
-        print("[OK] Two-participant round-trip test passed!")
+        print("[PASS] Two-participant delivery test passed!")
         return True
     else:
-        print("[WARN] No messages received — DDS discovery may need more time")
-        print("[INFO] In production, participants are long-lived and discovery happens at startup")
-        return True
+        print("[FAIL] No messages received between two participants")
+        print("  DDS discovery may need more time, or loopback is disabled.")
+        print("  In production, participants are long-lived and discovery happens at startup.")
+        return False
 
 
 async def test_dds_latency_roundtrip():
-    """Measure DDS publish + read latency"""
+    """
+    Measure DDS publish + read latency.
+    NOTE: This measures publish() + read_messages() on the same participant.
+    If self-delivery is not working, the read will timeout and the measured
+    latency will reflect the timeout value, not actual DDS latency.
+    """
     print("\n=== Test: DDS Latency (Publish + Read) ===")
+    print("  NOTE: Measures publish+read on same participant (local loopback).")
 
     config = OrchestratorConfig(dds_enabled=True, dds_domain=0)
     dds = DDSLayer(config)
@@ -180,10 +200,16 @@ async def test_dds_latency_roundtrip():
     print(f"    Min:    {min_lat:.3f} ms")
     print(f"    Max:    {max_lat:.3f} ms")
 
-    if avg < 10.0:
-        print("[OK] Latency within acceptable range")
+    if avg > 90.0:
+        print(f"  [WARN: avg={avg:.1f}ms is close to the 100ms read timeout.")
+        print(f"   This likely means self-delivery is not working and the measured")
+        print(f"   latency reflects the timeout, not actual DDS latency.]")
+        print("[WARN] Latency likely reflects timeout, not real DDS latency")
+        return True
+    elif avg < 10.0:
+        print("[PASS] Latency within acceptable range")
     else:
-        print("[WARN] Latency higher than expected")
+        print("[WARN] Latency higher than expected but below timeout threshold")
 
     return True
 
@@ -191,13 +217,13 @@ async def test_dds_latency_roundtrip():
 async def main():
     """Run all DDS round-trip tests"""
     print("=" * 60)
-    print("DDS Round-Trip Tests")
+    print("DDS Round-Trip / Loopback Tests")
     print("=" * 60)
 
     tests = [
-        ("Same Participant", test_dds_roundtrip_same_participant),
+        ("Same Participant (Loopback)", test_dds_roundtrip_same_participant),
         ("Two Participants", test_dds_roundtrip_two_participants),
-        ("Latency", test_dds_latency_roundtrip),
+        ("Latency (Publish+Read)", test_dds_latency_roundtrip),
     ]
 
     passed = 0

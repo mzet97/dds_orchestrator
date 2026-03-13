@@ -2,171 +2,208 @@
 """
 E4: Escalabilidade Multi-Agente - gRPC
 ======================================
-Mede throughput e latência com gRPC
-100% REAL - usa servidor LLM real
+Avalia throughput e latência com múltiplos clientes via gRPC.
+
+Requer: servidor(es) gRPC rodando (_grpc_server.py --backend http://... --port 50051)
+
+Design experimental (conforme dissertação):
+  Fase A: 1 agente, clientes = 1, 2, 4, 8
+  Fase B: 2 agentes, clientes = 1, 2, 4, 8
+  N = 50 requisições por cliente por configuração
 
 Usage:
-    python E4_scalability_grpc.py --agentes localhost:50051 --clientes 8 --n 50
+    # Iniciar servidores gRPC nas VMs (VM1 e VM2):
+    python _grpc_server.py --backend http://localhost:8082 --port 50051
+
+    # Fase A (1 agente):
+    python E4_scalability_grpc.py --agentes 192.168.1.60:50051 --n 50
+
+    # Fase B (2 agentes):
+    python E4_scalability_grpc.py --agentes 192.168.1.60:50051,192.168.1.61:50051 --n 50
 """
 
 import argparse
 import asyncio
 import json
+import random
 import time
 import statistics
 import psutil
 from pathlib import Path
 from typing import Dict, List
 import grpc
-# import your_generated_pb2 as pb2
-# import your_generated_pb2_grpc as pb2_grpc
+
+
+def _json_serialize(obj: dict) -> bytes:
+    return json.dumps(obj).encode("utf-8")
+
+
+def _json_deserialize(data: bytes) -> dict:
+    return json.loads(data.decode("utf-8"))
+
+
+CLIENT_COUNTS = [1, 2, 4, 8]
 
 
 class ScalabilityBenchmarkGRPC:
-    """Benchmark de escalabilidade multi-agente com gRPC."""
+    """Benchmark de escalabilidade com gRPC."""
 
-    def __init__(self, agentes: List[str], clientes: int):
-        self.agentes = agentes  # Lista de endereços gRPC
-        self.clientes = clientes
+    def __init__(self, agentes: List[str]):
+        self.agentes = agentes
+        # Canal por agente (reutilizado)
+        self._channels = {
+            addr: grpc.insecure_channel(addr) for addr in agentes
+        }
+        self._stubs = {
+            addr: ch.unary_unary(
+                "/LLMService/Chat",
+                request_serializer=_json_serialize,
+                response_deserializer=_json_deserialize,
+            )
+            for addr, ch in self._channels.items()
+        }
 
-    async def client_request(self, agent_addr: str) -> Dict:
-        """Executa uma requisição REAL via gRPC e mede latência."""
+    def close(self):
+        for ch in self._channels.values():
+            ch.close()
+
+    def _single_request(self, addr: str) -> Dict:
+        """Requisição síncrona ao servidor gRPC."""
+        stub = self._stubs[addr]
+        payload = {
+            "model": "phi4-mini",
+            "content": "O que e 2+2?",
+            "max_tokens": 20
+        }
         start = time.perf_counter()
-
         try:
-            # Criar canal gRPC
-            channel = grpc.insecure_channel(agent_addr)
-            # stub = pb2_grpc.AgentServiceStub(channel)
-
-            # Simular chamada gRPC (substituir com chamada real)
-            # request = pb2.ChatRequest(
-            #     messages=[pb2.Message(role="user", content="O que é 2+2?")]
-            # )
-            # response = stub.Chat(request)
-
-            # Por agora, simular com pequeno delay de rede
-            await asyncio.sleep(0.01)
-
-            channel.close()
-
+            stub(payload, timeout=120)
             end = time.perf_counter()
-            latency = (end - start) * 1000  # ms
-
-            return {
-                "success": True,
-                "latency_ms": latency
-            }
+            return {"success": True, "latency_ms": (end - start) * 1000}
+        except grpc.RpcError as e:
+            end = time.perf_counter()
+            return {"success": False, "latency_ms": (end - start) * 1000,
+                    "error": str(e.code())}
         except Exception as e:
             end = time.perf_counter()
-            return {
-                "success": False,
-                "latency_ms": (end - start) * 1000,
-                "error": str(e)
-            }
+            return {"success": False, "latency_ms": (end - start) * 1000, "error": str(e)}
 
-    async def run_concurrent_clients(self, n: int) -> List[Dict]:
-        """Executa N requisições concorrentes de múltiplos clientes."""
-        results = []
-
-        # Criar tasks para todos os clientes
-        tasks = []
-        for _ in range(n):
-            # Cada cliente escolhe um agente aleatório
-            import random
-            agent = random.choice(self.agentes)
-            task = self.client_request(agent)
-            tasks.append(task)
-
-        # Executar todos concurrently
+    async def run_concurrent(self, num_clientes: int, n_per_client: int) -> List[Dict]:
+        """Executa num_clientes × n_per_client requisições concorrentes."""
+        total = num_clientes * n_per_client
+        loop = asyncio.get_event_loop()
+        tasks = [
+            loop.run_in_executor(None, self._single_request, random.choice(self.agentes))
+            for _ in range(total)
+        ]
         results = await asyncio.gather(*tasks)
-
-        return results
-
-    def get_orchestrator_resources(self) -> Dict:
-        """Captura uso de CPU e memória."""
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_mb']):
-            try:
-                if 'python' in proc.info['name'].lower():
-                    return {
-                        "cpu_percent": proc.cpu_percent(),
-                        "memory_mb": proc.memory_info().rss / 1024 / 1024
-                    }
-            except:
-                pass
-        return {"cpu_percent": 0, "memory_mb": 0}
+        return list(results)
 
 
 async def run_benchmark(args):
-    """Executa benchmark de escalabilidade."""
+    """Executa benchmark E4 completo (Fase A e Fase B)."""
 
-    # Endereços dos agentes gRPC
-    agentes = args.agentes.split(",") if args.agentes else ["localhost:50051"]
+    raw_agentes = [a.strip() for a in args.agentes.split(",") if a.strip()]
+    # Normalizar: remover prefixo http:// se presente
+    agentes = []
+    for a in raw_agentes:
+        if a.startswith("http"):
+            from urllib.parse import urlparse
+            parsed = urlparse(a)
+            agentes.append(f"{parsed.hostname}:{parsed.port or 50051}")
+        else:
+            agentes.append(a)
 
-    benchmark = ScalabilityBenchmarkGRPC(agentes=agentes, clientes=args.clientes)
+    num_agentes = len(agentes)
+    phase = "A" if num_agentes == 1 else "B" if num_agentes == 2 else f"{num_agentes}ag"
 
-    results = []
+    benchmark = ScalabilityBenchmarkGRPC(agentes)
 
     print(f"E4: Escalabilidade Multi-Agente - gRPC")
-    print(f"Agentes: {len(agentes)}")
-    print(f"Clientes simultâneos: {args.clientes}")
+    print(f"Agentes ({num_agentes}): {agentes}")
+    print(f"Fase: {phase}")
+    print(f"Configurações de clientes: {CLIENT_COUNTS}")
     print(f"Requisições por cliente: {args.n}")
-    print("-" * 50)
+    print("=" * 60)
 
-    # Executar teste
-    client_results = await benchmark.run_concurrent_clients(args.clientes * args.n)
-
-    # Calcular métricas
-    latencies = [r["latency_ms"] for r in client_results if r.get("success")]
-    successes = sum(1 for r in client_results if r.get("success"))
-
-    # Recursos
-    resources = benchmark.get_orchestrator_resources()
-
-    summary = {
-        "protocol": "GRPC",
-        "num_agentes": len(agentes),
-        "num_clientes": args.clientes,
-        "total_requests": len(client_results),
-        "successful_requests": successes,
-        "throughput_req_s": successes / (max(latencies) / 1000) if latencies else 0,
-        "latency_p50_ms": round(statistics.median(latencies), 2) if latencies else 0,
-        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0,
-        "latency_p99_ms": round(sorted(latencies)[int(len(latencies) * 0.99)] if latencies else 0,
-        "cpu_orchestrator_pct": round(resources.get("cpu_percent", 0), 2),
-        "mem_orchestrator_mb": round(resources.get("memory_mb", 0), 2)
-    }
-
-    # Salvar CSV
-    csv_file = f"results/E4_GRPC_{len(agentes)}ag_{args.clientes}cl.csv"
+    all_summaries = []
     Path("results").mkdir(exist_ok=True)
 
-    with open(csv_file, "w") as f:
-        f.write("cliente,latency_ms,success\n")
-        for i, r in enumerate(client_results):
-            f.write(f"{i},{r['latency_ms']},{1 if r.get('success') else 0}\n")
+    try:
+        for num_clientes in CLIENT_COUNTS:
+            print(f"\n--- Fase {phase}: {num_agentes} agente(s), {num_clientes} cliente(s) ---")
 
-    # Salvar JSON
-    json_file = f"results/E4_GRPC_{len(agentes)}ag_{args.clientes}cl_summary.json"
+            results = await benchmark.run_concurrent(num_clientes, args.n)
+
+            latencies = sorted([r["latency_ms"] for r in results if r.get("success")])
+            successes = len(latencies)
+            total = len(results)
+
+            if not latencies:
+                print("  ERRO: nenhuma requisição bem-sucedida")
+                all_summaries.append({"phase": phase, "num_clientes": num_clientes, "error": "no data"})
+                continue
+
+            throughput = successes / (latencies[-1] / 1000.0) if latencies[-1] > 0 else 0
+
+            summary = {
+                "protocol": "gRPC",
+                "phase": phase,
+                "num_agentes": num_agentes,
+                "num_clientes": num_clientes,
+                "total_requests": total,
+                "successful_requests": successes,
+                "throughput_req_s": round(throughput, 3),
+                "latency_p50_ms": round(statistics.median(latencies), 2),
+                "latency_p95_ms": round(latencies[int(len(latencies) * 0.95)], 2),
+                "latency_p99_ms": round(latencies[int(len(latencies) * 0.99)], 2),
+                "latency_mean_ms": round(statistics.mean(latencies), 2),
+                "latency_stdev_ms": round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0,
+                "cpu_pct": round(psutil.cpu_percent(interval=0.1), 1),
+                "mem_mb": round(psutil.virtual_memory().used / 1024 / 1024, 1)
+            }
+            all_summaries.append(summary)
+
+            print(f"  Throughput: {summary['throughput_req_s']:.2f} req/s")
+            print(f"  Latência p50: {summary['latency_p50_ms']:.2f}ms  "
+                  f"p95: {summary['latency_p95_ms']:.2f}ms  "
+                  f"p99: {summary['latency_p99_ms']:.2f}ms")
+            print(f"  Sucesso: {successes}/{total}")
+
+            csv_file = f"results/E4_gRPC_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
+            with open(csv_file, "w") as f:
+                f.write("latency_ms,success\n")
+                for r in results:
+                    f.write(f"{r['latency_ms']},{1 if r.get('success') else 0}\n")
+
+            await asyncio.sleep(2.0)
+
+    finally:
+        benchmark.close()
+
+    json_file = f"results/E4_gRPC_fase{phase}_{num_agentes}ag_summary.json"
     with open(json_file, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(all_summaries, f, indent=2)
 
-    print("\nResultados:")
-    print(f"Throughput: {summary['throughput_req_s']:.2f} req/s")
-    print(f"Latência p50: {summary['latency_p50_ms']:.2f}ms")
-    print(f"Latência p95: {summary['latency_p95_ms']:.2f}ms")
-    print(f"CPU: {summary['cpu_orchestrator_pct']:.1f}%")
-    print(f"Memória: {summary['mem_orchestrator_mb']:.1f}MB")
-    print(f"\nCSV: {csv_file}")
-    print(f"JSON: {json_file}")
+    print(f"\n{'=' * 60}")
+    print(f"Resumo Fase {phase} ({num_agentes} agente(s)):")
+    print(f"{'Clientes':>8} {'p50(ms)':>10} {'p95(ms)':>10} {'req/s':>8}")
+    for s in all_summaries:
+        if "error" not in s:
+            print(f"{s['num_clientes']:>8} {s['latency_p50_ms']:>10.1f} "
+                  f"{s['latency_p95_ms']:>10.1f} {s['throughput_req_s']:>8.2f}")
 
-    return summary
+    print(f"\nJSON: {json_file}")
+    return all_summaries
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E4: Escalabilidade Multi-Agente - gRPC")
-    parser.add_argument("--agentes", default="localhost:50051", help="Endereços gRPC dos agentes (separados por vírgula)")
-    parser.add_argument("--clientes", type=int, default=1, help="Número de clientes simultâneos")
-    parser.add_argument("--n", type=int, default=50, help="Requisições por cliente")
+    parser = argparse.ArgumentParser(description="E4: Escalabilidade - gRPC")
+    parser.add_argument("--agentes", default="localhost:50051",
+                        help="Endereços gRPC dos agentes separados por vírgula. "
+                             "1 agente = Fase A, 2 agentes = Fase B")
+    parser.add_argument("--n", type=int, default=50,
+                        help="Requisições por cliente por configuração")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

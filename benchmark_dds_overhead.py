@@ -78,7 +78,11 @@ async def benchmark_dds_publish(runs: int = 1000, domain: int = 0) -> dict:
 
 
 async def benchmark_dds_serialization(runs: int = 1000) -> dict:
-    """Mede overhead de serialização/deserialização JSON (simula IDL)"""
+    """Mede overhead de serialização/deserialização JSON (proxy para IDL/CDR).
+
+    NOTA: Esta medição é de JSON encode/decode (proxy para CDR/IDL).
+    A serialização real do CycloneDDS usa CDR binário e pode ter overhead diferente.
+    """
     test_message = {
         "task_id": str(uuid.uuid4()),
         "requester_id": "benchmark-client",
@@ -125,10 +129,13 @@ async def benchmark_dds_serialization(runs: int = 1000) -> dict:
         end = time.perf_counter()
         roundtrip_latencies.append((end - start) * 1000)
 
+    print("  NOTA: Esta medicao e de JSON (proxy para CDR/IDL).")
+    print("  A serializacao real do CycloneDDS usa CDR binario e pode ter overhead diferente.")
+
     return {
-        "serialize": _compute_stats("Serialization", serialize_latencies),
-        "deserialize": _compute_stats("Deserialization", deserialize_latencies),
-        "roundtrip": _compute_stats("Serialize+Deserialize", roundtrip_latencies),
+        "serialize": _compute_stats("JSON Serialization (proxy for CDR)", serialize_latencies),
+        "deserialize": _compute_stats("JSON Deserialization (proxy for CDR)", deserialize_latencies),
+        "roundtrip": _compute_stats("JSON Serialize+Deserialize (proxy for CDR)", roundtrip_latencies),
         "payload_bytes": len(json.dumps(test_message).encode("utf-8")),
     }
 
@@ -142,7 +149,10 @@ async def benchmark_http_echo(runs: int = 100, host: str = "127.0.0.1", port: in
     """
     Mede latência HTTP round-trip (POST JSON + response).
     Requer um servidor llama-server ou equivalente rodando.
-    Usa /health como endpoint leve para medir overhead puro.
+
+    NOTA: /health é um endpoint trivial (sem inferência). Para comparação
+    real com DDS, use E1_decompose_latency_http.py que mede
+    /v1/chat/completions com inferência real.
     """
     url_health = f"http://{host}:{port}/health"
     url_completions = f"http://{host}:{port}/v1/completions"
@@ -224,7 +234,7 @@ def _compute_stats(label: str, latencies: List[float]) -> dict:
     sorted_lats = sorted(latencies)
     n = len(sorted_lats)
 
-    return {
+    result = {
         "label": label,
         "n": n,
         "mean_ms": statistics.mean(sorted_lats),
@@ -232,10 +242,15 @@ def _compute_stats(label: str, latencies: List[float]) -> dict:
         "stddev_ms": statistics.stdev(sorted_lats) if n > 1 else 0.0,
         "min_ms": sorted_lats[0],
         "max_ms": sorted_lats[-1],
-        "p50_ms": sorted_lats[int(n * 0.50)],
-        "p95_ms": sorted_lats[int(n * 0.95)],
-        "p99_ms": sorted_lats[int(n * 0.99)],
+        "p50_ms": statistics.median(sorted_lats),
+        "p95_ms": sorted_lats[min(int(n * 0.95), n - 1)],
+        "p99_ms": sorted_lats[min(int(n * 0.99), n - 1)],
     }
+
+    if n < 100:
+        result["_warning"] = f"N={n} < 100: p95/p99 percentiles have low statistical reliability"
+
+    return result
 
 
 def print_stats(stats: dict, indent: int = 0):
@@ -248,6 +263,8 @@ def print_stats(stats: dict, indent: int = 0):
     if "label" in stats:
         s = stats
         print(f"{prefix}{s['label']} (n={s['n']}):")
+        if s.get("_warning"):
+            print(f"{prefix}  AVISO: {s['_warning']}")
         print(f"{prefix}  Mean:   {s['mean_ms']:.4f} ms")
         print(f"{prefix}  Median: {s['median_ms']:.4f} ms")
         print(f"{prefix}  Stddev: {s['stddev_ms']:.4f} ms")
@@ -285,8 +302,8 @@ async def main():
     print(f"Runs: {args.runs}")
     print("=" * 60)
 
-    # 1. Serialization overhead
-    print("\n--- Serialization Overhead ---")
+    # 1. Serialization overhead (JSON as proxy for CDR/IDL)
+    print("\n--- Serialization Overhead (JSON proxy for CDR/IDL) ---")
     serial_stats = await benchmark_dds_serialization(args.runs)
     print_stats(serial_stats)
 
@@ -299,6 +316,8 @@ async def main():
     # 3. HTTP overhead
     if not args.skip_http:
         print(f"\n--- HTTP Overhead ({args.http_host}:{args.http_port}) ---")
+        print("  NOTA: /health e endpoint trivial. Para comparacao com DDS use")
+        print("  E1_decompose_latency_http.py que mede /v1/chat/completions com inferencia real.")
         http_stats = await benchmark_http_echo(
             runs=min(args.runs, 500),
             host=args.http_host,

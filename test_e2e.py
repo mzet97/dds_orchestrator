@@ -2,10 +2,14 @@
 """
 End-to-End Test with Mock LLM Server
 Tests the complete flow:
-    Client HTTP → Orchestrator → Agent → Mock llama-server → Agent → Orchestrator → Client
+    Client HTTP -> Orchestrator -> Agent -> Mock llama-server -> Agent -> Orchestrator -> Client
 
 Sobe um mock HTTP server que responde como llama-server, registra um agent,
 e verifica o fluxo completo de chat.
+
+NOTA: Este teste E2E usa dds_enabled=False e valida apenas o caminho HTTP
+do servidor. Nao testa o transporte DDS. E um smoke test do servidor HTTP
+e da integracao entre registry, scheduler e agent via HTTP fallback.
 
 Uso:
     python test_e2e.py
@@ -198,9 +202,14 @@ class MockAgentServer:
 async def test_e2e_with_orchestrator():
     """
     Test full E2E flow:
-    Client → Orchestrator → Agent → Mock LLM → back
+    Client -> Orchestrator -> Agent -> Mock LLM -> back
+
+    NOTE: This test uses dds_enabled=False. It validates only the HTTP path
+    of the orchestrator server, not the DDS transport. It is a smoke test
+    for the HTTP server and registry/scheduler integration.
     """
     print("\n=== Test: End-to-End Flow ===")
+    print("  NOTE: dds_enabled=False -- HTTP-only smoke test, not DDS validation.")
 
     from config import OrchestratorConfig
     from registry import AgentRegistry, AgentInfo
@@ -216,11 +225,11 @@ async def test_e2e_with_orchestrator():
     await mock_llm.start()
     await mock_agent.start()
 
-    # Start orchestrator
+    # Start orchestrator (HTTP-only, no DDS)
     config = OrchestratorConfig(
         host="127.0.0.1",
         port=9990,
-        dds_enabled=False,  # Use HTTP fallback for test
+        dds_enabled=False,  # HTTP fallback only -- does NOT validate DDS path
     )
     registry = AgentRegistry(config)
     scheduler = TaskScheduler(config)
@@ -248,10 +257,10 @@ async def test_e2e_with_orchestrator():
             # Test 1: Health check
             print("\n  [Test 1] Health check...")
             async with session.get("http://127.0.0.1:9990/health") as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                assert data["status"] == "healthy"
-                print(f"    Health: {data['status']} ✓")
+                assert data["status"] == "healthy", f"Expected 'healthy', got '{data['status']}'"
+                print(f"    Health: {data['status']}")
                 results["passed"] += 1
 
             # Test 2: Register agent
@@ -271,19 +280,19 @@ async def test_e2e_with_orchestrator():
                 "http://127.0.0.1:9990/agents/register",
                 json=reg_data
             ) as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                assert data["success"] is True
-                print(f"    Registered: {data['agent_id']} ✓")
+                assert data["success"] is True, f"Expected success=True, got {data.get('success')}"
+                print(f"    Registered: {data['agent_id']}")
                 results["passed"] += 1
 
             # Test 3: List agents
             print("\n  [Test 3] List agents...")
             async with session.get("http://127.0.0.1:9990/agents") as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                assert len(data["agents"]) == 1
-                print(f"    Agents: {len(data['agents'])} ✓")
+                assert len(data["agents"]) == 1, f"Expected 1 agent, got {len(data['agents'])}"
+                print(f"    Agents: {len(data['agents'])}")
                 results["passed"] += 1
 
             # Test 4: Chat request (end-to-end)
@@ -297,10 +306,15 @@ async def test_e2e_with_orchestrator():
                 "http://127.0.0.1:9990/chat",
                 json=chat_data
             ) as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                assert "task_id" in data or "response" in data or "success" in data
-                print(f"    Chat response received ✓")
+                # Verify the response is not an error
+                assert data.get("success") is not False, f"Response indicates failure: {data}"
+                assert not (data.get("error") and data.get("error") != ""), \
+                    f"Response contains error: {data.get('error')}"
+                assert "task_id" in data or "response" in data or "success" in data, \
+                    f"Response missing expected fields: {list(data.keys())}"
+                print(f"    Chat response received")
                 print(f"    Data: {json.dumps(data, indent=2)[:200]}")
                 results["passed"] += 1
 
@@ -314,30 +328,37 @@ async def test_e2e_with_orchestrator():
                 "http://127.0.0.1:9990/generate",
                 json=gen_data
             ) as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                print(f"    Generate response received ✓")
+                # Verify response field exists and is not empty
+                response_content = data.get("response", "")
+                assert data.get("success") is not False, f"Response indicates failure: {data}"
+                if "response" in data:
+                    assert response_content != "", "Response field exists but is empty"
+                print(f"    Generate response received")
                 print(f"    Data: {json.dumps(data, indent=2)[:200]}")
                 results["passed"] += 1
 
             # Test 6: Status endpoint
             print("\n  [Test 6] Status endpoint...")
             async with session.get("http://127.0.0.1:9990/status") as resp:
-                assert resp.status == 200
+                assert resp.status == 200, f"Expected status 200, got {resp.status}"
                 data = await resp.json()
-                assert "registry" in data
-                assert "scheduler" in data
-                print(f"    Registry: {data['registry']} ✓")
+                assert "registry" in data, "Status response missing 'registry' field"
+                assert "scheduler" in data, "Status response missing 'scheduler' field"
+                print(f"    Registry: {data['registry']}")
                 results["passed"] += 1
 
-            # Test 7: Mock LLM received requests
+            # Test 7: Verify mock LLM received requests
             print("\n  [Test 7] Verify mock LLM received requests...")
             if len(mock_llm.requests_received) > 0:
-                print(f"    Mock LLM received {len(mock_llm.requests_received)} requests ✓")
+                print(f"    Mock LLM received {len(mock_llm.requests_received)} requests")
                 results["passed"] += 1
             else:
-                print("    Mock LLM received 0 requests (agent may use different path)")
-                results["passed"] += 1  # Still pass — agent might call /chat not /v1/
+                print(f"    [FAIL] Mock LLM received 0 requests.")
+                print(f"    The orchestrator did not forward any request to the LLM backend.")
+                print(f"    This may indicate the agent routing or HTTP forwarding is broken.")
+                results["failed"] += 1
 
     except AssertionError as e:
         print(f"    FAIL: {e}")
@@ -358,6 +379,7 @@ async def main():
     """Run all E2E tests"""
     print("=" * 60)
     print("End-to-End Tests (with Mock LLM)")
+    print("NOTE: These tests use dds_enabled=False (HTTP-only smoke test)")
     print("=" * 60)
 
     try:

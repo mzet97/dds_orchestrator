@@ -75,10 +75,10 @@ def remove_outliers_iqr(latencies: List[float], factor: float = 1.5) -> Tuple[Li
     if len(latencies) < 4:
         return latencies, 0
 
-    s = sorted(latencies)
-    n = len(s)
-    q1 = s[int(n * 0.25)]
-    q3 = s[int(n * 0.75)]
+    # Use statistics.quantiles for accurate Q1/Q3 computation
+    quantiles = statistics.quantiles(latencies, n=4)
+    q1 = quantiles[0]
+    q3 = quantiles[2]
     iqr = q3 - q1
     lower = q1 - factor * iqr
     upper = q3 + factor * iqr
@@ -110,7 +110,7 @@ def compute_stats(latencies: List[float]) -> Dict[str, float]:
         "stddev_ms": round(stddev, 3),
         "min_ms": round(s[0], 3),
         "max_ms": round(s[-1], 3),
-        "p50_ms": round(s[int(n * 0.50)], 3),
+        "p50_ms": round(statistics.median(s), 3),
         "p90_ms": round(s[min(int(n * 0.90), n - 1)], 3),
         "p95_ms": round(s[min(int(n * 0.95), n - 1)], 3),
         "p99_ms": round(s[min(int(n * 0.99), n - 1)], 3),

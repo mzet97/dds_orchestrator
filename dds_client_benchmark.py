@@ -19,7 +19,9 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.pub import Publisher
 from cyclonedds.sub import Subscriber
 from cyclonedds.topic import Topic
-from cyclonedds.qos import QoS, Policy
+from cyclonedds.core import Policy
+from cyclonedds.qos import Qos
+from cyclonedds.util import duration
 from cyclonedds.idl import IdlStruct
 from cyclonedds.idl.types import bounded_str, int32, int64, bool_
 
@@ -73,9 +75,9 @@ class DDSClientBenchmark:
         self.participant = DomainParticipant(self.domain)
 
         # QoS para comunicação confiável
-        qos_reliable = QoS(
-            Policy.Reliability.RELIABLE,
-            Policy.Durability.TRANSIENT_LOCAL
+        qos_reliable = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(milliseconds=100)),
+            Policy.Durability.TransientLocal,
         )
 
         # Publisher para enviar requisições
@@ -123,7 +125,7 @@ class DDSClientBenchmark:
             priority=priority,
             timeout_ms=timeout_ms,
             requires_context=False,
-            created_at=int(time.time())
+            created_at=int(time.time() * 1000)  # milliseconds, consistent with other files
         )
 
         # Enviar requisição
@@ -155,15 +157,27 @@ class DDSClientBenchmark:
         }
 
     def close(self):
-        """Fecha a conexão DDS"""
+        """Fecha a conexão DDS — deleta writers/readers antes do participant"""
+        if self.request_writer:
+            del self.request_writer
+            self.request_writer = None
+        if self.response_reader:
+            del self.response_reader
+            self.response_reader = None
         if self.participant:
             self.participant.close()
+            self.participant = None
 
 
 async def run_benchmark(prompts: list, model: str = "phi4-mini",
                        domain: int = 0, num_runs: int = 5) -> list:
-    """Executa o benchmark com os prompts fornecidos"""
+    """Executa o benchmark com os prompts fornecidos.
 
+    NOTE: send_request() uses blocking time.sleep() internally, so we
+    wrap calls with run_in_executor to avoid blocking the event loop.
+    """
+
+    loop = asyncio.get_event_loop()
     client = DDSClientBenchmark(domain=domain)
     client.initialize()
 
@@ -172,13 +186,13 @@ async def run_benchmark(prompts: list, model: str = "phi4-mini",
     # Warmup
     print("[Warmup]")
     for i in range(3):
-        client.send_request(
-            [{"role": "user", "content": "hi"}],
-            max_tokens=5
+        await loop.run_in_executor(
+            None, client.send_request,
+            [{"role": "user", "content": "hi"}], "chat", 5
         )
 
     # Benchmark
-    print(f"\n[Benchmark] {len(prompts)} prompts, {num_runs} execuções cada")
+    print(f"\n[Benchmark] {len(prompts)} prompts, {num_runs} execucoes cada")
 
     for prompt_idx, prompt in enumerate(prompts):
         prompt_name = prompt["name"]
@@ -190,9 +204,9 @@ async def run_benchmark(prompts: list, model: str = "phi4-mini",
 
         for i in range(num_runs):
             start = time.time()
-            response = client.send_request(
-                [{"role": "user", "content": prompt_text}],
-                max_tokens=max_tokens
+            response = await loop.run_in_executor(
+                None, client.send_request,
+                [{"role": "user", "content": prompt_text}], "chat", max_tokens
             )
             elapsed_ms = (time.time() - start) * 1000
 

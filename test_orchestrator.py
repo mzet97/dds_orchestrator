@@ -15,10 +15,9 @@ os.environ.setdefault('CYCLONEDDS_URI', 'file:///mnt/e/TI/git/tese/llama.cpp_dds
 
 from config import OrchestratorConfig
 from models import AgentRegistration, AgentTaskRequest, TaskType, ChatMessage
-from registry import AgentRegistry
+from registry import AgentRegistry, AgentInfo
 from scheduler import TaskScheduler, Task, TaskPriority
 from context import ContextManager
-from dds_client import DDSClient  # Use REAL DDS client, not mock
 from http_client import HTTPClient
 
 
@@ -26,39 +25,44 @@ async def test_registry():
     """Test agent registry"""
     print("\n=== Testing Agent Registry ===")
 
-    dds_client = DDSClient()  # Use REAL DDS client - initializes in __init__
-    registry = AgentRegistry(dds_client)
+    config = OrchestratorConfig()
+    registry = AgentRegistry(config)
 
-    # Register agent
-    reg = AgentRegistration(
+    # Create AgentInfo (the type that registry.register_agent expects)
+    agent_info = AgentInfo(
         agent_id="test-agent-1",
         hostname="localhost",
         port=8081,
         model="tinyllama-1.1b",
-        model_path="/models/tinyllama.gguf",
+        specialization="generic",
         vram_available_mb=6000,
-        vram_total_mb=8000,
         slots_idle=1,
         slots_total=1,
     )
 
-    agent_id = await registry.register_agent(reg)
-    print(f"Registered agent: {agent_id}")
+    result = await registry.register_agent(agent_info)
+    assert result is True, "register_agent should return True"
+    print(f"  Registered agent: {agent_info.agent_id}")
 
-    # Get agent
-    agent = await registry.get_agent(agent_id)
-    print(f"Got agent: {agent.agent_id}, model: {agent.model}")
+    # Get agent by ID
+    agent = await registry.get_agent("test-agent-1")
+    assert agent is not None, "get_agent should return the registered agent"
+    assert agent.agent_id == "test-agent-1", f"Expected agent_id 'test-agent-1', got '{agent.agent_id}'"
+    assert agent.model == "tinyllama-1.1b", f"Expected model 'tinyllama-1.1b', got '{agent.model}'"
+    print(f"  Got agent: {agent.agent_id}, model: {agent.model}")
 
-    # Find agent
-    found = await registry.find_agent(model="tinyllama-1.1b")
-    print(f"Found agent: {found.agent_id if found else 'None'}")
+    # Select agent (registry has select_agent, not find_agent)
+    found = await registry.select_agent(requirements={"model": "tinyllama-1.1b"})
+    assert found is not None, "select_agent should find an agent matching the model"
+    assert found.agent_id == "test-agent-1", f"Expected agent 'test-agent-1', got '{found.agent_id}'"
+    print(f"  Selected agent: {found.agent_id}")
 
     # Get all agents
     all_agents = await registry.get_all_agents()
-    print(f"Total agents: {len(all_agents)}")
+    assert len(all_agents) == 1, f"Expected 1 agent, got {len(all_agents)}"
+    print(f"  Total agents: {len(all_agents)}")
 
-    print("[OK] Registry test passed!")
-    return True
+    print("[PASS] Registry test passed!")
 
 
 async def test_scheduler():
@@ -77,14 +81,22 @@ async def test_scheduler():
     )
 
     task_id = await scheduler.submit_task(task)
-    print(f"Submitted task: {task_id}")
+    assert task_id == "task-1", f"Expected task_id 'task-1', got '{task_id}'"
+    print(f"  Submitted task: {task_id}")
 
     # Get stats
     stats = await scheduler.get_stats()
-    print(f"Queue stats: {stats}")
+    assert stats["total_tasks"] == 1, f"Expected 1 total task, got {stats['total_tasks']}"
+    assert stats["queue_size"] == 1, f"Expected queue_size 1, got {stats['queue_size']}"
+    print(f"  Queue stats: {stats}")
 
-    print("[OK] Scheduler test passed!")
-    return True
+    # Get next task
+    next_task = await scheduler.get_next_task()
+    assert next_task is not None, "get_next_task should return the submitted task"
+    assert next_task.task_id == "task-1", f"Expected task_id 'task-1', got '{next_task.task_id}'"
+    print(f"  Got next task: {next_task.task_id}")
+
+    print("[PASS] Scheduler test passed!")
 
 
 async def test_context_manager():
@@ -98,11 +110,14 @@ async def test_context_manager():
         user_id="user-1",
         initial_message=ChatMessage(role="user", content="Hello!"),
     )
-    print(f"Created context: {context_id}")
+    assert context_id is not None, "create_context should return a context_id"
+    assert len(context_id) > 0, "context_id should not be empty"
+    print(f"  Created context: {context_id}")
 
     # Get messages
     messages = await context_manager.get_messages(context_id)
-    print(f"Messages in context: {len(messages)}")
+    assert len(messages) >= 1, f"Expected at least 1 message, got {len(messages)}"
+    print(f"  Messages in context: {len(messages)}")
 
     # Add message
     await context_manager.add_message(
@@ -111,10 +126,10 @@ async def test_context_manager():
     )
 
     messages = await context_manager.get_messages(context_id)
-    print(f"Messages after add: {len(messages)}")
+    assert len(messages) >= 2, f"Expected at least 2 messages after add, got {len(messages)}"
+    print(f"  Messages after add: {len(messages)}")
 
-    print("[OK] Context manager test passed!")
-    return True
+    print("[PASS] Context manager test passed!")
 
 
 async def test_http_client():
@@ -125,10 +140,10 @@ async def test_http_client():
 
     # Just test instantiation
     async with client:
-        print("HTTP Client created successfully")
+        assert client is not None, "HTTP Client should be instantiated"
+        print("  HTTP Client created successfully")
 
-    print("[OK] HTTP Client test passed!")
-    return True
+    print("[PASS] HTTP Client test passed!")
 
 
 async def main():
@@ -151,6 +166,9 @@ async def main():
         try:
             await test_func()
             passed += 1
+        except AssertionError as e:
+            print(f"[FAIL] {name} test failed (assertion): {e}")
+            failed += 1
         except Exception as e:
             print(f"[FAIL] {name} test failed: {e}")
             failed += 1

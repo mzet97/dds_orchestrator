@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-E5: Streaming Token-a-Token - HTTP
-==================================
+E5: Streaming Token-a-Token - HTTP Direto
+==========================================
 Mede TTFT (Time-to-First-Token) e ITL (Inter-Token Latency)
-100% REAL - streaming real via HTTP
+100% REAL - streaming real via HTTP direto ao agente
+
+Rota: Cliente -> HTTP direto ao agente -> SSE -> Cliente
+
+O cliente conecta diretamente ao agente HTTP (sem orquestrador DDS no meio).
+Comparar com E5_streaming_dds.py (via orquestrador com DDS interno).
+
+Metricas:
+  TTFT = tempo ate receber o primeiro token (ms)
+  ITL  = tempo entre tokens consecutivos (ms); mede jitter de entrega
 
 Usage:
-    python E5_streaming_http.py --model phi4-mini --n 50
+    python E5_streaming_http.py --url http://localhost:8082 --model phi4-mini --n 50
 """
 
 import argparse
@@ -20,14 +29,14 @@ import aiohttp
 
 
 class StreamingBenchmarkHTTP:
-    """Benchmark de streaming HTTP token-a-token."""
+    """Benchmark de streaming HTTP token-a-token (direto ao agente)."""
 
     def __init__(self, base_url: str):
         self.base_url = base_url
 
     async def measure_streaming(self, model: str, prompt: str, max_tokens: int = 200) -> Dict:
         """
-        Mede TTFT e ITL com streaming HTTP REAL.
+        Mede TTFT e ITL com streaming HTTP REAL direto ao agente.
         """
         ttft = None  # Time-to-First-Token
         itl_list = []  # Inter-Token Latency
@@ -56,7 +65,7 @@ class StreamingBenchmarkHTTP:
                         # Parse SSE line
                         if line.startswith(b"data: "):
                             data = line[6:]
-                            if data == b"[DONE]":
+                            if data.strip() == b"[DONE]":
                                 break
 
                             try:
@@ -75,7 +84,7 @@ class StreamingBenchmarkHTTP:
                                 previous_time = current_time
                                 total_tokens += 1
 
-                            except:
+                            except Exception:
                                 pass
 
         except Exception as e:
@@ -96,19 +105,20 @@ class StreamingBenchmarkHTTP:
 
 
 async def run_benchmark(args):
-    """Executa benchmark de streaming HTTP."""
+    """Executa benchmark de streaming HTTP direto."""
 
     benchmark = StreamingBenchmarkHTTP(base_url=args.url)
 
     # Prompt padronizado
-    prompt = "Conte uma história sobre um robô que aprende a sentir emoções. Com pelo menos 200 palavras."
+    prompt = "Conte uma historia sobre um robo que aprende a sentir emocoes. Com pelo menos 200 palavras."
 
     results = []
 
-    print(f"E5: Streaming Token-a-Token - HTTP")
+    print(f"E5: Streaming Token-a-Token - HTTP Direto")
+    print(f"Rota: Cliente -> HTTP direto ao agente -> SSE -> Cliente")
     print(f"URL: {args.url}")
     print(f"Modelo: {args.model}")
-    print(f"Iterações: {args.n}")
+    print(f"Iteracoes: {args.n}")
     print("-" * 50)
 
     for i in range(args.n):
@@ -125,18 +135,18 @@ async def run_benchmark(args):
                 "total_time_ms": result["total_time_ms"]
             })
 
-            print(f"Iteração {i+1}/{args.n}: TTFT={result['ttft_ms']:.1f}ms, ITL={result['itl_mean_ms']:.2f}ms, Tokens={result['tokens']}")
+            print(f"Iteracao {i+1}/{args.n}: TTFT={result['ttft_ms']:.1f}ms, ITL={result['itl_mean_ms']:.2f}ms, Tokens={result['tokens']}")
         else:
-            print(f"Iteração {i+1}/{args.n}: ERRO - {result['error']}")
+            print(f"Iteracao {i+1}/{args.n}: ERRO - {result['error']}")
 
-    # Estatísticas
+    # Estatisticas
     ttft_values = [r["ttft_ms"] for r in results]
     itl_mean_values = [r["itl_mean_ms"] for r in results]
     itl_p99_values = [r["itl_p99_ms"] for r in results]
     tokens_values = [r["tokens"] for r in results]
 
     summary = {
-        "protocol": "HTTP_STREAMING",
+        "protocol": "HTTP_DIRECT",
         "model": args.model,
         "n": len(results),
         "ttft": {
@@ -157,8 +167,8 @@ async def run_benchmark(args):
         }
     }
 
-    # Salvar CSV
-    csv_file = f"results/E5_HTTP_streaming_{args.model}.csv"
+    # Salvar CSV - nome distinto para HTTP direto
+    csv_file = f"results/E5_HTTP_DIRECT_streaming_{args.model}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
@@ -167,13 +177,13 @@ async def run_benchmark(args):
             f.write(f"{r['iteration']},{r['ttft_ms']},{r['itl_mean_ms']},{r['itl_median_ms']},{r['itl_p99_ms']},{r['tokens']},{r['total_time_ms']}\n")
 
     # Salvar JSON
-    json_file = f"results/E5_HTTP_streaming_{args.model}_summary.json"
+    json_file = f"results/E5_HTTP_DIRECT_streaming_{args.model}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\nResultados:")
-    print(f"TTFT médio: {summary['ttft']['mean_ms']:.2f}ms")
-    print(f"ITL médio: {summary['itl_mean']['mean_ms']:.2f}ms")
+    print(f"TTFT medio: {summary['ttft']['mean_ms']:.2f}ms")
+    print(f"ITL medio: {summary['itl_mean']['mean_ms']:.2f}ms")
     print(f"ITL p99: {summary['itl_p99']['mean_ms']:.2f}ms")
     print(f"\nCSV: {csv_file}")
     print(f"JSON: {json_file}")
@@ -182,10 +192,10 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - HTTP")
+    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - HTTP Direto")
     parser.add_argument("--model", default="phi4-mini", help="Modelo a usar")
-    parser.add_argument("--url", default="http://localhost:8080", help="URL do servidor")
-    parser.add_argument("--n", type=int, default=50, help="Número de iterações")
+    parser.add_argument("--url", default="http://localhost:8082", help="URL do agente HTTP direto")
+    parser.add_argument("--n", type=int, default=50, help="Numero de iteracoes")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

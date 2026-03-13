@@ -30,30 +30,39 @@ def setup_logging(level: str):
 async def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="DDS-LLM Orchestrator")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP server port")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="HTTP server host")
+    parser.add_argument("--port", type=int, default=None, help="HTTP server port")
+    parser.add_argument("--host", type=str, default=None, help="HTTP server host")
     parser.add_argument("--config", type=str, default=None, help="Config file path")
-    parser.add_argument("--dds-domain", type=int, default=0, help="DDS domain ID")
-    parser.add_argument("--log-level", type=str, default="INFO",
+    parser.add_argument("--dds-domain", type=int, default=None, help="DDS domain ID")
+    parser.add_argument("--log-level", type=str, default=None,
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="Log level")
 
     args = parser.parse_args()
 
     # Setup logging
-    setup_logging(args.log_level)
+    setup_logging(args.log_level or "INFO")
     logger = logging.getLogger(__name__)
 
     # Load config
     if args.config:
         config = OrchestratorConfig()
         config.load_from_file(Path(args.config))
+        # CLI args override config file values when explicitly specified
+        if args.port is not None:
+            config.port = args.port
+        if args.host is not None:
+            config.host = args.host
+        if args.dds_domain is not None:
+            config.dds_domain = args.dds_domain
+        if args.log_level is not None:
+            config.log_level = args.log_level
     else:
         config = load_config_from_env()
-        config.port = args.port
-        config.host = args.host
-        config.dds_domain = args.dds_domain
-        config.log_level = args.log_level
+        config.port = args.port if args.port is not None else config.port
+        config.host = args.host if args.host is not None else config.host
+        config.dds_domain = args.dds_domain if args.dds_domain is not None else config.dds_domain
+        config.log_level = args.log_level if args.log_level is not None else config.log_level
 
     logger.info("=" * 60)
     logger.info("DDS-LLM Orchestrator Starting")
@@ -88,7 +97,7 @@ async def main():
         while True:
             await asyncio.sleep(3600)
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
         await server.stop()

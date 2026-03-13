@@ -132,14 +132,14 @@ class AgentSelector:
             TaskType.TOOL_CALL: ["text", "generic"],
         }
 
-        required_specs = task_to_spec.get(criteria.task_type, ["generic"])
+        required_specs = list(task_to_spec.get(criteria.task_type, ["generic"]))
 
-        # Verifica flags específicas
-        if criteria.requires_vision and "vision" not in required_specs:
-            required_specs.append("vision")
+        # Vision and embedding are hard requirements — agent MUST support them
+        if criteria.requires_vision and agent_spec != "vision":
+            return False
 
-        if criteria.requires_embedding and "embedding" not in required_specs:
-            required_specs.append("embedding")
+        if criteria.requires_embedding and agent_spec != "embedding":
+            return False
 
         return agent_spec in required_specs
 
@@ -176,21 +176,23 @@ class AgentSelector:
                     metrics.current_load -= 1
                     logger.debug(f"Agente {agent_id} liberado (carga: {metrics.current_load})")
 
-    def get_available_agents(self) -> List[dict]:
+    async def get_available_agents(self) -> List[dict]:
         """Retorna lista de agentes disponíveis"""
-        result = []
-        for agent_id, metrics in self.agent_metrics.items():
-            if metrics.is_healthy and metrics.current_load < metrics.max_load:
-                result.append({
-                    "agent_id": agent_id,
-                    "specialization": metrics.specialization,
-                    "available_slots": metrics.max_load - metrics.current_load,
-                    "success_rate": metrics.success_rate,
-                    "avg_response_time_ms": metrics.avg_response_time_ms,
-                })
-        return result
+        async with self._lock:
+            result = []
+            for agent_id, metrics in self.agent_metrics.items():
+                if metrics.is_healthy and metrics.current_load < metrics.max_load:
+                    result.append({
+                        "agent_id": agent_id,
+                        "specialization": metrics.specialization,
+                        "available_slots": metrics.max_load - metrics.current_load,
+                        "success_rate": metrics.success_rate,
+                        "avg_response_time_ms": metrics.avg_response_time_ms,
+                    })
+            return result
 
 
+# TODO: LoadBalancer not integrated — use AgentSelector instead
 class LoadBalancer:
     """Balanceador de carga para distribuição de requisições"""
 
@@ -220,6 +222,9 @@ class LoadBalancer:
         elif self.strategy == "weighted":
             # Agentes com mais slots disponíveis têm maior peso
             total_slots = sum(a.get("available_slots", 1) for a in agents)
+            if total_slots == 0:
+                # All agents at full capacity, fall back to least loaded
+                return min(agents, key=lambda a: a.get("current_load", 0))
             import random
             r = random.uniform(0, total_slots)
             cumulative = 0

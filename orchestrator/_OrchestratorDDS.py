@@ -33,7 +33,7 @@ class AgentRegistration(idl.IdlStruct, typename="orchestrator.AgentRegistration"
     slots_total: types.int32
     vision_enabled: bool
     reasoning_enabled: bool
-    registered_at: types.int32
+    registered_at: types.int64
 
 
 @dataclass
@@ -47,7 +47,7 @@ class AgentStatus(idl.IdlStruct, typename="orchestrator.AgentStatus"):
     memory_usage_mb: types.int32
     vram_usage_mb: types.int32
     current_model: str
-    last_heartbeat: types.int32
+    last_heartbeat: types.int64
 
 
 @dataclass
@@ -63,6 +63,7 @@ class TaskRequest(idl.IdlStruct, typename="orchestrator.TaskRequest"):
     requires_context: bool
     context_id: str
     created_at: types.int64
+    stream: bool = False
 
 
 @dataclass
@@ -92,6 +93,7 @@ class ClientRequest(idl.IdlStruct, typename="orchestrator.ClientRequest"):
     priority: types.int32
     timeout_ms: types.int32
     requires_context: bool
+    created_at: types.int64 = 0
 
 
 @dataclass
@@ -99,6 +101,7 @@ class ClientRequest(idl.IdlStruct, typename="orchestrator.ClientRequest"):
 @annotate.autoid("sequential")
 class ClientResponse(idl.IdlStruct, typename="orchestrator.ClientResponse"):
     request_id: str
+    client_id: str
     content: str
     is_final: bool
     prompt_tokens: types.int32

@@ -75,7 +75,7 @@ class BenchmarkDDSClient:
         qos = Qos(
             Policy.Reliability.Reliable(duration(seconds=10)),
             Policy.Durability.Volatile,
-            Policy.History.KeepLast(1),
+            Policy.History.KeepLast(100),  # KeepLast(100) to avoid losing responses in parallel mode
         )
 
         self.writer = DataWriter(self.participant, self.topic_request, qos)
@@ -185,14 +185,19 @@ SUMMARY_COLUMNS = [
 ]
 
 
+_csv_write_lock = threading.Lock()
+
+
 def write_raw_row(filepath: str, row: Dict):
-    """Append single row to per-client CSV (real-time, survives crashes)."""
-    file_exists = os.path.exists(filepath)
-    with open(filepath, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=RAW_COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    """Append single row to per-client CSV (real-time, survives crashes).
+    Thread-safe: uses a module-level lock for concurrent parallel writes."""
+    with _csv_write_lock:
+        file_exists = os.path.exists(filepath)
+        with open(filepath, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=RAW_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
 
 def compute_stats(latencies: List[float]) -> Dict[str, float]:
@@ -223,13 +228,14 @@ def compute_stats(latencies: List[float]) -> Dict[str, float]:
 
 
 def write_summary_row(filepath: str, row: Dict):
-    """Append one scenario row to summary.csv."""
-    file_exists = os.path.exists(filepath)
-    with open(filepath, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
+    """Append one scenario row to summary.csv. Thread-safe."""
+    with _csv_write_lock:
+        file_exists = os.path.exists(filepath)
+        with open(filepath, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
 
 # ===========================================================================
@@ -628,8 +634,15 @@ def print_env_check():
     print()
 
 
-def estimate_time(modes: List[str], client_counts: List[int], requests: int, gpu_time_s: float = 2.0):
-    """Print estimated execution time."""
+def estimate_time(modes: List[str], client_counts: List[int], requests: int,
+                   gpu_time_s: float = 2.0, gpu_slots: int = 1):
+    """Print estimated execution time.
+
+    Args:
+        gpu_slots: Number of concurrent inference slots on the GPU.
+                   Default 1 (e.g., Phi-4-mini with 1 slot).
+                   Adjust based on your llama-server --n-parallel setting.
+    """
     total_s = 0
     for mode in modes:
         for nc in client_counts:
@@ -637,12 +650,12 @@ def estimate_time(modes: List[str], client_counts: List[int], requests: int, gpu
             if mode == "sync":
                 est = total_req * gpu_time_s
             else:
-                # async/parallel: limited by GPU concurrency (~4 slots)
-                est = (total_req / min(nc, 4)) * gpu_time_s
+                # async/parallel: limited by GPU concurrency (gpu_slots)
+                est = (total_req / min(nc, gpu_slots)) * gpu_time_s
             total_s += est
 
     hours = total_s / 3600
-    print(f"Estimated total time: ~{hours:.1f}h (assuming ~{gpu_time_s}s/request on GPU)")
+    print(f"Estimated total time: ~{hours:.1f}h (assuming ~{gpu_time_s}s/request, {gpu_slots} GPU slot(s))")
     print()
 
 
@@ -677,6 +690,7 @@ Examples:
     parser.add_argument("--output", type=str, default="results", help="Output directory (default: results/)")
     parser.add_argument("--prompt", type=str, default="What is 2+2?", help="Prompt text (default: 'What is 2+2?')")
     parser.add_argument("--max-tokens", type=int, default=10, help="Max tokens (default: 10)")
+    parser.add_argument("--gpu-slots", type=int, default=1, help="Number of concurrent GPU inference slots (default: 1)")
     parser.add_argument("--skip-existing", action="store_true", help="Skip scenarios with existing results")
     parser.add_argument("--verbose", action="store_true", help="Print per-request details")
     args = parser.parse_args()
@@ -709,7 +723,7 @@ Examples:
     print(f"  Timeout:  {args.timeout}s")
     print(f"  Output:   {output_dir}/")
     print()
-    estimate_time(modes, args.clients, args.requests)
+    estimate_time(modes, args.clients, args.requests, gpu_slots=args.gpu_slots)
 
     # Build scenario list
     scenarios = []

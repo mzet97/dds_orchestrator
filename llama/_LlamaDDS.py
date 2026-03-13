@@ -6,7 +6,7 @@
 
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import auto
 from typing import TYPE_CHECKING, Optional
 
@@ -36,9 +36,9 @@ class ChatCompletionRequest(idl.IdlStruct, typename="llama.ChatCompletionRequest
     temperature: types.float32
     max_tokens: types.int32
     stream: bool
-    top_p: types.sequence[types.float32]
-    n: types.sequence[types.int32]
-    stop: types.sequence[str]
+    top_p: types.sequence[types.float32] = field(default_factory=list)
+    n: types.sequence[types.int32] = field(default_factory=list)
+    stop: types.sequence[str] = field(default_factory=list)
 
 
 @dataclass

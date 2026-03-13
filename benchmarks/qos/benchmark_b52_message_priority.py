@@ -7,6 +7,11 @@ Compares message prioritization between:
 - Python Priority Queue (multiple queues with round-robin)
 - Redis Priority Queue (sorted sets)
 
+NOTA: TRANSPORT_PRIORITY e uma dica para o transporte de rede.
+Em localhost/loopback, pode nao haver diferenca mensuravel de ordenacao.
+Este benchmark pode mostrar ruido estatistico em vez de diferenca real
+quando executado em loopback.
+
 Metrics:
 - Latency of high-priority message from send to processing start
 - Latency degradation for low-priority messages under load
@@ -44,7 +49,6 @@ from cyclonedds.sub import DataReader
 from cyclonedds.core import Policy
 from cyclonedds.qos import Qos
 from cyclonedds.util import duration
-from dataclasses import dataclass
 import cyclonedds.idl as idl
 import cyclonedds.idl.annotations as annotate
 import cyclonedds.idl.types as types
@@ -93,9 +97,15 @@ class BenchmarkResults:
             self.max_ms = max(self.latencies)
             self.mean_ms = statistics.mean(self.latencies)
             self.std_ms = statistics.stdev(self.latencies) if len(self.latencies) > 1 else 0
-            self.p50_ms = self.latencies[len(self.latencies) // 2]
-            self.p95_ms = self.latencies[int(len(self.latencies) * 0.95)]
-            self.p99_ms = self.latencies[int(len(self.latencies) * 0.99)]
+            self.p50_ms = statistics.median(self.latencies)
+            if len(self.latencies) >= 20:
+                self.p95_ms = statistics.quantiles(self.latencies, n=20)[18]
+            else:
+                self.p95_ms = max(self.latencies)
+            if len(self.latencies) >= 100:
+                self.p99_ms = statistics.quantiles(self.latencies, n=100)[98]
+            else:
+                self.p99_ms = max(self.latencies)
 
 
 # ============================================================================
@@ -103,7 +113,13 @@ class BenchmarkResults:
 # ============================================================================
 
 class DDSPriorityQueue:
-    """DDS-based priority queue using TRANSPORT_PRIORITY."""
+    """DDS-based priority queue using TRANSPORT_PRIORITY.
+
+    NOTA: TRANSPORT_PRIORITY is a hint to the network transport layer.
+    On localhost/loopback, the OS may not honor priority differentiation.
+    This benchmark measures whether DDS delivers any observable ordering
+    benefit vs. application-level queuing.
+    """
 
     def __init__(self, domain_id: int = 0):
         self.domain_id = domain_id
@@ -115,6 +131,11 @@ class DDSPriorityQueue:
 
     def setup(self):
         """Setup DDS entities with different priority writers."""
+        print("NOTA: TRANSPORT_PRIORITY e uma dica para o transporte de rede.")
+        print("Em localhost/loopback, pode nao haver diferenca mensuravel de ordenacao.")
+        print("Este benchmark pode mostrar ruido estatistico em vez de diferenca real.")
+        print()
+
         self.participant = DomainParticipant(self.domain_id)
         topic = Topic(self.participant, "priority/queue", PriorityMessage)
 
@@ -146,7 +167,7 @@ class DDSPriorityQueue:
             )
             writer.write(msg)
 
-    def receive(self, timeout_ms: int = 1000) -> Optional[Dict]:
+    def receive(self, timeout_ms: int = 1000) -> Optional[PriorityMessage]:
         """Receive next message."""
         deadline = time.time() + (timeout_ms / 1000)
         while time.time() < deadline:
@@ -156,7 +177,7 @@ class DDSPriorityQueue:
                     return samples[0]
             except Exception:
                 pass
-            time.sleep(0.01)
+            time.sleep(0.001)
         return None
 
     def cleanup(self):
@@ -185,14 +206,14 @@ class PythonPriorityQueue:
     def send(self, priority: int, message_id: str):
         """Send message with specified priority."""
         self.message_times[message_id] = time.perf_counter()
-        self.queues[priority].put({
-            "id": message_id,
-            "priority": priority,
-            "timestamp": time.time(),
-            "payload": "x" * 100
-        })
+        self.queues[priority].put(PriorityMessage(
+            message_id=message_id,
+            priority=priority,
+            payload="x" * 100,
+            timestamp=int(time.time() * 1000),
+        ))
 
-    def receive(self, timeout_ms: int = 1000) -> Optional[Dict]:
+    def receive(self, timeout_ms: int = 1000) -> Optional[PriorityMessage]:
         """Receive next message using round-robin across priorities."""
         start = time.perf_counter()
         timeout = timeout_ms / 1000
@@ -260,7 +281,7 @@ class RedisPriorityQueue:
             # Simulation mode
             pass
 
-    def receive(self, timeout_ms: int = 1000) -> Optional[Dict]:
+    def receive(self, timeout_ms: int = 1000) -> Optional[PriorityMessage]:
         """Receive highest priority message."""
         if not self.redis:
             return None
@@ -270,12 +291,12 @@ class RedisPriorityQueue:
             result = self.redis.zpopmin(self.key, count=1)
             if result:
                 message_id, score = result[0]
-                return {
-                    "id": message_id,
-                    "priority": -int(score // 1000000),
-                    "timestamp": time.time(),
-                    "payload": "x" * 100
-                }
+                return PriorityMessage(
+                    message_id=message_id,
+                    priority=-int(score // 1000000),
+                    payload="x" * 100,
+                    timestamp=int(time.time() * 1000),
+                )
         except Exception:
             pass
 
@@ -304,13 +325,19 @@ def run_benchmark(
     num_low_priority: int = 90,
     processing_delay_ms: int = 50,
 ) -> List[BenchmarkResults]:
-    """Run priority benchmark for a specific method."""
+    """Run priority benchmark for a specific method.
+
+    NOTE: processing_delay_ms is NOT included in the latency metric.
+    Latency measures only the time from send to receive (delivery time).
+    The processing delay simulates work between receives to build up queue pressure.
+    """
 
     results_by_priority = {0: [], 1: [], 2: []}
 
     print(f"\n{'='*60}")
     print(f"Running: {method}")
     print(f"Messages: {num_high_priority} high, {num_low_priority} low priority")
+    print(f"Processing delay: {processing_delay_ms}ms (not included in latency)")
     print(f"{'='*60}")
 
     if method == "DDS":
@@ -346,15 +373,20 @@ def run_benchmark(
     while received < total:
         msg = queue_impl.receive(timeout_ms=1000)
         if msg:
+            # Use message_id consistently (PriorityMessage dataclass attribute)
             msg_id = msg.message_id
             if msg_id in send_times:
+                # Measure delivery latency only (excludes processing delay)
                 latency_ms = (time.perf_counter() - send_times[msg_id]) * 1000
                 priority = msg.priority
                 results_by_priority[priority].append(latency_ms)
                 received += 1
 
-        # Simulate processing delay
-        time.sleep(processing_delay_ms / 1000)
+            # Simulate processing delay to build up queue pressure
+            # This is NOT included in the latency metric above
+            time.sleep(processing_delay_ms / 1000)
+        else:
+            break  # timeout, no more messages
 
     queue_impl.cleanup()
 
@@ -441,12 +473,15 @@ def run_with_load(
     while received < total:
         msg = queue_impl.receive(timeout_ms=5000)
         if msg:
+            # Use message_id consistently (PriorityMessage dataclass attribute)
             msg_id = msg.message_id
             if msg_id in send_times:
                 latency_ms = (time.perf_counter() - send_times[msg_id]) * 1000
                 priority = msg.priority
                 results_by_priority[priority].append(latency_ms)
                 received += 1
+        else:
+            break  # timeout, no more messages
 
         time.sleep(0.01)
 

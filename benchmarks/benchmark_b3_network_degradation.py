@@ -2,13 +2,15 @@
 """
 B3: Network Degradation Benchmark
 ================================
-Avalia o comportamento com latência de rede simulada usando tc netem.
+Avalia o comportamento com latencia de rede simulada usando tc netem.
+
+Mede latencia real de requisicoes HTTP ao orquestrador DDS e ao endpoint HTTP
+direto, permitindo comparar como cada transporte reage a degradacao de rede.
 
 Usage:
-    python benchmark_b3_network_degradation.py --mode all
-    python benchmark_b3_network_degradation.py --mode dds
-    python benchmark_b3_network_degradation.py --mode http
-    python benchmark_b3_network_degradation.py --mode grpc
+    python benchmark_b3_network_degradation.py --mode all --url http://localhost:8080
+    python benchmark_b3_network_degradation.py --mode dds --url http://localhost:8080
+    python benchmark_b3_network_degradation.py --mode http --url http://localhost:8081
 """
 
 import argparse
@@ -22,11 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from dds_orchestrator.benchmarks.qos.benchmark_b71_dds_grpc import (
-    DDSClient, HTTPClient, gRPCClient
-)
+import aiohttp
 
 
 # Network delay configurations (in milliseconds)
@@ -70,64 +68,95 @@ def get_current_delay(interface: str = "lo") -> int:
     return 0
 
 
-async def benchmark_dds_latency(delay_ms: int, iterations: int = 100) -> Dict[str, float]:
-    """Benchmark DDS latency with network delay."""
-    client = DDSClient()
-
-    latencies = []
-    for _ in range(iterations):
-        start = time.perf_counter()
-        # Simulate simple request-response
-        await asyncio.sleep(0.001)  # Minimal work
-        end = time.perf_counter()
-        latencies.append((end - start) * 1000)  # Convert to ms
-
+def _compute_stats(latencies: List[float]) -> Dict[str, float]:
+    """Compute latency statistics from a list of measurements."""
     return {
         "mean": statistics.mean(latencies),
         "p50": statistics.median(latencies),
-        "p95": statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies),
+        "p95": statistics.quantiles(latencies, n=100)[94] if len(latencies) >= 20 else max(latencies),
         "p99": statistics.quantiles(latencies, n=100)[98] if len(latencies) >= 100 else max(latencies),
         "stdev": statistics.stdev(latencies) if len(latencies) > 1 else 0
     }
 
 
-async def benchmark_http_latency(delay_ms: int, iterations: int = 100) -> Dict[str, float]:
-    """Benchmark HTTP latency with network delay."""
-    client = HTTPClient()
+async def benchmark_dds_latency(url: str, iterations: int = 100) -> Dict[str, float]:
+    """Benchmark DDS latency via orchestrator HTTP API.
 
+    The orchestrator routes internally via DDS to the agent.
+    This measures the full round-trip: client -> orchestrator -> DDS -> agent -> DDS -> orchestrator -> client.
+    """
     latencies = []
-    for _ in range(iterations):
-        start = time.perf_counter()
-        # Simulate HTTP request
-        await asyncio.sleep(0.001)
-        end = time.perf_counter()
-        latencies.append((end - start) * 1000)
+    async with aiohttp.ClientSession() as session:
+        for _ in range(iterations):
+            start = time.perf_counter()
+            try:
+                async with session.post(
+                    f"{url}/v1/chat/completions",
+                    json={
+                        "model": "phi4-mini",
+                        "messages": [{"role": "user", "content": "ok"}],
+                        "max_tokens": 5,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    await resp.text()
+                latencies.append((time.perf_counter() - start) * 1000)
+            except Exception as e:
+                print(f"  DDS request error: {e}")
 
-    return {
-        "mean": statistics.mean(latencies),
-        "p50": statistics.median(latencies),
-        "p95": statistics.quantiles(latencies, n=20)[18] if len(latencies) >= 20 else max(latencies),
-        "p99": statistics.quantiles(latencies, n=100)[98] if len(latencies) >= 100 else max(latencies),
-        "stdev": statistics.stdev(latencies) if len(latencies) > 1 else 0
-    }
+    if not latencies:
+        return {"mean": 0, "p50": 0, "p95": 0, "p99": 0, "stdev": 0, "error": "no successful requests"}
+
+    return _compute_stats(latencies)
 
 
-async def run_benchmark(mode: str, delay_ms: int, iterations: int = 100) -> Dict[str, Any]:
+async def benchmark_http_latency(url: str, iterations: int = 100) -> Dict[str, float]:
+    """Benchmark HTTP latency via direct HTTP endpoint.
+
+    This measures a direct HTTP request (no DDS in the path).
+    """
+    latencies = []
+    async with aiohttp.ClientSession() as session:
+        for _ in range(iterations):
+            start = time.perf_counter()
+            try:
+                async with session.post(
+                    f"{url}/v1/chat/completions",
+                    json={
+                        "model": "phi4-mini",
+                        "messages": [{"role": "user", "content": "ok"}],
+                        "max_tokens": 5,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    await resp.text()
+                latencies.append((time.perf_counter() - start) * 1000)
+            except Exception as e:
+                print(f"  HTTP request error: {e}")
+
+    if not latencies:
+        return {"mean": 0, "p50": 0, "p95": 0, "p99": 0, "stdev": 0, "error": "no successful requests"}
+
+    return _compute_stats(latencies)
+
+
+async def run_benchmark(mode: str, delay_ms: int, dds_url: str, http_url: str,
+                        iterations: int = 100) -> Dict[str, Any]:
     """Run benchmark for specific mode and delay."""
     results = {"delay_ms": delay_ms, "iterations": iterations}
 
     if mode in ["all", "dds"]:
-        results["dds"] = await benchmark_dds_latency(delay_ms, iterations)
+        results["dds"] = await benchmark_dds_latency(dds_url, iterations)
 
     if mode in ["all", "http"]:
-        results["http"] = await benchmark_http_latency(delay_ms, iterations)
+        results["http"] = await benchmark_http_latency(http_url, iterations)
 
     return results
 
 
 async def main():
     parser = argparse.ArgumentParser(description="B3 Network Degradation Benchmark")
-    parser.add_argument("--mode", choices=["all", "dds", "http", "grpc"],
+    parser.add_argument("--mode", choices=["all", "dds", "http"],
                         default="all", help="Benchmark mode")
     parser.add_argument("--iterations", type=int, default=100,
                         help="Number of iterations per test")
@@ -137,14 +166,23 @@ async def main():
                         help="Output file for results")
     parser.add_argument("--interface", type=str, default="lo",
                         help="Network interface to apply delay")
+    parser.add_argument("--url", type=str, default="http://localhost:8080",
+                        help="Orchestrator URL (DDS transport)")
+    parser.add_argument("--http-url", type=str, default=None,
+                        help="Direct HTTP endpoint URL (defaults to --url)")
 
     args = parser.parse_args()
+
+    dds_url = args.url
+    http_url = args.http_url if args.http_url else args.url
 
     delays = [int(d) for d in args.delays.split(",")]
     all_results = []
 
     print(f"=== B3 Network Degradation Benchmark ===")
     print(f"Mode: {args.mode}")
+    print(f"DDS URL: {dds_url}")
+    print(f"HTTP URL: {http_url}")
     print(f"Delays: {delays} ms")
     print(f"Iterations: {args.iterations}")
     print()
@@ -162,33 +200,31 @@ async def main():
             print("No delay (baseline)")
 
         # Run benchmark
-        result = await run_benchmark(args.mode, delay_ms, args.iterations)
+        result = await run_benchmark(args.mode, delay_ms, dds_url, http_url, args.iterations)
         all_results.append(result)
 
         # Print results
         if "dds" in result:
-            print(f"  DDS: {result['dds']['mean']:.2f}ms (p50), {result['dds']['p95']:.2f}ms (p95)")
+            print(f"  DDS: {result['dds']['mean']:.2f}ms (mean), {result['dds']['p95']:.2f}ms (p95)")
         if "http" in result:
-            print(f"  HTTP: {result['http']['mean']:.2f}ms (p50), {result['http']['p95']:.2f}ms (p95)")
+            print(f"  HTTP: {result['http']['mean']:.2f}ms (mean), {result['http']['p95']:.2f}ms (p95)")
 
         print()
 
-    # Calculate degradation percentages
-    baseline_dds = next((r for r in all_results if r["delay_ms"] == 0), None)
-    baseline_http = next((r for r in all_results if r["delay_ms"] == 0), None)
+    # Calculate degradation percentages using delay=0 as baseline
+    baseline = next((r for r in all_results if r["delay_ms"] == 0), None)
 
     for result in all_results:
-        if result["delay_ms"] > 0 and baseline_dds and "dds" in result:
-            if baseline_dds.get("dds"):
+        if result["delay_ms"] > 0 and baseline:
+            if baseline.get("dds") and "dds" in result:
                 result["dds"]["degradation_pct"] = (
-                    (result["dds"]["mean"] - baseline_dds["dds"]["mean"]) /
-                    baseline_dds["dds"]["mean"] * 100
+                    (result["dds"]["mean"] - baseline["dds"]["mean"]) /
+                    baseline["dds"]["mean"] * 100
                 )
-        if result["delay_ms"] > 0 and baseline_http and "http" in result:
-            if baseline_http.get("http"):
+            if baseline.get("http") and "http" in result:
                 result["http"]["degradation_pct"] = (
-                    (result["http"]["mean"] - baseline_http["http"]["mean"]) /
-                    baseline_http["http"]["mean"] * 100
+                    (result["http"]["mean"] - baseline["http"]["mean"]) /
+                    baseline["http"]["mean"] * 100
                 )
 
     # Save results

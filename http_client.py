@@ -34,6 +34,8 @@ class HTTPClient:
 
     async def health_check(self, host: str, port: int) -> bool:
         """Check if agent is healthy"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
         try:
             url = f"http://{host}:{port}/health"
             async with self.session.get(url) as response:
@@ -42,7 +44,9 @@ class HTTPClient:
             return False
 
     async def get_agent_status(self, host: str, port: int) -> Optional[Dict]:
-        """Get agent status"""
+        """Get agent status via /health endpoint"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
         try:
             url = f"http://{host}:{port}/health"
             async with self.session.get(url) as response:
@@ -62,6 +66,8 @@ class HTTPClient:
         max_tokens: int = 256,
     ) -> Optional[AgentTaskResponse]:
         """Send chat request to agent"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
         try:
             url = f"http://{host}:{port}/chat"
             payload = {
@@ -71,8 +77,8 @@ class HTTPClient:
                 "max_tokens": max_tokens,
             }
             async with self.session.post(url, json=payload) as response:
+                data = await response.json()
                 if response.status == 200:
-                    data = await response.json()
                     return AgentTaskResponse(
                         task_id=data.get("task_id", ""),
                         agent_id=data.get("agent_id", ""),
@@ -82,6 +88,14 @@ class HTTPClient:
                         success=data.get("success", True),
                         error_message=data.get("error", ""),
                     )
+                else:
+                    return AgentTaskResponse(
+                        task_id="",
+                        agent_id="",
+                        content="",
+                        success=False,
+                        error_message=data.get("error", f"HTTP {response.status}"),
+                    )
         except Exception as e:
             return AgentTaskResponse(
                 task_id="",
@@ -90,7 +104,6 @@ class HTTPClient:
                 success=False,
                 error_message=str(e),
             )
-        return None
 
     async def send_generate_request(
         self,
@@ -102,8 +115,10 @@ class HTTPClient:
         max_tokens: int = 256,
     ) -> Optional[AgentTaskResponse]:
         """Send generation request to agent"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
         try:
-            url = f"http://{host}:{port}/generate"
+            url = f"http://{host}:{port}/v1/completions"
             payload = {
                 "prompt": prompt,
                 "model": model,
@@ -111,16 +126,27 @@ class HTTPClient:
                 "max_tokens": max_tokens,
             }
             async with self.session.post(url, json=payload) as response:
+                data = await response.json()
                 if response.status == 200:
-                    data = await response.json()
+                    # OpenAI-compatible /v1/completions format
+                    choices = data.get("choices", [])
+                    content = choices[0].get("text", "") if choices else data.get("response", "")
                     return AgentTaskResponse(
                         task_id=data.get("task_id", ""),
                         agent_id=data.get("agent_id", ""),
-                        content=data.get("response", ""),
+                        content=content,
                         is_final=True,
                         processing_time_ms=data.get("processing_time_ms", 0),
-                        success=data.get("success", True),
-                        error_message=data.get("error", ""),
+                        success=True,
+                        error_message="",
+                    )
+                else:
+                    return AgentTaskResponse(
+                        task_id="",
+                        agent_id="",
+                        content="",
+                        success=False,
+                        error_message=data.get("error", f"HTTP {response.status}"),
                     )
         except Exception as e:
             return AgentTaskResponse(
@@ -130,7 +156,6 @@ class HTTPClient:
                 success=False,
                 error_message=str(e),
             )
-        return None
 
 
 # ============================================
@@ -157,6 +182,8 @@ class OrchestratorHTTPClient:
 
     async def register(self, registration: AgentRegistration) -> bool:
         """Register with orchestrator"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
         try:
             url = f"{self.orchestrator_url}/agents/register"
             async with self.session.post(url, json=registration.model_dump()) as response:
@@ -165,10 +192,13 @@ class OrchestratorHTTPClient:
             print(f"Failed to register: {e}")
             return False
 
-    async def send_task(self, task: AgentTaskRequest) -> Optional[AgentTaskResponse]:
-        """Send task to orchestrator"""
+    async def send_task(self, task: AgentTaskRequest, agent_id: Optional[str] = None) -> Optional[AgentTaskResponse]:
+        """Send task to orchestrator for a specific agent"""
+        if self.session is None:
+            raise RuntimeError("HTTPClient not initialized. Use as context manager or call __aenter__.")
+        target_id = agent_id or task.requester_id
         try:
-            url = f"{self.orchestrator_url}/agents/{task.target_agent_id}/task"
+            url = f"{self.orchestrator_url}/agents/{target_id}/task"
             async with self.session.post(url, json=task.model_dump()) as response:
                 if response.status == 200:
                     data = await response.json()

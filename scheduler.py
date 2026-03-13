@@ -72,8 +72,8 @@ class TaskScheduler:
         self._lock = asyncio.Lock()
         self._task_handlers: Dict[str, Callable] = {}
 
-        # Start background tasks
-        self._cleanup_task = None
+        # TODO: Implement periodic cleanup of old completed/failed tasks
+        # self._cleanup_task = None
 
     def register_handler(self, task_type: str, handler: Callable):
         """Register a handler for a task type"""
@@ -92,6 +92,24 @@ class TaskScheduler:
         logger.info(f"Task {task.task_id} submitted with priority {task.priority.name}")
         return task.task_id
 
+    @staticmethod
+    def _map_priority(value) -> "TaskPriority":
+        """Map external priority (any int 0-10+) or TaskPriority to TaskPriority enum.
+        External scale: higher number = higher priority (e.g., 10=CRITICAL, 8+=HIGH, 5+=NORMAL, <5=LOW).
+        Internal scale: lower number = higher priority (heapq min-heap).
+        """
+        if isinstance(value, TaskPriority):
+            return value
+        v = int(value)
+        if v >= 10:
+            return TaskPriority.CRITICAL
+        elif v >= 7:
+            return TaskPriority.HIGH
+        elif v >= 4:
+            return TaskPriority.NORMAL
+        else:
+            return TaskPriority.LOW
+
     async def submit_chat(self, messages: List[dict], **kwargs) -> str:
         """Submit a chat task"""
         task = Task(
@@ -100,10 +118,25 @@ class TaskScheduler:
             messages=messages,
             max_tokens=kwargs.get("max_tokens", self.config.default_max_tokens),
             temperature=kwargs.get("temperature", self.config.default_temperature),
-            priority=TaskPriority(kwargs.get("priority", TaskPriority.NORMAL.value)),
+            priority=self._map_priority(kwargs.get("priority", TaskPriority.NORMAL.value)),
             timeout_ms=kwargs.get("timeout_ms", self.config.task_timeout_seconds * 1000),
         )
         return await self.submit_task(task)
+
+    async def track_task(self, task: Task) -> str:
+        """Track a task that is processed inline (not queued).
+
+        Unlike submit_task(), this does NOT put the task in the priority queue.
+        Use this when the caller handles routing directly and just needs the
+        task to appear in stats/history with correct RUNNING status.
+        """
+        async with self._lock:
+            task.status = TaskStatus.RUNNING
+            task.started_at = time.time()
+            self.tasks[task.task_id] = task
+            self.running_tasks[task.task_id] = task
+        logger.debug(f"Tracking inline task {task.task_id}")
+        return task.task_id
 
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get task by ID"""
@@ -121,28 +154,30 @@ class TaskScheduler:
                 return False
 
             task.status = TaskStatus.CANCELLED
+            task.completed_at = time.time()
             logger.info(f"Task {task_id} cancelled")
             return True
 
     async def get_next_task(self) -> Optional[Task]:
-        """Get next task from queue"""
+        """Get next task from queue, skipping cancelled tasks"""
         try:
-            # Wait for task with timeout
-            priority, task_id = await asyncio.wait_for(
-                self.queue.get(),
-                timeout=1.0
-            )
+            while True:
+                # Wait for task with timeout
+                priority, task_id = await asyncio.wait_for(
+                    self.queue.get(),
+                    timeout=1.0
+                )
+                self.queue.task_done()
 
-            async with self._lock:
-                task = self.tasks.get(task_id)
-                if task and task.status == TaskStatus.CANCELLED:
-                    return None
-                if task:
+                async with self._lock:
+                    task = self.tasks.get(task_id)
+                    if not task or task.status == TaskStatus.CANCELLED:
+                        # Skip missing or cancelled tasks and try the next one
+                        continue
                     task.status = TaskStatus.RUNNING
                     task.started_at = time.time()
                     self.running_tasks[task_id] = task
-
-                return task
+                    return task
 
         except asyncio.TimeoutError:
             return None
@@ -194,20 +229,34 @@ class TaskScheduler:
         async with self._lock:
             completed = [t for t in self.tasks.values()
                         if t.status == TaskStatus.COMPLETED]
-            return sorted(completed, key=lambda t: t.completed_at, reverse=True)[:limit]
+            return sorted(completed, key=lambda t: t.completed_at or 0, reverse=True)[:limit]
+
+    async def cleanup_old_tasks(self, max_tasks: int = 1000, max_age_seconds: int = 3600):
+        """Remove old completed/failed/cancelled tasks when limit exceeded"""
+        async with self._lock:
+            if len(self.tasks) <= max_tasks:
+                return
+            tasks_to_remove = []
+            for task_id, task in self.tasks.items():
+                if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT]:
+                    if task.completed_at is not None and time.time() - task.completed_at > max_age_seconds:
+                        tasks_to_remove.append(task_id)
+            for task_id in tasks_to_remove:
+                del self.tasks[task_id]
+                self.running_tasks.pop(task_id, None)
 
     async def get_stats(self) -> dict:
         """Get scheduler statistics"""
         async with self._lock:
             total = len(self.tasks)
-            pending = sum(1 for t in self.tasks.values() if t.status == TaskStatus.QUEUED)
+            queued = sum(1 for t in self.tasks.values() if t.status == TaskStatus.QUEUED)
             running = len(self.running_tasks)
             completed = sum(1 for t in self.tasks.values() if t.status == TaskStatus.COMPLETED)
             failed = sum(1 for t in self.tasks.values() if t.status == TaskStatus.FAILED)
 
             return {
                 "total_tasks": total,
-                "pending_tasks": pending,
+                "queued_tasks": queued,
                 "running_tasks": running,
                 "completed_tasks": completed,
                 "failed_tasks": failed,

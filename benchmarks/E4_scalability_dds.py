@@ -1,12 +1,33 @@
 #!/usr/bin/env python3
 """
-E4: Escalabilidade Multi-Agente Distribuído
-==============================================
-Mede throughput e latência com múltiplos clientes e agentes
-100% REAL - usa servidor LLM real em múltiplas VMs
+E4: Escalabilidade Multi-Agente Distribuído - DDS
+==================================================
+Avalia throughput e latência com múltiplos clientes e agentes em ambiente distribuído.
+
+Design experimental (conforme dissertação):
+  Fase A: 1 agente (VM1 ou VM2), clientes = 1, 2, 4, 8
+  Fase B: 2 agentes (VM1 + VM2), clientes = 1, 2, 4, 8
+  N = 50 requisições por cliente por configuração
+
+Ambiente distribuído (inter-VM via Proxmox):
+  VM1: 192.168.1.60  - Agente AMD RX6600M (Phi-4-mini)
+  VM2: 192.168.1.61  - Agente NVIDIA RTX 3080 (Qwen3.5-9B)
+  VM3: 192.168.1.62  - Orquestrador (sem GPU)
+
+Métricas: throughput (req/s), latência p50/p95/p99, CPU/memória do orquestrador.
 
 Usage:
-    python E4_scalability_dds.py --agentes 2 --clientes 8 --n 50
+    # Fase A: 1 agente
+    python E4_scalability_dds.py \\
+        --orchestrador http://192.168.1.62:8080 \\
+        --agentes http://192.168.1.60:8082 \\
+        --n 50
+
+    # Fase B: 2 agentes
+    python E4_scalability_dds.py \\
+        --orchestrador http://192.168.1.62:8080 \\
+        --agentes http://192.168.1.60:8082,http://192.168.1.61:8082 \\
+        --n 50
 """
 
 import argparse
@@ -19,31 +40,34 @@ from pathlib import Path
 from typing import Dict, List
 import aiohttp
 
+CLIENT_COUNTS = [1, 2, 4, 8]  # configurações de clientes conforme dissertação
 
-class ScalabilityBenchmark:
-    """Benchmark de escalabilidade multi-agente."""
 
-    def __init__(self, agentes: List[str], clientes: int):
-        self.agentes = agentes  # Lista de URLs dos agentes
-        self.clientes = clientes
+class ScalabilityBenchmarkDDS:
+    """Benchmark de escalabilidade multi-agente com DDS."""
 
-    async def client_request(self, session: aiohttp.ClientSession, agent_url: str) -> Dict:
-        """Executa uma requisição REAL e mede latência."""
+    def __init__(self, orchestrador_url: str, agentes: List[str]):
+        self.orchestrador_url = orchestrador_url
+        self.agentes = agentes
+
+    async def _single_request(self, session: aiohttp.ClientSession) -> Dict:
+        """Executa uma requisição via orquestrador (DDS routing interno)."""
         start = time.perf_counter()
-
         try:
             async with session.post(
-                f"{agent_url}/chat",
-                json={"messages": [{"role": "user", "content": "O que é 2+2?"}]},
-                timeout=aiohttp.ClientTimeout(total=60)
+                f"{self.orchestrador_url}/v1/chat/completions",
+                json={
+                    "model": "phi4-mini",
+                    "messages": [{"role": "user", "content": "O que e 2+2?"}],
+                    "max_tokens": 20
+                },
+                timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
                 await resp.text()
                 end = time.perf_counter()
-                latency = (end - start) * 1000  # ms
-
                 return {
-                    "success": True,
-                    "latency_ms": latency,
+                    "success": resp.status == 200,
+                    "latency_ms": (end - start) * 1000,
                     "status": resp.status
                 }
         except Exception as e:
@@ -54,111 +78,157 @@ class ScalabilityBenchmark:
                 "error": str(e)
             }
 
-    async def run_concurrent_clients(self, n: int) -> List[Dict]:
-        """Executa N requisições concorrentes de múltiplos clientes."""
-        results = []
+    async def run_concurrent(self, num_clientes: int, n_per_client: int) -> List[Dict]:
+        """Executa num_clientes × n_per_client requisições concorrentes."""
+        total = num_clientes * n_per_client
 
         async with aiohttp.ClientSession() as session:
-            # Criar tasks para todos os clientes
-            tasks = []
-            for _ in range(n):
-                # Cada cliente escolhe um agente aleatório
-                import random
-                agent = random.choice(self.agentes)
-                task = self.client_request(session, agent)
-                tasks.append(task)
-
-            # Executar todos concurrently
+            tasks = [self._single_request(session) for _ in range(total)]
             results = await asyncio.gather(*tasks)
 
-        return results
+        return list(results)
 
-    def get_orchestrator_resources(self) -> Dict:
-        """Captura uso de CPU e memória do orchestrator."""
-        # Encontrar processo do orchestrator
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+    def get_orchestrador_resources(self) -> Dict:
+        """Captura CPU e memória do processo orquestrador."""
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info']):
             try:
-                if 'python' in proc.info['name'].lower():
+                cmdline = " ".join(proc.info.get('cmdline') or [])
+                if 'main.py' in cmdline or 'orchestrat' in cmdline.lower():
                     return {
-                        "cpu_percent": proc.cpu_percent(),
-                        "memory_mb": proc.info['memory_info'].rss / 1024 / 1024 if proc.info.get('memory_info') else 0
+                        "cpu_percent": proc.cpu_percent(interval=0.1),
+                        "memory_mb": proc.info['memory_info'].rss / 1024 / 1024
                     }
-            except:
+            except Exception:
                 pass
-        return {"cpu_percent": 0, "memory_mb": 0}
+        # Fallback: sistema
+        return {
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+            "memory_mb": psutil.virtual_memory().used / 1024 / 1024
+        }
+
+
+def compute_summary(protocol: str, phase: str, num_agentes: int,
+                    num_clientes: int, results: List[Dict],
+                    resources: Dict) -> Dict:
+    """Calcula métricas estatísticas de uma rodada."""
+    latencies = sorted([r["latency_ms"] for r in results if r.get("success")])
+    successes = len(latencies)
+    total = len(results)
+
+    if not latencies:
+        return {"error": "nenhuma requisição bem-sucedida"}
+
+    # Throughput: requisições bem-sucedidas / tempo da requisição mais longa
+    throughput = successes / (latencies[-1] / 1000.0) if latencies[-1] > 0 else 0
+
+    return {
+        "protocol": protocol,
+        "phase": phase,
+        "num_agentes": num_agentes,
+        "num_clientes": num_clientes,
+        "total_requests": total,
+        "successful_requests": successes,
+        "throughput_req_s": round(throughput, 3),
+        "latency_p50_ms": round(statistics.median(latencies), 2),
+        "latency_p95_ms": round(latencies[int(len(latencies) * 0.95)], 2),
+        "latency_p99_ms": round(latencies[int(len(latencies) * 0.99)], 2),
+        "latency_mean_ms": round(statistics.mean(latencies), 2),
+        "latency_stdev_ms": round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0,
+        "cpu_orchestrador_pct": round(resources.get("cpu_percent", 0), 2),
+        "mem_orchestrador_mb": round(resources.get("memory_mb", 0), 2)
+    }
 
 
 async def run_benchmark(args):
-    """Executa benchmark de escalabilidade."""
+    """Executa benchmark E4 completo (Fase A e Fase B)."""
 
-    # URLs dos agentes (VMs reais)
-    agentes = args.agentes.split(",") if args.agentes else ["http://localhost:8082"]
+    agentes = [a.strip() for a in args.agentes.split(",") if a.strip()]
+    num_agentes = len(agentes)
+    phase = "A" if num_agentes == 1 else "B" if num_agentes == 2 else f"{num_agentes}ag"
 
-    benchmark = ScalabilityBenchmark(agentes=agentes, clientes=args.clientes)
+    benchmark = ScalabilityBenchmarkDDS(
+        orchestrador_url=args.orchestrador,
+        agentes=agentes
+    )
 
-    results = []
-
-    print(f"E4: Escalabilidade Multi-Agente")
-    print(f"Agentes: {len(agentes)}")
-    print(f"Clientes simultâneos: {args.clientes}")
+    print(f"E4: Escalabilidade Multi-Agente - DDS")
+    print(f"Orquestrador: {args.orchestrador}")
+    print(f"Agentes ({num_agentes}): {agentes}")
+    print(f"Fase: {phase}")
+    print(f"Configurações de clientes: {CLIENT_COUNTS}")
     print(f"Requisições por cliente: {args.n}")
-    print("-" * 50)
+    print("=" * 60)
 
-    # Executar teste
-    client_results = await benchmark.run_concurrent_clients(args.clientes * args.n)
-
-    # Calcular métricas
-    latencies = [r["latency_ms"] for r in client_results if r.get("success")]
-    successes = sum(1 for r in client_results if r.get("success"))
-
-    # Recursos do orchestrator
-    resources = benchmark.get_orchestrator_resources()
-
-    summary = {
-        "protocol": "DDS",
-        "num_agentes": len(agentes),
-        "num_clientes": args.clientes,
-        "total_requests": len(client_results),
-        "successful_requests": successes,
-        "throughput_req_s": successes / (max(latencies) / 1000) if latencies else 0,
-        "latency_p50_ms": round(statistics.median(latencies), 2) if latencies else 0,
-        "latency_p95_ms": round(sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0, 2),
-        "latency_p99_ms": round(sorted(latencies)[int(len(latencies) * 0.99)] if latencies else 0, 2),
-        "cpu_orchestrator_pct": round(resources.get("cpu_percent", 0), 2),
-        "mem_orchestrator_mb": round(resources.get("memory_mb", 0), 2)
-    }
-
-    # Salvar CSV
-    csv_file = f"results/E4_scalability_{len(agentes)}ag_{args.clientes}cl.csv"
+    all_summaries = []
     Path("results").mkdir(exist_ok=True)
 
-    with open(csv_file, "w") as f:
-        f.write("cliente,latency_ms,success\n")
-        for i, r in enumerate(client_results):
-            f.write(f"{i},{r['latency_ms']},{1 if r.get('success') else 0}\n")
+    # Iterar sobre cada configuração de clientes
+    for num_clientes in CLIENT_COUNTS:
+        print(f"\n--- Fase {phase}: {num_agentes} agente(s), {num_clientes} cliente(s) ---")
 
-    # Salvar JSON
-    json_file = f"results/E4_scalability_{len(agentes)}ag_{args.clientes}cl_summary.json"
+        resources_before = benchmark.get_orchestrador_resources()
+
+        # Executar rodada
+        results = await benchmark.run_concurrent(num_clientes, args.n)
+
+        resources_after = benchmark.get_orchestrador_resources()
+        resources = {
+            "cpu_percent": max(resources_before["cpu_percent"], resources_after["cpu_percent"]),
+            "memory_mb": resources_after["memory_mb"]
+        }
+
+        summary = compute_summary(
+            protocol="DDS",
+            phase=phase,
+            num_agentes=num_agentes,
+            num_clientes=num_clientes,
+            results=results,
+            resources=resources
+        )
+        all_summaries.append(summary)
+
+        print(f"  Throughput: {summary.get('throughput_req_s', 0):.2f} req/s")
+        print(f"  Latência p50: {summary.get('latency_p50_ms', 0):.2f}ms  "
+              f"p95: {summary.get('latency_p95_ms', 0):.2f}ms  "
+              f"p99: {summary.get('latency_p99_ms', 0):.2f}ms")
+        print(f"  Sucesso: {summary.get('successful_requests', 0)}/{summary.get('total_requests', 0)}")
+
+        # Salvar CSV desta rodada
+        csv_file = f"results/E4_DDS_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
+        with open(csv_file, "w") as f:
+            f.write("latency_ms,success\n")
+            for r in results:
+                f.write(f"{r['latency_ms']},{1 if r.get('success') else 0}\n")
+
+        # Pausa entre configurações para estabilizar
+        await asyncio.sleep(2.0)
+
+    # Salvar JSON consolidado
+    json_file = f"results/E4_DDS_fase{phase}_{num_agentes}ag_summary.json"
     with open(json_file, "w") as f:
-        json.dump(summary, f, indent=2)
+        json.dump(all_summaries, f, indent=2)
 
-    print("\nResultados:")
-    print(f"Throughput: {summary['throughput_req_s']:.2f} req/s")
-    print(f"Latência p50: {summary['latency_p50_ms']:.2f}ms")
-    print(f"Latência p95: {summary['latency_p95_ms']:.2f}ms")
-    print(f"CPU: {summary['cpu_orchestrator_pct']:.1f}%")
-    print(f"Memória: {summary['mem_orchestrator_mb']:.1f}MB")
-    print(f"\nCSV: {csv_file}")
-    print(f"JSON: {json_file}")
+    print(f"\n{'=' * 60}")
+    print(f"Resumo Fase {phase} ({num_agentes} agente(s)):")
+    print(f"{'Clientes':>8} {'p50(ms)':>10} {'p95(ms)':>10} {'req/s':>8}")
+    for s in all_summaries:
+        if "error" not in s:
+            print(f"{s['num_clientes']:>8} {s['latency_p50_ms']:>10.1f} "
+                  f"{s['latency_p95_ms']:>10.1f} {s['throughput_req_s']:>8.2f}")
 
-    return summary
+    print(f"\nJSON: {json_file}")
+    return all_summaries
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E4: Escalabilidade Multi-Agente")
-    parser.add_argument("--agentes", default="http://localhost:8082", help="URLs dos agentes (separados por vírgula)")
-    parser.add_argument("--clientes", type=int, default=1, help="Número de clientes simultâneos")
-    parser.add_argument("--n", type=int, default=50, help="Requisições por cliente")
+    parser = argparse.ArgumentParser(description="E4: Escalabilidade Multi-Agente - DDS")
+    parser.add_argument("--orchestrador", default="http://localhost:8080",
+                        help="URL do orquestrador DDS")
+    parser.add_argument("--agentes", default="http://localhost:8082",
+                        help="URLs dos agentes separados por vírgula. "
+                             "1 agente = Fase A, 2 agentes = Fase B")
+    parser.add_argument("--n", type=int, default=50,
+                        help="Requisições por cliente por configuração")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

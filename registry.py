@@ -6,7 +6,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from datetime import datetime
 import logging
 
@@ -20,6 +20,7 @@ class AgentInfo:
     hostname: str
     port: int
     model: str
+    model_path: str = ""
     specialization: str = "generic"  # text, vision, embedding, generic
     vram_available_mb: int = 0
     slots_idle: int = 1
@@ -41,21 +42,34 @@ class AgentRegistry:
         self.agents: Dict[str, AgentInfo] = {}
         self._lock = asyncio.Lock()
 
-    async def register_agent(self, agent_info: AgentInfo) -> bool:
-        """Register a new agent or update existing"""
+    async def register_agent(self, agent_info) -> str:
+        """Register a new agent or update existing.
+
+        Accepts an AgentInfo dataclass, a Pydantic model with agent_id, or a dict.
+        Returns the agent_id of the registered agent.
+        """
+        # Convert dict or Pydantic model to AgentInfo dataclass if needed
+        if isinstance(agent_info, dict):
+            agent_info = self._agent_info_from_dict(agent_info)
+        elif not isinstance(agent_info, AgentInfo):
+            # Assume Pydantic model or similar object with attributes
+            agent_info = self._agent_info_from_dict(
+                agent_info.model_dump() if hasattr(agent_info, 'model_dump')
+                else agent_info.__dict__
+            )
+
         async with self._lock:
-            existing = self.agents.get(agent_info.agent_id)
+            action = "Updating" if agent_info.agent_id in self.agents else "Registering new"
+            logger.info(f"{action} agent {agent_info.agent_id}")
+            self.agents[agent_info.agent_id] = agent_info
 
-            if existing:
-                # Update existing agent
-                logger.info(f"Updating agent {agent_info.agent_id}")
-                self.agents[agent_info.agent_id] = agent_info
-            else:
-                # New registration
-                logger.info(f"Registering new agent {agent_info.agent_id}")
-                self.agents[agent_info.agent_id] = agent_info
+            return agent_info.agent_id
 
-            return True
+    def _agent_info_from_dict(self, data: dict) -> AgentInfo:
+        """Create an AgentInfo from a dictionary, ignoring unknown fields."""
+        known_fields = {f.name for f in AgentInfo.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in data.items() if k in known_fields}
+        return AgentInfo(**filtered)
 
     async def unregister_agent(self, agent_id: str) -> bool:
         """Unregister an agent"""
@@ -94,13 +108,28 @@ class AgentRegistry:
 
             agent.last_heartbeat = time.time()
 
-            if status:
+            if status is not None:
                 agent.status = status
             if slots_idle is not None:
                 agent.slots_idle = slots_idle
             if memory_usage_mb is not None:
-                agent.vram_available_mb = max(0, agent.vram_available_mb - memory_usage_mb)
+                agent.vram_available_mb = memory_usage_mb
 
+            return True
+
+    async def adjust_slots(self, agent_id: str, delta: int, status: str = None) -> bool:
+        """Atomically adjust slots_idle by delta (positive = release, negative = acquire).
+        If status is not provided, auto-derives: 'idle' when slots_idle > 0, 'busy' when 0."""
+        async with self._lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                return False
+            agent.slots_idle = max(0, agent.slots_idle + delta)
+            if status is not None:
+                agent.status = status
+            else:
+                agent.status = "idle" if agent.slots_idle > 0 else "busy"
+            agent.last_heartbeat = time.time()
             return True
 
     async def remove_stale_agents(self, timeout_seconds: int = None) -> List[str]:
@@ -129,7 +158,7 @@ class AgentRegistry:
 
         # Simple selection: least loaded
         if requirements is None:
-            return min(available, key=lambda a: a.slots_idle)
+            return max(available, key=lambda a: a.slots_idle)
 
         # Filter by requirements
         filtered = available
@@ -143,7 +172,25 @@ class AgentRegistry:
         if not filtered:
             return None
 
-        return min(filtered, key=lambda a: a.slots_idle)
+        return max(filtered, key=lambda a: a.slots_idle)
+
+    async def get_online_agents(self) -> List[AgentInfo]:
+        """Get agents that are not stale (have recent heartbeats)"""
+        timeout = self.config.agent_timeout_seconds
+        current_time = time.time()
+        async with self._lock:
+            return [
+                agent for agent in self.agents.values()
+                if current_time - agent.last_heartbeat <= timeout
+            ]
+
+    async def find_agents_by_model(self, model_id: str) -> List[AgentInfo]:
+        """Find agents whose model or model_path contains model_id"""
+        async with self._lock:
+            return [
+                agent for agent in self.agents.values()
+                if model_id in agent.model or model_id in getattr(agent, 'model_path', '')
+            ]
 
     async def get_stats(self) -> dict:
         """Get registry statistics"""

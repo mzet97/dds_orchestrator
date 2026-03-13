@@ -6,6 +6,7 @@ Provides REST API for clients to interact with the orchestration system
 import asyncio
 import logging
 import time
+import uuid
 from typing import Dict, List, Optional
 from aiohttp import web
 
@@ -39,7 +40,10 @@ class OrchestratorServer:
         # Background tasks
         self._heartbeat_task = None
         self._cleanup_task = None
+        self._dds_client_task = None
+        self._response_dispatch_task = None
         self._cleanup_lock = asyncio.Lock()
+        self._inflight_dds_tasks: set = set()
 
     async def start(self):
         """Start the orchestrator server"""
@@ -73,6 +77,7 @@ class OrchestratorServer:
         # API v1 routes (OpenAI compatible)
         self.app.router.add_post('/v1/chat/completions', self.handle_chat)
         self.app.router.add_post('/v1/completions', self.handle_generate)
+        self.app.router.add_post('/api/v1/chat/completions', self.handle_chat)
 
         # DDS topics (if enabled)
         if self.dds.is_available():
@@ -92,13 +97,31 @@ class OrchestratorServer:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         # DDS client request handler
         self._dds_client_task = asyncio.create_task(self._dds_client_loop())
+        # Sole consumer of TOPIC_AGENT_RESPONSE — dispatches to per-task waiters
+        self._response_dispatch_task = asyncio.create_task(self.dds.dispatch_agent_responses())
+        # NOTE: dispatch_client_responses is NOT started here because the
+        # orchestrator is a PRODUCER of client responses (publisher), not a
+        # consumer.  It is only useful when DDSLayer is used in a CLIENT role
+        # (e.g., benchmark scripts that subscribe to TOPIC_CLIENT_RESPONSE).
 
     async def stop(self):
         """Stop the orchestrator server"""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
+        for task in (self._heartbeat_task, self._cleanup_task,
+                     self._dds_client_task, self._response_dispatch_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        # Cancel inflight DDS client tasks
+        for t in list(self._inflight_dds_tasks):
+            if not t.done():
+                t.cancel()
+        if self._inflight_dds_tasks:
+            await asyncio.gather(*self._inflight_dds_tasks, return_exceptions=True)
+            self._inflight_dds_tasks.clear()
 
         if self.site:
             await self.site.stop()
@@ -112,7 +135,12 @@ class OrchestratorServer:
         while True:
             try:
                 await asyncio.sleep(10)
-                await self.registry.remove_stale_agents()
+                stale_ids = await self.registry.remove_stale_agents()
+                for agent_id in (stale_ids or []):
+                    try:
+                        await self.selector.unregister_agent(agent_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to unregister stale agent {agent_id} from selector: {e}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -161,9 +189,11 @@ class OrchestratorServer:
                     if not messages_json or messages_json == "[]":
                         logger.debug(f"Skipping empty DDS client request {request_id} (no messages)")
                         continue
-                    # Process valid requests concurrently
+                    # Process valid requests concurrently (tracked for clean shutdown)
                     task = asyncio.create_task(self._process_dds_client_request(req))
+                    self._inflight_dds_tasks.add(task)
                     task.add_done_callback(lambda t, rid=request_id: self._handle_task_completion(t, rid))
+                    task.add_done_callback(self._inflight_dds_tasks.discard)
 
             except asyncio.CancelledError:
                 break
@@ -189,7 +219,8 @@ class OrchestratorServer:
 
         try:
             messages = json.loads(messages_json)
-        except:
+        except Exception as e:
+            logger.warning(f"Failed to parse messages_json, using raw content: {e}")
             messages = [{"role": "user", "content": messages_json}]
 
         logger.info(f"Processing DDS client request: {request_id}")
@@ -201,48 +232,66 @@ class OrchestratorServer:
             await self._send_dds_client_response(request_id, client_id, "", success=0, error="No agents available")
             return
 
-        agent = agents[0]
+        # Select agent with most idle slots for load balancing
+        agent = max(agents, key=lambda a: a.slots_idle)
         logger.info(f"Selected agent: {agent.agent_id}")
 
-        # Send task to agent via DDS
-        dds_request = AgentTaskRequest(
-            task_id=request_id,
-            requester_id="orchestrator",
-            task_type="chat",
-            messages=messages,
-            priority=5,
-            timeout_ms=60000,
-            requires_context=0,
-        )
-        await self.dds.publish_agent_request(dds_request)
+        # Acquire agent slot (status auto-derived: idle if slots remain, busy if 0)
+        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
+            # Agent was removed between selection and slot acquisition
+            await self._send_dds_client_response(request_id, client_id, "", success=0, error="Agent no longer available")
+            return
 
-        # Wait for agent response
-        agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
+        try:
+            # Send task to agent via DDS
+            dds_request = AgentTaskRequest(
+                task_id=request_id,
+                requester_id="orchestrator",
+                task_type="chat",
+                messages=messages,
+                priority=5,
+                timeout_ms=60000,
+                requires_context=False,
+            )
+            # Register waiter BEFORE publishing to avoid race where response arrives first
+            self.dds.prepare_agent_response_waiter(request_id)
+            try:
+                await self.dds.publish_agent_request(dds_request)
 
-        # Send response back to client via DDS
-        # agent_response can be dict (timeout error) or IdlStruct (DDS response)
-        if isinstance(agent_response, dict):
-            content = agent_response.get("content", "")
-            success = agent_response.get("success", False)
-            prompt_tokens = agent_response.get("prompt_tokens", 0)
-            completion_tokens = agent_response.get("completion_tokens", 0)
-            processing_time_ms = agent_response.get("processing_time_ms", 0)
-            error = agent_response.get("error", "")
-        else:
-            content = getattr(agent_response, "content", "")
-            success = getattr(agent_response, "success", False)
-            prompt_tokens = getattr(agent_response, "prompt_tokens", 0)
-            completion_tokens = getattr(agent_response, "completion_tokens", 0)
-            processing_time_ms = getattr(agent_response, "processing_time_ms", 0)
-            error = getattr(agent_response, "error_message", "")
+                # Wait for agent response
+                agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
+            except Exception:
+                # Clean up waiter on failure
+                self.dds._pending_agent_responses.pop(request_id, None)
+                raise
 
-        await self._send_dds_client_response(
-            request_id, client_id, content,
-            success=success, error=error,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            processing_time_ms=processing_time_ms,
-        )
+            # Send response back to client via DDS
+            # agent_response can be dict (timeout error) or IdlStruct (DDS response)
+            if isinstance(agent_response, dict):
+                content = agent_response.get("content", "")
+                success = agent_response.get("success", False)
+                prompt_tokens = agent_response.get("prompt_tokens", 0)
+                completion_tokens = agent_response.get("completion_tokens", 0)
+                processing_time_ms = agent_response.get("processing_time_ms", 0)
+                error = agent_response.get("error", "")
+            else:
+                content = getattr(agent_response, "content", "")
+                success = getattr(agent_response, "success", False)
+                prompt_tokens = getattr(agent_response, "prompt_tokens", 0)
+                completion_tokens = getattr(agent_response, "completion_tokens", 0)
+                processing_time_ms = getattr(agent_response, "processing_time_ms", 0)
+                error = getattr(agent_response, "error_message", "")
+
+            await self._send_dds_client_response(
+                request_id, client_id, content,
+                success=success, error=error,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                processing_time_ms=processing_time_ms,
+            )
+        finally:
+            # Always release agent slot
+            await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
     async def _send_dds_client_response(self, request_id, client_id, content, success=True, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0):
         """Send response to client via DDS using IDL-generated ClientResponse type"""
@@ -250,6 +299,7 @@ class OrchestratorServer:
 
         response = ClientResponse(
             request_id=request_id,
+            client_id=client_id,
             content=content,
             is_final=True,
             prompt_tokens=prompt_tokens,
@@ -266,20 +316,7 @@ class OrchestratorServer:
         while True:
             try:
                 await asyncio.sleep(60)
-
-                # Clean up old completed tasks
-                async with self._cleanup_lock:
-                    # Keep only last 1000 tasks
-                    if len(self.scheduler.tasks) > 1000:
-                        tasks_to_remove = []
-                        for task_id, task in self.scheduler.tasks.items():
-                            if task.status in ["completed", "failed", "cancelled"]:
-                                if time.time() - task.completed_at > 3600:  # 1 hour
-                                    tasks_to_remove.append(task_id)
-
-                        for task_id in tasks_to_remove:
-                            del self.scheduler.tasks[task_id]
-
+                await self.scheduler.cleanup_old_tasks()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -350,6 +387,7 @@ class OrchestratorServer:
             model=data.get("model", "unknown"),
             vram_available_mb=data.get("vram_available_mb", 0),
             slots_idle=data.get("slots_idle", 1),
+            slots_total=data.get("slots_total", data.get("slots_idle", 1)),
             vision_enabled=data.get("vision_enabled", False),
             capabilities=data.get("capabilities", []),
         )
@@ -361,7 +399,7 @@ class OrchestratorServer:
             await self.selector.register_agent(
                 agent_id=agent_info.agent_id,
                 specialization="generic",
-                max_load=agent_info.slots_idle
+                max_load=agent_info.slots_total
             )
         except Exception as e:
             logger.warning(f"Failed to register in selector: {e}")
@@ -378,7 +416,8 @@ class OrchestratorServer:
             data = await request.json()
             status = data.get("status", "idle")
             slots_idle = data.get("slots_idle", 1)
-        except:
+        except Exception as e:
+            logger.warning(f"Failed to parse heartbeat JSON, using defaults: {e}")
             status = "idle"
             slots_idle = 1
 
@@ -400,7 +439,10 @@ class OrchestratorServer:
 
     async def handle_chat(self, request: web.Request) -> web.Response:
         """Handle chat request"""
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception as e:
+            return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
         messages = data.get("messages", [])
 
         if not messages:
@@ -412,15 +454,7 @@ class OrchestratorServer:
         priority = data.get("priority", TaskPriority.NORMAL.value)
         task_type = data.get("task_type", "chat")
 
-        # Determine task type and specialization
-        criteria = SelectionCriteria(
-            task_type=TaskType(task_type) if task_type in [t.value for t in TaskType] else TaskType.CHAT,
-            requires_vision=data.get("requires_vision", False),
-            requires_embedding=data.get("requires_embedding", False),
-            priority=priority
-        )
-
-        # Get any available agent from registry (simpler approach)
+        # Get any available agent from registry
         agents = await self.registry.get_available_agents()
         if not agents:
             return web.json_response({
@@ -428,120 +462,159 @@ class OrchestratorServer:
                 "code": "NO_AGENTS"
             }, status=503)
 
-        # Use first available agent (simplified - can be improved)
-        selected_agent_id = agents[0].agent_id
-        logger.info(f"Selected agent: {selected_agent_id}")
-
-        # Get agent info from registry
-        agent = await self.registry.get_agent(selected_agent_id)
+        # Select agent with most idle slots for load balancing
+        agent = max(agents, key=lambda a: a.slots_idle)
+        logger.info(f"Selected agent: {agent.agent_id}")
 
         # Create task
         task = Task(
-            task_id=f"task-{int(time.time() * 1000)}",
+            task_id=f"task-{str(uuid.uuid4())}",
             task_type="chat",
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            priority=TaskPriority(priority),
+            priority=TaskScheduler._map_priority(priority),
             assigned_agent_id=agent.agent_id,
         )
 
-        # Update agent status
-        await self.registry.update_heartbeat(agent.agent_id, status="busy", slots_idle=agent.slots_idle - 1)
+        # Update agent status (atomic slot decrement, status auto-derived)
+        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
+            return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
 
-        # Submit to scheduler
-        await self.scheduler.submit_task(task)
+        # Track task (don't queue — we dispatch inline via DDS/HTTP below)
+        await self.scheduler.track_task(task)
 
         # Try DDS first, fall back to HTTP if it fails
         dds_success = False
         response_data = {}
 
         try:
-            # Send task to agent via DDS topic
-            dds_request = AgentTaskRequest(
-                task_id=task.task_id,
-                requester_id="orchestrator",
-                task_type=task.task_type,
-                messages=messages,
-                priority=priority,
-                timeout_ms=task.timeout_ms,
-                requires_context=task.requires_context,
-            )
-            await self.dds.publish_agent_request(dds_request)
-
-            # Wait for response from agent via DDS topic
-            # Agent publishes to agent/response topic
-            response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)  # 120s timeout for DDS
-            # Only consider success if we got actual content (not just an error message)
-            # Response can be either a dict or an IdlStruct object
-            content = ""
-            if isinstance(response_data, dict):
-                content = response_data.get("content", "")
-            else:
-                content = getattr(response_data, "content", "")
-
-            if content:
-                dds_success = True
-        except Exception as e:
-            logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
-
-        # If DDS failed, use HTTP fallback
-        logger.info(f"DDS result: dds_success={dds_success}, response_data={response_data}")
-        if not dds_success:
-            logger.info(f"Using HTTP fallback for task {task.task_id}")
-            agent_url = f"http://{agent.hostname}:{agent.port}"
-            logger.info(f"Calling agent at {agent_url}")
             try:
-                # Convert messages to prompt for /generate endpoint
-                prompt = ""
-                for msg in messages:
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    prompt += f"{role}: {content}\n"
-
-                http_result = await self.dds.send_request_via_http(
-                    agent_url,
-                    {"prompt": prompt.strip(), "max_tokens": max_tokens, "temperature": temperature},
-                    timeout=task.timeout_ms // 1000
+                # Send task to agent via DDS topic
+                dds_request = AgentTaskRequest(
+                    task_id=task.task_id,
+                    requester_id="orchestrator",
+                    task_type=task.task_type,
+                    messages=messages,
+                    priority=priority,
+                    timeout_ms=task.timeout_ms,
+                    requires_context=task.requires_context,
+                    stream=data.get("stream", False),
                 )
-                logger.info(f"HTTP result: {http_result}")
-                response_data = {
-                    "content": http_result.get("response", ""),
-                    "processing_time_ms": http_result.get("processing_time_ms", 0),
-                    "success": http_result.get("success", 1)
-                }
+                # Register waiter BEFORE publishing to avoid race condition
+                # where the response arrives before the waiter is set up.
+                self.dds.prepare_agent_response_waiter(task.task_id)
+                await self.dds.publish_agent_request(dds_request)
+
+                # Wait for response from agent via DDS topic
+                # Agent publishes to agent/response topic
+                response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)  # 120s timeout for DDS
+                # Only consider success if we got actual content (not just an error message)
+                # Response can be either a dict or an IdlStruct object
+                content = ""
+                if isinstance(response_data, dict):
+                    content = response_data.get("content", "")
+                else:
+                    content = getattr(response_data, "content", "")
+
+                # Check if DDS transport actually delivered a response.
+                # wait_for_agent_response returns {"error": "DDS not available"} when
+                # DDS is disabled — treat that as a transport failure for HTTP fallback.
+                if isinstance(response_data, dict) and response_data.get("error") == "DDS not available":
+                    logger.info("DDS not available, will try HTTP fallback")
+                else:
+                    dds_success = True
             except Exception as e:
-                logger.error(f"HTTP fallback also failed: {e}")
-                response_data = {"content": "", "error": str(e), "success": 0}
+                logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
+                # Clean up the waiter since DDS path failed
+                self.dds._pending_agent_responses.pop(task.task_id, None)
 
-        # Complete task with result - handle both dict and IdlStruct
-        response_content = ""
-        if isinstance(response_data, dict):
-            response_content = response_data.get("content", "")
-            processing_time = response_data.get("processing_time_ms", 0)
-        else:
-            response_content = getattr(response_data, "content", "")
-            processing_time = getattr(response_data, "processing_time_ms", 0)
+            # If DDS failed, use HTTP fallback
+            logger.info(f"DDS result: dds_success={dds_success}, response_data={response_data}")
+            if not dds_success:
+                logger.info(f"Using HTTP fallback for task {task.task_id}")
+                agent_url = f"http://{agent.hostname}:{agent.port}"
+                logger.info(f"Calling agent at {agent_url}")
+                try:
+                    # Convert messages to prompt for /generate endpoint
+                    prompt = ""
+                    for msg in messages:
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                        prompt += f"{role}: {content}\n"
 
-        await self.scheduler.complete_task(
-            task.task_id,
-            response=response_content,
-            processing_time_ms=processing_time
-        )
+                    http_result = await self.dds.send_request_via_http(
+                        agent_url,
+                        {"prompt": prompt.strip(), "max_tokens": max_tokens, "temperature": temperature},
+                        timeout=max(1, task.timeout_ms // 1000)
+                    )
+                    logger.info(f"HTTP result: {http_result}")
+                    response_data = {
+                        "content": http_result.get("response", ""),
+                        "processing_time_ms": http_result.get("processing_time_ms", 0),
+                        "success": http_result.get("success", 1)
+                    }
+                except Exception as e:
+                    logger.error(f"HTTP fallback also failed: {e}")
+                    response_data = {"content": "", "error": str(e), "success": 0}
 
-        # Update agent status back to idle
-        await self.registry.update_heartbeat(agent.agent_id, status="idle", slots_idle=agent.slots_idle + 1)
+            # Complete task with result - handle both dict and IdlStruct
+            response_content = ""
+            response_error = None
+            if isinstance(response_data, dict):
+                response_content = response_data.get("content", "")
+                processing_time = response_data.get("processing_time_ms", 0)
+                if not response_data.get("success", 1):
+                    response_error = response_data.get("error", "Unknown error")
+            else:
+                response_content = getattr(response_data, "content", "")
+                processing_time = getattr(response_data, "processing_time_ms", 0)
+                if not getattr(response_data, "success", True):
+                    response_error = getattr(response_data, "error_message", "Unknown error")
 
+            await self.scheduler.complete_task(
+                task.task_id,
+                response=response_content,
+                error=response_error,
+                processing_time_ms=processing_time
+            )
+        except asyncio.CancelledError:
+            # Client disconnected — mark task as cancelled so it doesn't stay "running"
+            await self.scheduler.cancel_task(task.task_id)
+            raise
+        finally:
+            # Always restore slot — including on CancelledError (client disconnect)
+            # Status auto-derived from resulting slots_idle count
+            await self.registry.adjust_slots(agent.agent_id, delta=+1)
+
+        # Return OpenAI-compatible response for /api/v1/chat/completions
         return web.json_response({
-            "task_id": task.task_id,
+            "id": task.task_id,
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_content,
+                },
+                "finish_reason": "stop" if response_content else "error",
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
             "agent_id": agent.agent_id,
-            "status": "completed" if response_content else "failed",
-            "response": response_content,
+            "processing_time_ms": processing_time,
         })
 
     async def handle_generate(self, request: web.Request) -> web.Response:
         """Handle generate request"""
-        data = await request.json()
+        # NOTE: este endpoint bypassa DDS, usa HTTP direto ao agente
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
         prompt = data.get("prompt", "")
 
         if not prompt:
@@ -560,12 +633,21 @@ class OrchestratorServer:
         if not available:
             return web.json_response({"error": "No agents available"}, status=503)
 
-        agent = available[0]
+        agent = max(available, key=lambda a: a.slots_idle)
         agent_url = f"http://{agent.hostname}:{agent.port}"
-        result = await self.dds.send_request_via_http(
-            agent_url,
-            {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
-        )
+
+        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
+            return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
+
+        try:
+            result = await self.dds.send_request_via_http(
+                agent_url,
+                {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
+            )
+        except Exception as e:
+            return web.json_response({"error": f"Agent communication failed: {e}"}, status=502)
+        finally:
+            await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
         return web.json_response(result)
 
@@ -621,23 +703,29 @@ class OrchestratorServer:
 
     async def handle_dds_publish(self, request: web.Request) -> web.Response:
         """Publish to DDS topic"""
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
         topic = data.get("topic")
         message = data.get("message")
 
         if not topic or not message:
             return web.json_response({"error": "topic and message required"}, status=400)
 
-        await self.publish(topic, message)
+        await self.dds.publish(topic, message)
 
         return web.json_response({"success": True})
 
 
 # Helper for agent info dict
 def asdict(obj):
-    """Convert dataclass to dict"""
+    """Convert dataclass to dict, handling Enum values for JSON serialization"""
+    from enum import Enum
     if hasattr(obj, '__dataclass_fields__'):
         return {k: asdict(v) for k, v in obj.__dict__.items()}
+    elif isinstance(obj, Enum):
+        return obj.value
     elif isinstance(obj, list):
         return [asdict(i) for i in obj]
     elif isinstance(obj, dict):

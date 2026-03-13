@@ -17,11 +17,11 @@ B7.4 - Token Streaming
     Compares streaming performance for both protocols
 
 Usage:
-    python benchmark_b71_dds_grpc.py --mode latency
+    python benchmark_b71_dds_grpc.py --mode latency --grpc-endpoint localhost:50051
     python benchmark_b71_dds_grpc.py --mode serialization
-    python benchmark_b71_dds_grpc.py --mode failure
-    python benchmark_b71_dds_grpc.py --mode streaming
-    python benchmark_b71_dds_grpc.py --mode all
+    python benchmark_b71_dds_grpc.py --mode failure --grpc-endpoint localhost:50051
+    python benchmark_b71_dds_grpc.py --mode streaming --grpc-endpoint localhost:50051
+    python benchmark_b71_dds_grpc.py --mode all --grpc-endpoint localhost:50051
 """
 
 import argparse
@@ -29,10 +29,7 @@ import asyncio
 import gzip
 import json
 import os
-import pickle
-import random
 import statistics
-import struct
 import sys
 import threading
 import time
@@ -79,7 +76,13 @@ class StreamingResult:
 # ============================================================================
 
 class DDSClient:
-    """DDS client for benchmarking."""
+    """DDS client for benchmarking.
+
+    NOTE: Writer and reader on the same topic in the same participant
+    measures local loopback DDS buffer overhead, not real inter-process
+    communication. For real measurements, run writer and reader in
+    separate processes.
+    """
 
     def __init__(self, domain_id: int = 0):
         self.domain_id = domain_id
@@ -97,8 +100,6 @@ class DDSClient:
         from cyclonedds.core import Policy
         from cyclonedds.qos import Qos
         from cyclonedds.util import duration
-        import sys
-        from pathlib import Path
 
         # Import the IDL types from dds_types
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -114,6 +115,8 @@ class DDSClient:
             Policy.Durability.Volatile,
         )
 
+        # NOTE: loopback local -- measures DDS buffer overhead, not real
+        # inter-process communication.
         self.writer = DataWriter(self.participant, topic, qos)
         self.reader = DataReader(self.participant, topic, qos)
 
@@ -131,6 +134,7 @@ class DDSClient:
 
         # Receive response
         try:
+            from cyclonedds.util import duration
             samples = self.reader.read(timeout=duration(milliseconds=timeout_ms))
             if samples:
                 return (time.perf_counter() - start) * 1000
@@ -152,46 +156,65 @@ class DDSClient:
 # gRPC Implementation
 # ============================================================================
 
+def _json_serialize(obj):
+    """JSON serialization for gRPC."""
+    return json.dumps(obj).encode("utf-8")
+
+
+def _json_deserialize(data):
+    """JSON deserialization for gRPC."""
+    return json.loads(data.decode("utf-8"))
+
+
 class gRPCClient:
-    """gRPC client for benchmarking."""
+    """gRPC client for benchmarking using _grpc_server.py's /LLMService/Chat."""
 
     def __init__(self, server_address: str = "localhost:50051"):
         self.server_address = server_address
         self.channel = None
-        self.stub = None
+        self._stub = None
 
     def setup(self):
-        """Setup gRPC channel."""
+        """Setup gRPC channel and stub."""
         try:
             import grpc
-            from google.protobuf import json_format
 
-            # Create insecure channel (for benchmarking)
             self.channel = grpc.insecure_channel(self.server_address)
-            self.grpc = grpc
-            self.json_format = json_format
-
-            # Note: In real scenario, would need proto definition
-            # Using simulation for now
-
+            # Use unary_unary with JSON serialization matching _grpc_server.py
+            self._stub = self.channel.unary_unary(
+                "/LLMService/Chat",
+                request_serializer=_json_serialize,
+                response_deserializer=_json_deserialize,
+            )
         except ImportError:
-            print("Warning: grpcio not installed. Using simulation.")
+            print("Warning: grpcio not installed. gRPC tests will fail.")
             self.channel = None
+            self._stub = None
 
-    def send_and_receive(self, data: Dict, timeout_ms: int = 5000) -> float:
-        """Send data and measure roundtrip latency."""
+    def send_and_receive(self, data: Dict, timeout: float = 30.0) -> float:
+        """Send data via gRPC and measure roundtrip latency.
+
+        Uses the /LLMService/Chat RPC defined in _grpc_server.py.
+        """
         start = time.perf_counter()
 
-        if self.channel:
-            # Real gRPC call would go here
-            # For benchmarking, simulate network overhead
-            pass
+        if self._stub is None:
+            return -1
 
-        # Simulate gRPC overhead (typically higher than DDS)
-        time.sleep(0.001)  # 1ms simulated overhead
-        time.sleep(0.0001 * len(str(data)))  # Size-dependent overhead
-
-        return (time.perf_counter() - start) * 1000
+        try:
+            payload = {
+                "model": "phi4-mini",
+                "content": str(data.get("content", "ok")),
+                "max_tokens": 5,
+            }
+            resp = self._stub(payload, timeout=timeout)
+            latency_ms = (time.perf_counter() - start) * 1000
+            if resp.get("success", False):
+                return latency_ms
+            else:
+                return latency_ms  # Still return latency even on logical failure
+        except Exception as e:
+            return (time.perf_counter() - start) * 1000
 
     def cleanup(self):
         """Cleanup gRPC resources."""
@@ -199,26 +222,70 @@ class gRPCClient:
             self.channel.close()
 
 
+class HTTPClient:
+    """HTTP client for benchmarking (used by B3 as baseline)."""
+
+    def __init__(self, url: str = "http://localhost:8080"):
+        self.url = url.rstrip("/")
+        self.session = None
+
+    def setup(self):
+        """Setup HTTP session."""
+        import requests
+        self.session = requests.Session()
+
+    def send_and_receive(self, data: Dict, timeout: float = 30.0) -> float:
+        """Send data via HTTP and measure roundtrip latency."""
+        start = time.perf_counter()
+        if self.session is None:
+            return -1
+        try:
+            resp = self.session.post(
+                f"{self.url}/v1/chat/completions",
+                json={
+                    "model": "phi4-mini",
+                    "messages": [{"role": "user", "content": str(data.get("content", "ok"))}],
+                    "max_tokens": 5,
+                },
+                timeout=timeout
+            )
+            return (time.perf_counter() - start) * 1000
+        except Exception:
+            return (time.perf_counter() - start) * 1000
+
+    def cleanup(self):
+        """Cleanup HTTP session."""
+        if self.session:
+            self.session.close()
+
+
 # ============================================================================
 # Serialization Utilities
 # ============================================================================
 
-def serialize_dds(data: Dict) -> bytes:
-    """Serialize using DDS CDR (Common Data Representation)."""
-    # Simulate CDR serialization (binary, little-endian)
+def serialize_json(data: Dict) -> bytes:
+    """JSON serialization (proxy measurement -- real DDS uses CDR binary format).
+
+    DDS normally uses CDR (Common Data Representation) which is a binary,
+    little-endian serialization. This benchmark uses JSON as a proxy since
+    CDR serialization is handled internally by CycloneDDS and not directly
+    accessible from Python.
+    """
     json_str = json.dumps(data)
     return json_str.encode('utf-8')
 
 
-def deserialize_dds(data: bytes) -> Dict:
-    """Deserialize DDS CDR data."""
+def deserialize_json(data: bytes) -> Dict:
+    """JSON deserialization (proxy for DDS CDR)."""
     return json.loads(data.decode('utf-8'))
 
 
 def serialize_grpc_protobuf(data: Dict) -> bytes:
-    """Serialize using gRPC/Protocol Buffers."""
-    # Simulate protobuf serialization
-    # In real scenario, would use generated proto classes
+    """Serialize using gRPC/Protocol Buffers.
+
+    Note: This uses gzip-compressed JSON as a proxy for protobuf.
+    Real protobuf serialization would use generated proto classes.
+    """
     json_str = json.dumps(data)
 
     # Protobuf is typically more compact
@@ -228,7 +295,7 @@ def serialize_grpc_protobuf(data: Dict) -> bytes:
 
 
 def deserialize_grpc_protobuf(data: bytes) -> Dict:
-    """Deserialize gRPC/Protobuf data."""
+    """Deserialize gRPC/Protobuf data (gzip-compressed JSON proxy)."""
     decompressed = gzip.decompress(data)
     return json.loads(decompressed.decode('utf-8'))
 
@@ -255,6 +322,7 @@ def measure_serialization(serialize_fn, deserialize_fn, data: Dict) -> tuple:
 def run_latency_benchmark(
     num_iterations: int = 100,
     message_sizes: List[int] = [100, 1000, 10000],
+    grpc_endpoint: str = "localhost:50051",
 ) -> List[LatencyResult]:
     """B7.1 - Compare transport latency."""
 
@@ -285,8 +353,8 @@ def run_latency_benchmark(
     dds.cleanup()
 
     # gRPC test
-    grpc = gRPCClient()
-    grpc.setup()
+    grpc_client = gRPCClient(grpc_endpoint)
+    grpc_client.setup()
 
     for size in message_sizes:
         data = {"content": "x" * size, "timestamp": time.time()}
@@ -294,14 +362,15 @@ def run_latency_benchmark(
         print(f"Testing gRPC with {size} bytes...")
 
         for _ in range(num_iterations):
-            latency = grpc.send_and_receive(data)
-            results.append(LatencyResult(
-                protocol="gRPC",
-                message_size=size,
-                latency_ms=latency,
-            ))
+            latency = grpc_client.send_and_receive(data)
+            if latency > 0:
+                results.append(LatencyResult(
+                    protocol="gRPC",
+                    message_size=size,
+                    latency_ms=latency,
+                ))
 
-    grpc.cleanup()
+    grpc_client.cleanup()
 
     return results
 
@@ -359,9 +428,9 @@ def run_serialization_benchmark(
     for payload_type, payload in payloads.items():
         print(f"\nTesting {payload_type} serialization...")
 
-        # DDS (CDR)
+        # DDS (JSON proxy for CDR)
         serialized, ser_ms, deser_ms = measure_serialization(
-            serialize_dds, deserialize_dds, payload
+            serialize_json, deserialize_json, payload
         )
 
         results.append(SerializationResult(
@@ -373,9 +442,9 @@ def run_serialization_benchmark(
             deserialization_ms=deser_ms,
         ))
 
-        print(f"  DDS: {len(serialized)} bytes, {ser_ms:.3f}ms / {deser_ms:.3f}ms")
+        print(f"  DDS (JSON proxy): {len(serialized)} bytes, {ser_ms:.3f}ms / {deser_ms:.3f}ms")
 
-        # gRPC (Protobuf)
+        # gRPC (Protobuf proxy via gzip)
         serialized, ser_ms, deser_ms = measure_serialization(
             serialize_grpc_protobuf, deserialize_grpc_protobuf, payload
         )
@@ -389,15 +458,21 @@ def run_serialization_benchmark(
             deserialization_ms=deser_ms,
         ))
 
-        print(f"  gRPC: {len(serialized)} bytes, {ser_ms:.3f}ms / {deser_ms:.3f}ms")
+        print(f"  gRPC (gzip proxy): {len(serialized)} bytes, {ser_ms:.3f}ms / {deser_ms:.3f}ms")
 
     return results
 
 
 def run_failure_detection_benchmark(
     intervals: List[int] = [1000, 5000, 10000],  # ms
+    grpc_endpoint: str = "localhost:50051",
 ) -> List:
-    """B7.3 - Compare failure detection (QoS)."""
+    """B7.3 - Compare failure detection (QoS).
+
+    For DDS: uses DEADLINE QoS on a local participant.
+    For gRPC: sends health check RPCs to the gRPC server and measures
+    when the check fails (server must be stopped externally for real measurement).
+    """
 
     print(f"\n{'='*60}")
     print("B7.3 - Failure Detection (QoS) Benchmark")
@@ -460,34 +535,69 @@ def run_failure_detection_benchmark(
 
     dds.cleanup()
 
-    # gRPC Health Check
-    print(f"\nTesting gRPC Health Check...")
+    # gRPC Health Check -- real RPC calls to _grpc_server.py
+    print(f"\nTesting gRPC Health Check via {grpc_endpoint}...")
 
-    for interval_ms in intervals:
-        print(f"Testing with {interval_ms}ms interval...")
+    try:
+        import grpc
 
-        start = time.perf_counter()
+        for interval_ms in intervals:
+            print(f"Testing with {interval_ms}ms interval...")
 
-        # Simulate health check polling
-        # In real scenario: grpc_health_v1.HealthStub.Check()
-        time.sleep(interval_ms / 1000 * 1.5)
+            channel = grpc.insecure_channel(grpc_endpoint)
+            health_stub = channel.unary_unary(
+                "/LLMService/HealthCheck",
+                request_serializer=_json_serialize,
+                response_deserializer=_json_deserialize,
+            )
 
-        detection_ms = (time.perf_counter() - start) * 1000
+            start = time.perf_counter()
+            poll_interval = interval_ms / 1000
+            detection_ms = interval_ms * 1.5  # default if server is healthy
 
-        results.append({
-            "protocol": "gRPC",
-            "mechanism": "Health Check",
-            "interval_ms": interval_ms,
-            "detection_time_ms": detection_ms,
-        })
+            # Poll health check -- in a real test the gRPC server would be
+            # killed externally and we measure how fast we detect the failure
+            deadline = start + (interval_ms * 1.5 / 1000)
+            while time.perf_counter() < deadline:
+                try:
+                    resp = health_stub({}, timeout=1.0)
+                    if not resp.get("serving", False):
+                        detection_ms = (time.perf_counter() - start) * 1000
+                        break
+                except Exception:
+                    # gRPC error = server down = failure detected
+                    detection_ms = (time.perf_counter() - start) * 1000
+                    break
+                time.sleep(min(poll_interval, 0.1))
 
-        print(f"  Detection time: {detection_ms:.1f}ms")
+            channel.close()
+
+            results.append({
+                "protocol": "gRPC",
+                "mechanism": "Health Check",
+                "interval_ms": interval_ms,
+                "detection_time_ms": detection_ms,
+            })
+
+            print(f"  Detection time: {detection_ms:.1f}ms")
+
+    except ImportError:
+        print("WARNING: grpcio not installed. Skipping gRPC health check benchmark.")
+        for interval_ms in intervals:
+            results.append({
+                "protocol": "gRPC",
+                "mechanism": "Health Check",
+                "interval_ms": interval_ms,
+                "detection_time_ms": -1,
+                "error": "grpcio not installed",
+            })
 
     return results
 
 
 def run_streaming_benchmark(
     num_tokens: int = 100,
+    grpc_endpoint: str = "localhost:50051",
 ) -> List[StreamingResult]:
     """B7.4 - Compare token streaming."""
 
@@ -538,15 +648,15 @@ def run_streaming_benchmark(
     # gRPC streaming
     print(f"Testing gRPC streaming with {num_tokens} tokens...")
 
-    grpc = gRPCClient()
-    grpc.setup()
+    grpc_client = gRPCClient(grpc_endpoint)
+    grpc_client.setup()
 
     start = time.perf_counter()
     first_token_time = None
 
     for i in range(num_tokens):
         token_data = {"token": f"word_{i}", "index": i}
-        latency = grpc.send_and_receive(token_data)
+        latency = grpc_client.send_and_receive(token_data)
 
         if i == 0:
             first_token_time = (time.perf_counter() - start) * 1000
@@ -566,7 +676,7 @@ def run_streaming_benchmark(
         total_time_ms=total_time,
     ))
 
-    grpc.cleanup()
+    grpc_client.cleanup()
 
     print(f"  TTFT: {ttft:.2f}ms, ITL: {itl:.2f}ms")
 
@@ -594,6 +704,12 @@ def main():
         help="Number of tokens for streaming test"
     )
     parser.add_argument(
+        "--grpc-endpoint",
+        type=str,
+        default="localhost:50051",
+        help="gRPC server endpoint (started via _grpc_server.py)"
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="benchmark_results",
@@ -607,7 +723,9 @@ def main():
     all_results = {}
 
     if args.mode in ["latency", "all"]:
-        latency_results = run_latency_benchmark(args.iterations)
+        latency_results = run_latency_benchmark(
+            args.iterations, grpc_endpoint=args.grpc_endpoint
+        )
         all_results["latency"] = [
             {
                 "protocol": r.protocol,
@@ -632,11 +750,15 @@ def main():
         ]
 
     if args.mode in ["failure", "all"]:
-        failure_results = run_failure_detection_benchmark()
+        failure_results = run_failure_detection_benchmark(
+            grpc_endpoint=args.grpc_endpoint
+        )
         all_results["failure"] = failure_results
 
     if args.mode in ["streaming", "all"]:
-        streaming_results = run_streaming_benchmark(args.tokens)
+        streaming_results = run_streaming_benchmark(
+            args.tokens, grpc_endpoint=args.grpc_endpoint
+        )
         all_results["streaming"] = [
             {
                 "protocol": r.protocol,
@@ -658,6 +780,7 @@ def main():
         "config": {
             "iterations": args.iterations,
             "num_tokens": args.tokens,
+            "grpc_endpoint": args.grpc_endpoint,
         },
         "results": all_results,
     }

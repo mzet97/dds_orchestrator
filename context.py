@@ -50,7 +50,7 @@ class ContextManager:
         async with self._lock:
             # Check if at max capacity
             if len(self._contexts) >= self.max_contexts:
-                await self._cleanup_oldest()
+                self._cleanup_oldest_no_lock()
 
             context_id = str(uuid.uuid4())
             context = ConversationContext(
@@ -126,14 +126,28 @@ class ContextManager:
         async with self._lock:
             return list(self._user_contexts.get(user_id, []))
 
-    async def _cleanup_oldest(self):
-        """Remove oldest context"""
+    def _cleanup_oldest_no_lock(self):
+        """Remove oldest context. Must be called while lock is already held."""
         if not self._contexts:
             return
 
         # Find oldest context
         oldest_id = min(self._contexts.keys(), key=lambda k: self._contexts[k].last_updated)
-        await self.clear_context(oldest_id)
+
+        context = self._contexts[oldest_id]
+        user_id = context.user_id
+
+        del self._contexts[oldest_id]
+
+        # Remove from user contexts
+        if user_id in self._user_contexts:
+            if oldest_id in self._user_contexts[user_id]:
+                self._user_contexts[user_id].remove(oldest_id)
+
+    async def _cleanup_oldest(self):
+        """Remove oldest context (acquires lock)"""
+        async with self._lock:
+            self._cleanup_oldest_no_lock()
 
     async def cleanup_user(self, user_id: str):
         """Remove all contexts for a user"""

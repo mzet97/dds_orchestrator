@@ -16,6 +16,8 @@ from models import (
     AgentStatus,
     AgentTaskRequest,
     AgentTaskResponse,
+    ChatMessage,
+    TaskType,
 )
 
 
@@ -58,7 +60,7 @@ class DDSAgentRegistration(IdlStruct):
     slots_total: int32 = 0
     vision_enabled: bool = False
     reasoning_enabled: bool = False
-    registered_at: int32 = 0
+    registered_at: int64 = 0
 
     def to_model(self) -> AgentRegistration:
         return AgentRegistration(
@@ -104,7 +106,7 @@ class DDSAgentStatus(IdlStruct):
     memory_usage_mb: int32 = 0
     vram_usage_mb: int32 = 0
     current_model: bounded_str[256] = ""
-    last_heartbeat: int32 = 0
+    last_heartbeat: int64 = 0
 
     def to_model(self) -> AgentStatus:
         return AgentStatus(
@@ -133,7 +135,6 @@ class DDSTaskRequest(IdlStruct):
     created_at: int64 = 0
 
     def to_model(self) -> AgentTaskRequest:
-        from .models import ChatMessage, TaskType
         messages = [ChatMessage(**m) for m in json.loads(self.messages_json)]
         return AgentTaskRequest(
             task_id=self.task_id,
@@ -221,10 +222,14 @@ class DDSClient:
     def __init__(self, domain_id: int = 0):
         self.domain_id = domain_id
         self.dds_available = DDS_AVAILABLE
+        self.participant = None
+        self.writer_request = None
+        self.writer_register = None
+        self.reader_status = None
+        self.reader_response = None
 
         if not self.dds_available:
             print("Warning: CycloneDDS not available, using HTTP fallback mode")
-            self.participant = None
             return
 
         # Initialize DDS
@@ -280,7 +285,7 @@ class DDSClient:
 
     def publish_registration(self, registration: AgentRegistration):
         """Publish agent registration"""
-        if not self.dds_available or not self.writer_register:
+        if not self.dds_available or self.writer_register is None:
             return
 
         dds_data = DDSAgentRegistration.from_model(registration)
@@ -288,7 +293,7 @@ class DDSClient:
 
     def publish_task_request(self, task: AgentTaskRequest):
         """Publish task request to agents"""
-        if not self.dds_available or not self.writer_request:
+        if not self.dds_available or self.writer_request is None:
             return
 
         dds_data = DDSTaskRequest.from_model(task)
@@ -296,7 +301,7 @@ class DDSClient:
 
     def get_status_updates(self, timeout_ms: int = 100) -> List[AgentStatus]:
         """Get status updates from agents"""
-        if not self.dds_available or not self.reader_status:
+        if not self.dds_available or self.reader_status is None:
             return []
 
         try:
@@ -307,7 +312,7 @@ class DDSClient:
 
     def get_responses(self, timeout_ms: int = 100) -> List[AgentTaskResponse]:
         """Get task responses"""
-        if not self.dds_available or not self.reader_response:
+        if not self.dds_available or self.reader_response is None:
             return []
 
         try:
@@ -318,8 +323,22 @@ class DDSClient:
 
     def close(self):
         """Close DDS connections"""
-        if self.participant:
-            self.participant.close()
+        # Delete writers and readers before participant
+        for attr_name in ('writer_request', 'writer_register', 'reader_status', 'reader_response'):
+            obj = getattr(self, attr_name, None)
+            if obj is not None:
+                try:
+                    del obj
+                except Exception:
+                    pass
+                setattr(self, attr_name, None)
+
+        if self.participant is not None:
+            try:
+                del self.participant
+            except Exception:
+                pass
+            self.participant = None
 
 
 # ============================================
