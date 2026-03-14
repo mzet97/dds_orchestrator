@@ -200,7 +200,8 @@ def compile_llama(ssh: SSHManager, vm_cfg: Dict):
     build_dir = f"{BASE_DIR}/llama.cpp_dds/build"
     gpu_target = vm_cfg.get("gpu_target")
     cyclone_root = f"{BASE_DIR}/cyclonedds/install"
-    cmake_flags = f"-DLLAMA_DDS=ON -DCYCLONEDDS_ROOT={cyclone_root} -DCMAKE_BUILD_TYPE=Release"
+    cmake_flags = (f"-DLLAMA_DDS=ON -DLLAMA_GRPC=ON "
+                   f"-DCYCLONEDDS_ROOT={cyclone_root} -DCMAKE_BUILD_TYPE=Release")
     if gpu_target:
         cmake_flags += f" -DAMDGPU_TARGETS={gpu_target}"
 
