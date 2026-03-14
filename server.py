@@ -6,6 +6,7 @@ Provides REST API for clients to interact with the orchestration system
 import asyncio
 import json
 import logging
+import sys
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -353,65 +354,46 @@ class OrchestratorServer:
             return {"content": "", "success": False, "error": "Agent no longer available"}
 
         try:
-            from grpc_layer import AgentTaskRequest as GrpcAgentTaskRequest
-            task_request = GrpcAgentTaskRequest(
+            import grpc.aio as grpc_aio
+
+            # Direct gRPC call to agent — simpler than publish+waiter pattern
+            agent_grpc_url = getattr(agent, "grpc_address", None)
+            if not agent_grpc_url:
+                agent_grpc_url = f"{agent.hostname}:50053"
+
+            stub = self.grpc._get_or_create_stub(agent.agent_id, agent_grpc_url)
+
+            import os as _os
+            _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
+            if _proto_dir not in sys.path:
+                sys.path.insert(0, _proto_dir)
+            from proto import orchestrator_pb2 as _pb2
+            proto_req = _pb2.AgentTaskRequest(
                 task_id=request_id,
                 requester_id="orchestrator",
                 task_type="chat",
-                messages=messages,
                 priority=priority,
                 timeout_ms=timeout_ms,
                 requires_context=False,
                 stream=stream,
             )
+            for msg in messages:
+                proto_msg = proto_req.messages.add()
+                proto_msg.role = msg.get("role", "user")
+                proto_msg.content = msg.get("content", "")
 
-            # Route via gRPC to agent
-            agent_grpc_url = getattr(agent, "grpc_address", None)
-            if not agent_grpc_url:
-                agent_grpc_url = f"{agent.hostname}:50053"
+            logger.info(f"gRPC calling agent {agent.agent_id} at {agent_grpc_url}")
+            resp = await stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
+            logger.info(f"gRPC response: success={resp.success}, content_len={len(resp.content)}")
 
-            # For gRPC, publish_agent_request does the full RPC call and
-            # resolves the waiter internally. We prepare the waiter first,
-            # then publish (which resolves it), then collect the result.
-            self.grpc.prepare_agent_response_waiter(request_id)
-            await self.grpc.publish_agent_request(
-                task_request,
-                agent_id=agent.agent_id,
-                agent_grpc_url=agent_grpc_url,
-            )
-
-            # publish_agent_request already resolved the waiter via _resolve_waiter.
-            # Retrieve result directly from the container (don't re-wait).
-            waiter = self.grpc._pending_agent_responses.get(request_id)
-            if waiter:
-                event, container = waiter
-                agent_response = container[0]
-                self.grpc._pending_agent_responses.pop(request_id, None)
-            else:
-                # Waiter was already cleaned up by _resolve_waiter + pop in wait_for
-                # Try wait with short timeout as fallback
-                agent_response = await self.grpc.wait_for_agent_response(
-                    request_id, timeout_ms=5000
-                )
-
-            if isinstance(agent_response, dict):
-                return {
-                    "content": agent_response.get("content", ""),
-                    "success": agent_response.get("success", False),
-                    "error": agent_response.get("error", agent_response.get("error_message", "")),
-                    "prompt_tokens": agent_response.get("prompt_tokens", 0),
-                    "completion_tokens": agent_response.get("completion_tokens", 0),
-                    "processing_time_ms": agent_response.get("processing_time_ms", 0),
-                }
-            else:
-                return {
-                    "content": getattr(agent_response, "content", ""),
-                    "success": getattr(agent_response, "success", False),
-                    "error": getattr(agent_response, "error_message", ""),
-                    "prompt_tokens": getattr(agent_response, "prompt_tokens", 0),
-                    "completion_tokens": getattr(agent_response, "completion_tokens", 0),
-                    "processing_time_ms": getattr(agent_response, "processing_time_ms", 0),
-                }
+            return {
+                "content": resp.content,
+                "success": resp.success,
+                "error": resp.error_message or "",
+                "prompt_tokens": resp.prompt_tokens,
+                "completion_tokens": resp.completion_tokens,
+                "processing_time_ms": resp.processing_time_ms,
+            }
         except Exception as e:
             logger.error(f"Error in gRPC client request: {e}", exc_info=True)
             return {"content": "", "success": False, "error": str(e)}
