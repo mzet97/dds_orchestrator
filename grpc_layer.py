@@ -101,6 +101,8 @@ class GRPCLayer:
         # Client request handler — set by OrchestratorServer to route client
         # gRPC requests through the same registry/selector/agent pipeline.
         self._client_request_handler: Optional[Callable] = None
+        # Reference to the main asyncio event loop (set during start())
+        self._event_loop = None
 
         if getattr(config, "grpc_enabled", False):
             self._init_grpc()
@@ -115,33 +117,42 @@ class GRPCLayer:
         logger.info(f"gRPC layer initialized (port {self._port})")
 
     async def start(self):
-        """Start gRPC server for receiving agent AND client connections."""
+        """Start gRPC server (sync, in dedicated thread) for agent AND client connections.
+
+        Uses synchronous grpc.server in a background thread instead of grpc.aio
+        to avoid event loop conflicts between the gRPC server and outgoing gRPC
+        calls to agents (grpc.aio hangs when mixing server and client in same process).
+        """
         if not self.grpc_available:
             return
 
-        self._server = grpc.aio.server()
+        import concurrent.futures
+        import asyncio
 
-        # Agent-facing service (orchestrator calls agents, agents send heartbeats)
+        self._event_loop = asyncio.get_running_loop()
+        self._server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=10))
+
+        # Agent-facing service
         agent_servicer_cls = _make_servicer_class()
         _pb2_grpc.add_OrchestratorAgentServiceServicer_to_server(
             agent_servicer_cls(self), self._server
         )
 
-        # Client-facing service (clients submit chat requests)
-        client_servicer_cls = _make_client_servicer_class()
+        # Client-facing service (uses sync handler with thread executor)
+        client_servicer_cls = _make_client_servicer_class_sync()
         _pb2_grpc.add_ClientOrchestratorServiceServicer_to_server(
             client_servicer_cls(self), self._server
         )
 
         listen_addr = f"0.0.0.0:{self._port}"
         self._server.add_insecure_port(listen_addr)
-        await self._server.start()
-        logger.info(f"gRPC server started on {listen_addr} (agent + client services)")
+        self._server.start()
+        logger.info(f"gRPC server started on {listen_addr} (sync, agent + client services)")
 
     async def stop(self):
         """Stop gRPC server and close channels."""
         if self._server:
-            await self._server.stop(grace=5)
+            self._server.stop(grace=5)
             self._server = None
 
         for channel in self._agent_channels.values():
@@ -430,41 +441,62 @@ def _make_servicer_class():
 
 
 def _make_client_servicer_class():
-    """Create the client-facing servicer class after stubs are loaded."""
+    """Create async client-facing servicer (kept for compatibility, not currently used)."""
     class _ClientServicer(_pb2_grpc.ClientOrchestratorServiceServicer):
-        """gRPC server-side handler for external clients submitting chat requests.
-
-        Routes: Client --gRPC--> Orchestrator --gRPC--> Agent --gRPC--> llama-server
-        """
-
         def __init__(self, layer: GRPCLayer):
             self._layer = layer
 
         async def Chat(self, request, context):
-            """Handle unary chat request from client."""
+            return _pb2.ClientChatResponse(
+                request_id=request.request_id, content="",
+                is_final=True, success=False,
+                error_message="Use sync servicer",
+            )
+
+    return _ClientServicer
+
+
+def _make_client_servicer_class_sync():
+    """Create sync client-facing servicer for use with grpc.server (not grpc.aio).
+
+    The handler (_client_request_handler) is an async function in the main event loop.
+    We schedule it from the gRPC thread pool using run_coroutine_threadsafe.
+    """
+    class _ClientServicerSync(_pb2_grpc.ClientOrchestratorServiceServicer):
+        def __init__(self, layer: GRPCLayer):
+            self._layer = layer
+
+        def Chat(self, request, context):
+            """Handle unary chat request from client (sync, runs in thread pool)."""
             handler = self._layer._client_request_handler
             if handler is None:
                 return _pb2.ClientChatResponse(
-                    request_id=request.request_id,
-                    content="",
-                    is_final=True,
-                    success=False,
+                    request_id=request.request_id, content="",
+                    is_final=True, success=False,
                     error_message="Client handler not configured",
                 )
 
             try:
-                # Convert proto to dict for handler
                 messages = [{"role": m.role, "content": m.content} for m in request.messages]
-                result = await handler(
-                    request_id=request.request_id,
-                    messages=messages,
-                    model=request.model,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    priority=request.priority,
-                    timeout_ms=request.timeout_ms or 120000,
-                    stream=False,
+
+                # Schedule the async handler on the main event loop
+                import asyncio
+                loop = self._layer._event_loop
+                future = asyncio.run_coroutine_threadsafe(
+                    handler(
+                        request_id=request.request_id,
+                        messages=messages,
+                        model=request.model,
+                        max_tokens=request.max_tokens,
+                        temperature=request.temperature,
+                        priority=request.priority,
+                        timeout_ms=request.timeout_ms or 120000,
+                        stream=False,
+                    ),
+                    loop,
                 )
+                result = future.result(timeout=(request.timeout_ms or 120000) / 1000)
+
                 return _pb2.ClientChatResponse(
                     request_id=request.request_id,
                     content=result.get("content", ""),
@@ -479,57 +511,14 @@ def _make_client_servicer_class():
             except Exception as e:
                 logger.error(f"Error processing gRPC client Chat: {e}", exc_info=True)
                 return _pb2.ClientChatResponse(
-                    request_id=request.request_id,
-                    content="",
-                    is_final=True,
-                    success=False,
+                    request_id=request.request_id, content="",
+                    is_final=True, success=False,
                     error_message=str(e),
                 )
 
-        async def StreamChat(self, request, context):
-            """Handle streaming chat request from client."""
-            handler = self._layer._client_request_handler
-            if handler is None:
-                yield _pb2.ClientChatResponse(
-                    request_id=request.request_id,
-                    content="",
-                    is_final=True,
-                    success=False,
-                    error_message="Client handler not configured",
-                )
-                return
+        def StreamChat(self, request, context):
+            """Handle streaming chat (returns single response for now)."""
+            resp = self.Chat(request, context)
+            yield resp
 
-            try:
-                messages = [{"role": m.role, "content": m.content} for m in request.messages]
-                result = await handler(
-                    request_id=request.request_id,
-                    messages=messages,
-                    model=request.model,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    priority=request.priority,
-                    timeout_ms=request.timeout_ms or 120000,
-                    stream=False,  # agent-side streaming handled separately
-                )
-                yield _pb2.ClientChatResponse(
-                    request_id=request.request_id,
-                    content=result.get("content", ""),
-                    is_final=True,
-                    prompt_tokens=result.get("prompt_tokens", 0),
-                    completion_tokens=result.get("completion_tokens", 0),
-                    processing_time_ms=result.get("processing_time_ms", 0),
-                    success=result.get("success", False),
-                    error_message=result.get("error", ""),
-                    model=request.model,
-                )
-            except Exception as e:
-                logger.error(f"Error in gRPC StreamChat: {e}", exc_info=True)
-                yield _pb2.ClientChatResponse(
-                    request_id=request.request_id,
-                    content="",
-                    is_final=True,
-                    success=False,
-                    error_message=str(e),
-                )
-
-    return _ClientServicer
+    return _ClientServicerSync
