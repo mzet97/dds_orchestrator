@@ -354,20 +354,18 @@ class OrchestratorServer:
             return {"content": "", "success": False, "error": "Agent no longer available"}
 
         try:
-            import grpc.aio as grpc_aio
-
-            # Direct gRPC call to agent — simpler than publish+waiter pattern
-            agent_grpc_url = getattr(agent, "grpc_address", None)
-            if not agent_grpc_url:
-                agent_grpc_url = f"{agent.hostname}:50053"
-
-            stub = self.grpc._get_or_create_stub(agent.agent_id, agent_grpc_url)
-
+            import grpc
             import os as _os
             _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
             if _proto_dir not in sys.path:
                 sys.path.insert(0, _proto_dir)
             from proto import orchestrator_pb2 as _pb2
+            from proto import orchestrator_pb2_grpc as _pb2_grpc
+
+            agent_grpc_url = getattr(agent, "grpc_address", None)
+            if not agent_grpc_url:
+                agent_grpc_url = f"{agent.hostname}:50053"
+
             proto_req = _pb2.AgentTaskRequest(
                 task_id=request_id,
                 requester_id="orchestrator",
@@ -383,7 +381,18 @@ class OrchestratorServer:
                 proto_msg.content = msg.get("content", "")
 
             logger.info(f"gRPC calling agent {agent.agent_id} at {agent_grpc_url}")
-            resp = await stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
+
+            # Use synchronous gRPC in a thread executor to avoid grpc.aio event loop issues
+            def _sync_grpc_call():
+                channel = grpc.insecure_channel(agent_grpc_url)
+                stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
+                resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
+                channel.close()
+                return resp
+
+            loop = asyncio.get_running_loop()
+            resp = await loop.run_in_executor(None, _sync_grpc_call)
+
             logger.info(f"gRPC response: success={resp.success}, content_len={len(resp.content)}")
 
             return {
