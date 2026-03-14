@@ -357,6 +357,7 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
     wait_orchestrator_ready(ssh_orch)
 
     # 3. gRPC agent AFTER orchestrator is ready
+    #    HOSTNAME must be the agent's real IP so the orchestrator can reach it
     agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_grpc.py "
                  f"--model-name {agent_cfg['model_name']} "
                  f"--model-path {model_path} "
@@ -365,7 +366,8 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
                  f"--grpc-address localhost:50051 "
                  f"--grpc-listen-port 50053 "
                  f"--no-server")
-    ssh_agent.run_bg(agent_cmd, "/tmp/agent_grpc.log")
+    ssh_agent.run_bg(agent_cmd, "/tmp/agent_grpc.log",
+                     env={"HOSTNAME": ssh_agent.ip})
     print(f"    [OK] Agent gRPC em {ssh_agent.ip}")
 
 
