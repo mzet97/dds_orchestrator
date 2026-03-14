@@ -29,6 +29,12 @@ def _ensure_stubs():
     if _stubs_loaded:
         return True
     try:
+        # Add proto/ dir to sys.path so generated stubs can find each other
+        # (orchestrator_pb2_grpc.py does 'import orchestrator_pb2' without prefix)
+        import os, sys
+        proto_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proto")
+        if proto_dir not in sys.path:
+            sys.path.insert(0, proto_dir)
         from proto import orchestrator_pb2 as pb2
         from proto import orchestrator_pb2_grpc as pb2_grpc
         _pb2 = pb2
