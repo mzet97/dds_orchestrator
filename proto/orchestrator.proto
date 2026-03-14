@@ -46,6 +46,34 @@ message HeartbeatResponse {
 
 message Empty {}
 
+// ─── Client-facing messages ─────────────────────────────────────────────────
+
+message ClientChatRequest {
+    string               request_id   = 1;
+    string               model        = 2;
+    repeated ChatMessage messages     = 3;
+    float                temperature  = 4;
+    int32                max_tokens   = 5;
+    bool                 stream       = 6;
+    int32                priority     = 7;
+    int32                timeout_ms   = 8;
+}
+
+message ClientChatResponse {
+    string request_id         = 1;
+    string content            = 2;
+    bool   is_final           = 3;
+    int32  prompt_tokens      = 4;
+    int32  completion_tokens  = 5;
+    int32  processing_time_ms = 6;
+    bool   success            = 7;
+    string error_message      = 8;
+    string model              = 9;
+}
+
+// ─── Services ───────────────────────────────────────────────────────────────
+
+// Agent ↔ Orchestrator (internal)
 service OrchestratorAgentService {
     // Unary task submission
     rpc SubmitTask(AgentTaskRequest) returns (AgentTaskResponse);
@@ -55,4 +83,13 @@ service OrchestratorAgentService {
 
     // Heartbeat
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Client ↔ Orchestrator (external)
+service ClientOrchestratorService {
+    // Unary chat completion
+    rpc Chat(ClientChatRequest) returns (ClientChatResponse);
+
+    // Server-streaming chat completion (token-by-token)
+    rpc StreamChat(ClientChatRequest) returns (stream ClientChatResponse);
 }

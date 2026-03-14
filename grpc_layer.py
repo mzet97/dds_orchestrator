@@ -92,6 +92,10 @@ class GRPCLayer:
         self._server = None
         self._port = getattr(config, "grpc_port", 50052)
 
+        # Client request handler — set by OrchestratorServer to route client
+        # gRPC requests through the same registry/selector/agent pipeline.
+        self._client_request_handler: Optional[Callable] = None
+
         if getattr(config, "grpc_enabled", False):
             self._init_grpc()
 
@@ -105,20 +109,28 @@ class GRPCLayer:
         logger.info(f"gRPC layer initialized (port {self._port})")
 
     async def start(self):
-        """Start gRPC server for receiving agent connections."""
+        """Start gRPC server for receiving agent AND client connections."""
         if not self.grpc_available:
             return
 
-        # Start gRPC server (agents connect to orchestrator)
         self._server = grpc.aio.server()
-        servicer_cls = _make_servicer_class()
+
+        # Agent-facing service (orchestrator calls agents, agents send heartbeats)
+        agent_servicer_cls = _make_servicer_class()
         _pb2_grpc.add_OrchestratorAgentServiceServicer_to_server(
-            servicer_cls(self), self._server
+            agent_servicer_cls(self), self._server
         )
+
+        # Client-facing service (clients submit chat requests)
+        client_servicer_cls = _make_client_servicer_class()
+        _pb2_grpc.add_ClientOrchestratorServiceServicer_to_server(
+            client_servicer_cls(self), self._server
+        )
+
         listen_addr = f"0.0.0.0:{self._port}"
         self._server.add_insecure_port(listen_addr)
         await self._server.start()
-        logger.info(f"gRPC server started on {listen_addr}")
+        logger.info(f"gRPC server started on {listen_addr} (agent + client services)")
 
     async def stop(self):
         """Stop gRPC server and close channels."""
@@ -382,13 +394,9 @@ class GRPCLayer:
 
 
 def _make_servicer_class():
-    """Create the servicer class after stubs are loaded."""
+    """Create the agent-facing servicer class after stubs are loaded."""
     class _OrchestratorServicer(_pb2_grpc.OrchestratorAgentServiceServicer):
-        """gRPC server-side handler for agents connecting to orchestrator.
-
-        In the current architecture, the orchestrator calls agents (client mode).
-        This servicer handles the reverse direction if agents push responses.
-        """
+        """gRPC server-side handler for agents connecting to orchestrator."""
 
         def __init__(self, layer: GRPCLayer):
             self._layer = layer
@@ -403,14 +411,119 @@ def _make_servicer_class():
 
         async def SubmitTask(self, request, context):
             """Handle task submission from agent (reverse direction)."""
-            # Not used in current flow — orchestrator is the one calling agents
             return _pb2.AgentTaskResponse(
                 task_id=request.task_id,
                 agent_id="orchestrator",
                 content="",
                 is_final=True,
                 success=False,
-                error_message="Orchestrator does not accept tasks via gRPC",
+                error_message="Orchestrator does not accept tasks via gRPC (use ClientOrchestratorService)",
             )
 
     return _OrchestratorServicer
+
+
+def _make_client_servicer_class():
+    """Create the client-facing servicer class after stubs are loaded."""
+    class _ClientServicer(_pb2_grpc.ClientOrchestratorServiceServicer):
+        """gRPC server-side handler for external clients submitting chat requests.
+
+        Routes: Client --gRPC--> Orchestrator --gRPC--> Agent --gRPC--> llama-server
+        """
+
+        def __init__(self, layer: GRPCLayer):
+            self._layer = layer
+
+        async def Chat(self, request, context):
+            """Handle unary chat request from client."""
+            handler = self._layer._client_request_handler
+            if handler is None:
+                return _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content="",
+                    is_final=True,
+                    success=False,
+                    error_message="Client handler not configured",
+                )
+
+            try:
+                # Convert proto to dict for handler
+                messages = [{"role": m.role, "content": m.content} for m in request.messages]
+                result = await handler(
+                    request_id=request.request_id,
+                    messages=messages,
+                    model=request.model,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    priority=request.priority,
+                    timeout_ms=request.timeout_ms or 120000,
+                    stream=False,
+                )
+                return _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content=result.get("content", ""),
+                    is_final=True,
+                    prompt_tokens=result.get("prompt_tokens", 0),
+                    completion_tokens=result.get("completion_tokens", 0),
+                    processing_time_ms=result.get("processing_time_ms", 0),
+                    success=result.get("success", False),
+                    error_message=result.get("error", ""),
+                    model=request.model,
+                )
+            except Exception as e:
+                logger.error(f"Error processing gRPC client Chat: {e}", exc_info=True)
+                return _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content="",
+                    is_final=True,
+                    success=False,
+                    error_message=str(e),
+                )
+
+        async def StreamChat(self, request, context):
+            """Handle streaming chat request from client."""
+            handler = self._layer._client_request_handler
+            if handler is None:
+                yield _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content="",
+                    is_final=True,
+                    success=False,
+                    error_message="Client handler not configured",
+                )
+                return
+
+            try:
+                messages = [{"role": m.role, "content": m.content} for m in request.messages]
+                result = await handler(
+                    request_id=request.request_id,
+                    messages=messages,
+                    model=request.model,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    priority=request.priority,
+                    timeout_ms=request.timeout_ms or 120000,
+                    stream=False,  # agent-side streaming handled separately
+                )
+                yield _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content=result.get("content", ""),
+                    is_final=True,
+                    prompt_tokens=result.get("prompt_tokens", 0),
+                    completion_tokens=result.get("completion_tokens", 0),
+                    processing_time_ms=result.get("processing_time_ms", 0),
+                    success=result.get("success", False),
+                    error_message=result.get("error", ""),
+                    model=request.model,
+                )
+            except Exception as e:
+                logger.error(f"Error in gRPC StreamChat: {e}", exc_info=True)
+                yield _pb2.ClientChatResponse(
+                    request_id=request.request_id,
+                    content="",
+                    is_final=True,
+                    success=False,
+                    error_message=str(e),
+                )
+
+    return _ClientServicer

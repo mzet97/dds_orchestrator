@@ -46,6 +46,7 @@ class OrchestratorServer:
         self._dds_client_task = None
         self._response_dispatch_task = None
         self._grpc_dispatch_task = None
+        self._client_response_dispatch_task = None
         self._cleanup_lock = asyncio.Lock()
         self._inflight_dds_tasks: set = set()
 
@@ -104,9 +105,14 @@ class OrchestratorServer:
         self._dds_client_task = asyncio.create_task(self._dds_client_loop())
         # Sole consumer of TOPIC_AGENT_RESPONSE — dispatches to per-task waiters
         self._response_dispatch_task = asyncio.create_task(self.dds.dispatch_agent_responses())
+        # Sole consumer of TOPIC_CLIENT_RESPONSE — dispatches to per-client waiters
+        if hasattr(self.dds, 'dispatch_client_responses'):
+            self._client_response_dispatch_task = asyncio.create_task(self.dds.dispatch_client_responses())
 
         # Start gRPC layer if available
         if self.grpc and self.grpc.is_available():
+            # Wire client request handler so gRPC clients can submit tasks
+            self.grpc._client_request_handler = self._process_grpc_client_request
             await self.grpc.start()
             self._grpc_dispatch_task = asyncio.create_task(self.grpc.dispatch_agent_responses())
 
@@ -114,7 +120,7 @@ class OrchestratorServer:
         """Stop the orchestrator server"""
         for task in (self._heartbeat_task, self._cleanup_task,
                      self._dds_client_task, self._response_dispatch_task,
-                     self._grpc_dispatch_task):
+                     self._grpc_dispatch_task, self._client_response_dispatch_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -320,6 +326,85 @@ class OrchestratorServer:
         )
 
         await self.dds.publish_client_response(response)
+
+    async def _process_grpc_client_request(self, request_id, messages, model="",
+                                            max_tokens=50, temperature=0.7,
+                                            priority=5, timeout_ms=120000,
+                                            stream=False) -> dict:
+        """Process a client request arriving via gRPC.
+
+        Called by the ClientOrchestratorService.Chat handler in grpc_layer.py.
+        Routes: Client --gRPC--> Orchestrator --gRPC--> Agent --gRPC--> llama-server
+        Returns dict with content, success, error, tokens, etc.
+        """
+        import json
+
+        logger.info(f"Processing gRPC client request: {request_id}")
+
+        # Get available agent
+        agents = await self.registry.get_available_agents()
+        if not agents:
+            return {"content": "", "success": False, "error": "No agents available"}
+
+        agent = max(agents, key=lambda a: a.slots_idle)
+        logger.info(f"Selected agent for gRPC client: {agent.agent_id}")
+
+        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
+            return {"content": "", "success": False, "error": "Agent no longer available"}
+
+        try:
+            from grpc_layer import AgentTaskRequest as GrpcAgentTaskRequest
+            task_request = GrpcAgentTaskRequest(
+                task_id=request_id,
+                requester_id="orchestrator",
+                task_type="chat",
+                messages=messages,
+                priority=priority,
+                timeout_ms=timeout_ms,
+                requires_context=False,
+                stream=stream,
+            )
+
+            # Route via gRPC to agent
+            agent_grpc_url = getattr(agent, "grpc_address", None)
+            if not agent_grpc_url:
+                # Fallback: construct from agent hostname + known gRPC port
+                agent_grpc_url = f"{agent.hostname}:50053"
+
+            self.grpc.prepare_agent_response_waiter(request_id)
+            await self.grpc.publish_agent_request(
+                task_request,
+                agent_id=agent.agent_id,
+                agent_grpc_url=agent_grpc_url,
+            )
+
+            agent_response = await self.grpc.wait_for_agent_response(
+                request_id, timeout_ms=timeout_ms
+            )
+
+            if isinstance(agent_response, dict):
+                return {
+                    "content": agent_response.get("content", ""),
+                    "success": agent_response.get("success", False),
+                    "error": agent_response.get("error", agent_response.get("error_message", "")),
+                    "prompt_tokens": agent_response.get("prompt_tokens", 0),
+                    "completion_tokens": agent_response.get("completion_tokens", 0),
+                    "processing_time_ms": agent_response.get("processing_time_ms", 0),
+                }
+            else:
+                return {
+                    "content": getattr(agent_response, "content", ""),
+                    "success": getattr(agent_response, "success", False),
+                    "error": getattr(agent_response, "error_message", ""),
+                    "prompt_tokens": getattr(agent_response, "prompt_tokens", 0),
+                    "completion_tokens": getattr(agent_response, "completion_tokens", 0),
+                    "processing_time_ms": getattr(agent_response, "processing_time_ms", 0),
+                }
+        except Exception as e:
+            logger.error(f"Error in gRPC client request: {e}", exc_info=True)
+            return {"content": "", "success": False, "error": str(e)}
+        finally:
+            await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""

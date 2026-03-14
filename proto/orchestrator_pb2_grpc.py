@@ -3,10 +3,7 @@
 import grpc
 import warnings
 
-try:
-    from . import orchestrator_pb2 as orchestrator__pb2
-except ImportError:
-    import orchestrator_pb2 as orchestrator__pb2
+import orchestrator_pb2 as orchestrator__pb2
 
 GRPC_GENERATED_VERSION = '1.78.0'
 GRPC_VERSION = grpc.__version__
@@ -29,7 +26,10 @@ if _version_not_supported:
 
 
 class OrchestratorAgentServiceStub(object):
-    """Missing associated documentation comment in .proto file."""
+    """─── Services ───────────────────────────────────────────────────────────────
+
+    Agent ↔ Orchestrator (internal)
+    """
 
     def __init__(self, channel):
         """Constructor.
@@ -55,7 +55,10 @@ class OrchestratorAgentServiceStub(object):
 
 
 class OrchestratorAgentServiceServicer(object):
-    """Missing associated documentation comment in .proto file."""
+    """─── Services ───────────────────────────────────────────────────────────────
+
+    Agent ↔ Orchestrator (internal)
+    """
 
     def SubmitTask(self, request, context):
         """Unary task submission
@@ -105,7 +108,10 @@ def add_OrchestratorAgentServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class OrchestratorAgentService(object):
-    """Missing associated documentation comment in .proto file."""
+    """─── Services ───────────────────────────────────────────────────────────────
+
+    Agent ↔ Orchestrator (internal)
+    """
 
     @staticmethod
     def SubmitTask(request,
@@ -178,6 +184,126 @@ class OrchestratorAgentService(object):
             '/orchestrator_grpc.OrchestratorAgentService/Heartbeat',
             orchestrator__pb2.HeartbeatRequest.SerializeToString,
             orchestrator__pb2.HeartbeatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class ClientOrchestratorServiceStub(object):
+    """Client ↔ Orchestrator (external)
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.Chat = channel.unary_unary(
+                '/orchestrator_grpc.ClientOrchestratorService/Chat',
+                request_serializer=orchestrator__pb2.ClientChatRequest.SerializeToString,
+                response_deserializer=orchestrator__pb2.ClientChatResponse.FromString,
+                _registered_method=True)
+        self.StreamChat = channel.unary_stream(
+                '/orchestrator_grpc.ClientOrchestratorService/StreamChat',
+                request_serializer=orchestrator__pb2.ClientChatRequest.SerializeToString,
+                response_deserializer=orchestrator__pb2.ClientChatResponse.FromString,
+                _registered_method=True)
+
+
+class ClientOrchestratorServiceServicer(object):
+    """Client ↔ Orchestrator (external)
+    """
+
+    def Chat(self, request, context):
+        """Unary chat completion
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StreamChat(self, request, context):
+        """Server-streaming chat completion (token-by-token)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ClientOrchestratorServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'Chat': grpc.unary_unary_rpc_method_handler(
+                    servicer.Chat,
+                    request_deserializer=orchestrator__pb2.ClientChatRequest.FromString,
+                    response_serializer=orchestrator__pb2.ClientChatResponse.SerializeToString,
+            ),
+            'StreamChat': grpc.unary_stream_rpc_method_handler(
+                    servicer.StreamChat,
+                    request_deserializer=orchestrator__pb2.ClientChatRequest.FromString,
+                    response_serializer=orchestrator__pb2.ClientChatResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'orchestrator_grpc.ClientOrchestratorService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('orchestrator_grpc.ClientOrchestratorService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class ClientOrchestratorService(object):
+    """Client ↔ Orchestrator (external)
+    """
+
+    @staticmethod
+    def Chat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/orchestrator_grpc.ClientOrchestratorService/Chat',
+            orchestrator__pb2.ClientChatRequest.SerializeToString,
+            orchestrator__pb2.ClientChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamChat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/orchestrator_grpc.ClientOrchestratorService/StreamChat',
+            orchestrator__pb2.ClientChatRequest.SerializeToString,
+            orchestrator__pb2.ClientChatResponse.FromString,
             options,
             channel_credentials,
             insecure,

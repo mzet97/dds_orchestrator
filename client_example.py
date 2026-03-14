@@ -188,6 +188,107 @@ class DDSOrchestratorClient:
 
 
 # ============================================
+# gRPC Client (100% gRPC, no HTTP)
+# ============================================
+
+class GRPCOrchestratorClient:
+    """
+    Pure gRPC client for the orchestrator.
+    Connects to ClientOrchestratorService on the orchestrator's gRPC port.
+    No HTTP involved in the data path.
+    """
+
+    def __init__(self, endpoint: str = "localhost:50052"):
+        self.endpoint = endpoint
+        self.grpc_available = False
+        self._init_grpc()
+
+    def _init_grpc(self):
+        try:
+            import grpc
+            from proto import orchestrator_pb2 as pb2
+            from proto import orchestrator_pb2_grpc as pb2_grpc
+
+            self._pb2 = pb2
+            self._pb2_grpc = pb2_grpc
+            self._grpc = grpc
+
+            self.channel = grpc.insecure_channel(
+                self.endpoint,
+                options=[
+                    ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                ],
+            )
+            self.stub = pb2_grpc.ClientOrchestratorServiceStub(self.channel)
+            self.grpc_available = True
+            print(f"[gRPC Client] Connected to {self.endpoint}")
+
+        except ImportError as e:
+            print(f"gRPC not available: {e}")
+        except Exception as e:
+            print(f"Failed to initialize gRPC client: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def chat(self, messages: List[Dict], timeout_s: float = 120.0,
+             model: str = "", max_tokens: int = 50,
+             temperature: float = 0.7, priority: int = 5) -> dict:
+        """Send chat request via gRPC and wait for response"""
+        if not self.grpc_available:
+            return {"error": "gRPC not available"}
+
+        request_id = str(uuid.uuid4())
+
+        proto_messages = [
+            self._pb2.ChatMessage(role=m.get("role", "user"),
+                                   content=m.get("content", ""))
+            for m in messages
+        ]
+
+        request = self._pb2.ClientChatRequest(
+            request_id=request_id,
+            model=model,
+            messages=proto_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=False,
+            priority=priority,
+            timeout_ms=int(timeout_s * 1000),
+        )
+
+        t_start = time.time()
+        try:
+            response = self.stub.Chat(request, timeout=timeout_s)
+            elapsed = time.time() - t_start
+            return {
+                "request_id": request_id,
+                "content": response.content,
+                "is_final": response.is_final,
+                "prompt_tokens": response.prompt_tokens,
+                "completion_tokens": response.completion_tokens,
+                "processing_time_ms": response.processing_time_ms,
+                "success": response.success,
+                "error_message": response.error_message,
+                "grpc_roundtrip_ms": round(elapsed * 1000, 2),
+                "model": response.model,
+            }
+        except Exception as e:
+            elapsed = time.time() - t_start
+            return {
+                "error": str(e),
+                "request_id": request_id,
+                "grpc_roundtrip_ms": round(elapsed * 1000, 2),
+            }
+
+    def generate(self, prompt: str, **kwargs) -> dict:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self):
+        if hasattr(self, "channel"):
+            self.channel.close()
+
+
+# ============================================
 # CLI
 # ============================================
 
@@ -195,9 +296,11 @@ def main():
     parser = argparse.ArgumentParser(description="DDS-LLM Client")
     parser.add_argument("prompt", nargs="*", help="Prompt text")
     parser.add_argument("--dds", action="store_true", help="Use pure DDS (no HTTP)")
+    parser.add_argument("--grpc", action="store_true", help="Use pure gRPC (no HTTP)")
     parser.add_argument("--http", action="store_true", help="Use HTTP client")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain ID")
     parser.add_argument("--url", type=str, default="http://localhost:8080", help="Orchestrator URL (HTTP mode)")
+    parser.add_argument("--endpoint", type=str, default="localhost:50052", help="gRPC endpoint (gRPC mode)")
     parser.add_argument("--timeout", type=float, default=120.0, help="Timeout in seconds")
     args = parser.parse_args()
 
@@ -222,6 +325,21 @@ def main():
             print(f"  Success: {response.get('success')}")
             print(f"  Tokens: {response.get('prompt_tokens', 0)} prompt + {response.get('completion_tokens', 0)} completion")
             print(f"  DDS roundtrip: {response.get('dds_roundtrip_ms', 0)}ms")
+        client.close()
+    elif args.grpc:
+        print(f"=== gRPC Client ({args.endpoint}) ===")
+        client = GRPCOrchestratorClient(endpoint=args.endpoint)
+        t_start = time.time()
+        response = client.chat(messages, timeout_s=args.timeout)
+        t_total = time.time() - t_start
+        print(f"\nResponse ({t_total*1000:.0f}ms):")
+        if "error" in response and not response.get("success"):
+            print(f"  ERROR: {response.get('error', response.get('error_message', 'unknown'))}")
+        else:
+            print(f"  Content: {response.get('content', '')}")
+            print(f"  Success: {response.get('success')}")
+            print(f"  Tokens: {response.get('prompt_tokens', 0)} prompt + {response.get('completion_tokens', 0)} completion")
+            print(f"  gRPC roundtrip: {response.get('grpc_roundtrip_ms', 0)}ms")
         client.close()
     else:
         print(f"=== HTTP Client ({args.url}) ===")
