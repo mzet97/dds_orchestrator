@@ -306,32 +306,35 @@ def wait_orchestrator_ready(ssh_orch: SSHManager, max_wait: int = 30) -> bool:
 
 
 def start_services_http(ssh_orch, ssh_agent, agent_cfg):
-    """Start HTTP-only services: llama-server(HTTP) + orchestrator(HTTP) + agent."""
+    """Start HTTP-only services: orchestrator(HTTP) + agent_llm.py (starts its own llama-server)."""
     binary = find_llama_binary(ssh_agent)
     model_path = f"{MODELS_DIR}/{agent_cfg['model']}"
 
-    # 1. llama-server HTTP only
-    cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
-           f"--port 8082 --host 0.0.0.0")
-    ssh_agent.run_bg(cmd, "/tmp/llama_http.log")
-    print(f"    [OK] llama-server HTTP em {ssh_agent.ip}")
-    wait_llama_health(ssh_agent)
-
-    # 2. Orchestrator HTTP only FIRST (agent needs to register with it)
+    # 1. Orchestrator HTTP only FIRST — explicitly disable DDS
     orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
                 f"--port {ORCH_PORT} --log-level INFO")
-    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log")
-    print(f"    [OK] Orchestrator HTTP em {ssh_orch.ip}")
+    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log", env={"DDS_ENABLED": "false"})
+    print(f"    [OK] Orchestrator HTTP-only em {ssh_orch.ip}")
     wait_orchestrator_ready(ssh_orch)
 
-    # 3. Agent AFTER orchestrator is ready
-    agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_dds.py "
-                 f"--model-name {agent_cfg['model_name']} "
-                 f"--model-path {model_path} "
-                 f"--orchestrator-url http://{ORCH_IP}:{ORCH_PORT} "
-                 f"--port 8081 --llama-server-port 8082 --no-server")
-    ssh_agent.run_bg(agent_cmd, "/tmp/agent_http.log")
-    print(f"    [OK] Agent em {ssh_agent.ip}")
+    # 2. HTTP Agent — agent_llm.py manages its own llama-server internally.
+    #    Pure HTTP: agent starts llama-server, registers with orchestrator via HTTP,
+    #    receives tasks via HTTP, forwards to local llama-server via HTTP.
+    agent_env = {
+        "MODEL_PATH": model_path,
+        "MODEL_NAME": agent_cfg["model_name"],
+        "LLAMA_SERVER_PATH": binary,
+        "LLAMA_SERVER_PORT": "8082",
+        "AGENT_PORT": "8081",
+        "ORCHESTRATOR_URL": f"http://{ORCH_IP}:{ORCH_PORT}",
+        "GPU_LAYERS": "99",
+    }
+    agent_cmd = f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm.py"
+    ssh_agent.run_bg(agent_cmd, "/tmp/agent_http.log", env=agent_env)
+    print(f"    [OK] Agent HTTP em {ssh_agent.ip} (manages own llama-server)")
+
+    # Wait for llama-server (started by agent) to be healthy
+    wait_llama_health(ssh_agent)
 
 
 def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
