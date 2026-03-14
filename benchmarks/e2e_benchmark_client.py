@@ -163,7 +163,14 @@ class GRPCBenchmarkClient:
 
     async def setup(self):
         import grpc
-        sys.path.insert(0, str(Path(__file__).parent.parent))
+        # Add proto directory to path so generated stubs can find each other
+        proto_dir = str(Path(__file__).parent.parent / "proto")
+        if proto_dir not in sys.path:
+            sys.path.insert(0, proto_dir)
+        # Also add parent for 'from proto import ...' style imports
+        parent_dir = str(Path(__file__).parent.parent)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
         from proto import orchestrator_pb2 as pb2
         from proto import orchestrator_pb2_grpc as pb2_grpc
         self._pb2 = pb2
