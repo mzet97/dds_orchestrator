@@ -56,6 +56,13 @@ VM_CONFIG = {
         "role": "orchestrator",
         "desc": "Orchestrator",
     },
+    "client": {
+        "ip": "192.168.1.63",
+        "user": "oldds",
+        "password": "Admin@123",
+        "role": "client",
+        "desc": "Client VM",
+    },
     "agent1": {
         "ip": "192.168.1.60",
         "user": "oldds",
@@ -415,45 +422,38 @@ def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
 
 # ─── Local Benchmark Runner ─────────────────────────────────────────────────
 
-def run_local_benchmark(protocol: str, model: str, n: int,
-                        scenario: str = "all", ssh_remote: 'SSHManager' = None) -> int:
-    """Run benchmark.
+def run_benchmark_on_client(ssh_client: 'SSHManager', protocol: str, model: str,
+                            n: int, scenario: str = "all") -> int:
+    """Run benchmark on dedicated client VM (.63) via SSH.
 
-    For HTTP and gRPC: runs locally using subprocess.
-    For DDS: runs on orchestrator VM via SSH (DDS needs same subnet for multicast).
+    All 3 protocols (HTTP, gRPC, DDS) run from the client VM to ensure
+    true cross-VM measurement. No local execution.
     """
-    if protocol == "dds" and ssh_remote:
-        # Run DDS benchmark on orchestrator VM (same DDS domain)
-        xml = get_cyclonedds_xml(ssh_remote)
-        cmd = (f"export CYCLONEDDS_URI=file://{xml} && "
-               f"cd {BASE_DIR}/dds_orchestrator && "
-               f"python3 -u benchmarks/e2e_benchmark_client.py "
-               f"--protocol dds --domain 0 --model {model} "
-               f"--scenario {scenario} --n {n}")
-        print(f"\n    -> DDS benchmark via SSH on {ssh_remote.ip} (scenario={scenario}, n={n})")
-        ec, out, err = ssh_remote.run(cmd, timeout=600)
-        for line in out.strip().split('\n')[-10:]:
-            print(f"      {line}")
-        if ec != 0 and err:
-            print(f"      ERRO: {err[:200]}")
-        return ec
-    else:
-        # Run locally
-        script_dir = Path(__file__).parent
-        script = script_dir / "e2e_benchmark_client.py"
-        cmd = [
-            sys.executable, str(script),
-            "--protocol", protocol,
-            "--url", f"http://{ORCH_IP}:{ORCH_PORT}",
-            "--endpoint", f"{ORCH_IP}:{ORCH_GRPC_PORT}",
-            "--domain", "0",
-            "--model", model,
-            "--scenario", scenario,
-            "--n", str(n),
-        ]
-        print(f"\n    -> {protocol.upper()} benchmark local (scenario={scenario}, n={n})")
-        result = subprocess.run(cmd, cwd=str(script_dir))
-        return result.returncode
+    xml = get_cyclonedds_xml(ssh_client)
+
+    # Build env and command
+    env_prefix = ""
+    if protocol == "dds":
+        env_prefix = f"export CYCLONEDDS_URI=file://{xml} && "
+
+    cmd = (f"{env_prefix}"
+           f"cd {BASE_DIR}/dds_orchestrator && "
+           f"python3 -u benchmarks/e2e_benchmark_client.py "
+           f"--protocol {protocol} "
+           f"--url http://{ORCH_IP}:{ORCH_PORT} "
+           f"--endpoint {ORCH_IP}:{ORCH_GRPC_PORT} "
+           f"--domain 0 "
+           f"--model {model} "
+           f"--scenario {scenario} "
+           f"--n {n}")
+
+    print(f"\n    -> {protocol.upper()} benchmark on client VM {ssh_client.ip} (scenario={scenario}, n={n})")
+    ec, out, err = ssh_client.run(cmd, timeout=600)
+    for line in out.strip().split('\n')[-10:]:
+        print(f"      {line}")
+    if ec != 0 and err:
+        print(f"      ERRO: {err[:200]}")
+    return ec
 
 
 def run_E2_standalone(ssh_orch: SSHManager, n: int) -> Dict:
@@ -512,8 +512,11 @@ def main():
     primary_agent = VM_CONFIG[primary_agent_key]
     model_name = primary_agent["model_name"]
 
+    client_vm = VM_CONFIG["client"]
+
     print("=" * 60)
     print("  FULL E2E BENCHMARK: HTTP vs gRPC vs DDS")
+    print(f"  Client: {client_vm['ip']} ({client_vm['desc']})")
     print(f"  Orchestrator: {ORCH_IP}")
     print(f"  Agent: {primary_agent['ip']} ({primary_agent['desc']})")
     print(f"  Model: {model_name}")
@@ -525,8 +528,9 @@ def main():
     print("\n  CONECTANDO NAS VMs...")
     ssh_orch = SSHManager(ORCH_IP, "oldds", "Admin@123", "Orchestrator")
     ssh_agent = SSHManager(primary_agent["ip"], "oldds", "Admin@123", primary_agent["desc"])
+    ssh_client = SSHManager(client_vm["ip"], "oldds", "Admin@123", client_vm["desc"])
 
-    for ssh in [ssh_orch, ssh_agent]:
+    for ssh in [ssh_orch, ssh_agent, ssh_client]:
         if not ssh.connect():
             print(f"ERRO: Falha ao conectar em {ssh.ip}")
             sys.exit(1)
@@ -537,9 +541,15 @@ def main():
         print("  SETUP (git pull, deps, compile)")
         print("=" * 60)
 
-        for ssh in [ssh_orch, ssh_agent]:
+        for ssh in [ssh_orch, ssh_agent, ssh_client]:
             git_pull_all(ssh)
             install_deps(ssh)
+
+        # Regen proto stubs on client VM
+        ssh_client.run(
+            f"cd {BASE_DIR}/dds_orchestrator && "
+            f"python3 -m grpc_tools.protoc -I proto --python_out=proto "
+            f"--grpc_python_out=proto proto/orchestrator.proto", timeout=30)
 
         if not args.skip_compile:
             compile_llama(ssh_agent, primary_agent)
@@ -605,11 +615,9 @@ def main():
         warmup_request(ssh_orch, model_name)
         time.sleep(2)
 
-        # ─── Run benchmarks ──────────────────────────────────────────────
+        # ─── Run benchmarks on client VM (.63) ────────────────────────────
         print(f"\n  FASE {phase.upper()}: Benchmarks E1/E3/E4/E5 (n={args.n})")
-        # DDS runs on orchestrator VM (multicast), HTTP/gRPC run locally
-        rc = run_local_benchmark(phase, model_name, args.n, args.scenario,
-                                 ssh_remote=ssh_orch if phase == "dds" else None)
+        rc = run_benchmark_on_client(ssh_client, phase, model_name, args.n, args.scenario)
         results[phase.upper()] = {"exit_code": rc, "status": "OK" if rc == 0 else "FAIL"}
 
         # Kill services
@@ -639,8 +647,28 @@ def main():
             print(f"    {f.name}")
 
     # Disconnect
-    for ssh in [ssh_orch, ssh_agent]:
+    for ssh in [ssh_orch, ssh_agent, ssh_client]:
         ssh.disconnect()
+
+    # Fetch results from client VM
+    try:
+        ssh_cl = SSHManager(client_vm["ip"], "oldds", "Admin@123", "Client")
+        if ssh_cl.connect():
+            ec, out, _ = ssh_cl.run(f"ls {BASE_DIR}/dds_orchestrator/benchmarks/results/e2e_*.json 2>/dev/null")
+            if ec == 0:
+                import paramiko as _pm
+                _sftp = ssh_cl.client.open_sftp()
+                local_results = Path(__file__).parent / "results"
+                local_results.mkdir(exist_ok=True)
+                for remote_f in out.strip().split('\n'):
+                    if remote_f.strip():
+                        fname = remote_f.strip().split('/')[-1]
+                        _sftp.get(remote_f.strip(), str(local_results / fname))
+                _sftp.close()
+                print(f"  Copied results from client VM")
+            ssh_cl.disconnect()
+    except Exception as e:
+        print(f"  Warning: could not fetch results from client: {e}")
 
     # Save
     with open(args.output, "w", encoding="utf-8") as f:

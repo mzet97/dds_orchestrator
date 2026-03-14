@@ -9,8 +9,11 @@
 
     <Domain id="any">
         <General>
-            <AllowMulticast>false</AllowMulticast>
+            <AllowMulticast>true</AllowMulticast>
             <MaxMessageSize>65500B</MaxMessageSize>
+            <Interfaces>
+                <NetworkInterface name="eth0" />
+            </Interfaces>
         </General>
 
         <Discovery>
