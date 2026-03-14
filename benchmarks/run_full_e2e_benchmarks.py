@@ -358,7 +358,14 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
     print(f"    [OK] Orchestrator gRPC em {ssh_orch.ip}")
     wait_orchestrator_ready(ssh_orch)
 
-    # 3. gRPC agent AFTER orchestrator is ready
+    # 3. Regenerate proto stubs on agent (ensure compatibility)
+    ssh_agent.run(
+        f"cd {BASE_DIR}/dds_agent/python && "
+        f"python3 -m grpc_tools.protoc -I {BASE_DIR}/dds_orchestrator/proto "
+        f"--python_out=. --grpc_python_out=. {BASE_DIR}/dds_orchestrator/proto/orchestrator.proto",
+        timeout=30)
+
+    # 4. gRPC agent AFTER orchestrator is ready
     #    HOSTNAME must be the agent's real IP so the orchestrator can reach it
     agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_grpc.py "
                  f"--model-name {agent_cfg['model_name']} "
@@ -408,27 +415,44 @@ def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
 # ─── Local Benchmark Runner ─────────────────────────────────────────────────
 
 def run_local_benchmark(protocol: str, model: str, n: int,
-                        scenario: str = "all", extra_args: str = "") -> int:
-    """Run benchmark locally using subprocess (from WSL/Linux client)."""
-    script_dir = Path(__file__).parent
-    script = script_dir / "e2e_benchmark_client.py"
+                        scenario: str = "all", ssh_remote: 'SSHManager' = None) -> int:
+    """Run benchmark.
 
-    cmd = [
-        sys.executable, str(script),
-        "--protocol", protocol,
-        "--url", f"http://{ORCH_IP}:{ORCH_PORT}",
-        "--endpoint", f"{ORCH_IP}:{ORCH_GRPC_PORT}",
-        "--domain", "0",
-        "--model", model,
-        "--scenario", scenario,
-        "--n", str(n),
-    ]
-
-    print(f"\n    -> {protocol.upper()} benchmark (scenario={scenario}, n={n})")
-    print(f"    cmd: {' '.join(cmd)}")
-
-    result = subprocess.run(cmd, cwd=str(script_dir))
-    return result.returncode
+    For HTTP and gRPC: runs locally using subprocess.
+    For DDS: runs on orchestrator VM via SSH (DDS needs same subnet for multicast).
+    """
+    if protocol == "dds" and ssh_remote:
+        # Run DDS benchmark on orchestrator VM (same DDS domain)
+        xml = get_cyclonedds_xml(ssh_remote)
+        cmd = (f"export CYCLONEDDS_URI=file://{xml} && "
+               f"cd {BASE_DIR}/dds_orchestrator && "
+               f"python3 -u benchmarks/e2e_benchmark_client.py "
+               f"--protocol dds --domain 0 --model {model} "
+               f"--scenario {scenario} --n {n}")
+        print(f"\n    -> DDS benchmark via SSH on {ssh_remote.ip} (scenario={scenario}, n={n})")
+        ec, out, err = ssh_remote.run(cmd, timeout=600)
+        for line in out.strip().split('\n')[-10:]:
+            print(f"      {line}")
+        if ec != 0 and err:
+            print(f"      ERRO: {err[:200]}")
+        return ec
+    else:
+        # Run locally
+        script_dir = Path(__file__).parent
+        script = script_dir / "e2e_benchmark_client.py"
+        cmd = [
+            sys.executable, str(script),
+            "--protocol", protocol,
+            "--url", f"http://{ORCH_IP}:{ORCH_PORT}",
+            "--endpoint", f"{ORCH_IP}:{ORCH_GRPC_PORT}",
+            "--domain", "0",
+            "--model", model,
+            "--scenario", scenario,
+            "--n", str(n),
+        ]
+        print(f"\n    -> {protocol.upper()} benchmark local (scenario={scenario}, n={n})")
+        result = subprocess.run(cmd, cwd=str(script_dir))
+        return result.returncode
 
 
 def run_E2_standalone(ssh_orch: SSHManager, n: int) -> Dict:
@@ -477,8 +501,8 @@ def main():
     parser.add_argument("--skip-setup", action="store_true")
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--output", default="e2e_full_results.json")
-    parser.add_argument("--agent", choices=["agent1", "agent2"], default="agent2",
-                        help="Agent primario para benchmarks")
+    parser.add_argument("--agent", choices=["agent1", "agent2"], default="agent1",
+                        help="Agent primario (agent1=RX6600M GPU, agent2=RTX3080 no driver)")
 
     args = parser.parse_args()
     phases = [p.strip().lower() for p in args.phases.split(",")]
@@ -580,9 +604,11 @@ def main():
         warmup_request(ssh_orch, model_name)
         time.sleep(2)
 
-        # ─── Run benchmarks locally ──────────────────────────────────────
+        # ─── Run benchmarks ──────────────────────────────────────────────
         print(f"\n  FASE {phase.upper()}: Benchmarks E1/E3/E4/E5 (n={args.n})")
-        rc = run_local_benchmark(phase, model_name, args.n, args.scenario)
+        # DDS runs on orchestrator VM (multicast), HTTP/gRPC run locally
+        rc = run_local_benchmark(phase, model_name, args.n, args.scenario,
+                                 ssh_remote=ssh_orch if phase == "dds" else None)
         results[phase.upper()] = {"exit_code": rc, "status": "OK" if rc == 0 else "FAIL"}
 
         # Kill services

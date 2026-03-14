@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CycloneDDS config for WSL client connecting to VMs
+  Uses explicit peer list (unicast) since WSL is on a different subnet.
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+
+    <Domain id="any">
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+            <MaxMessageSize>65500B</MaxMessageSize>
+        </General>
+
+        <Discovery>
+            <MaxAutoParticipantIndex>30</MaxAutoParticipantIndex>
+            <SPDPInterval>100ms</SPDPInterval>
+            <LeaseDuration>500ms</LeaseDuration>
+            <!-- Explicit peers for cross-subnet discovery -->
+            <Peers>
+                <Peer address="192.168.1.60"/>
+                <Peer address="192.168.1.61"/>
+                <Peer address="192.168.1.62"/>
+            </Peers>
+        </Discovery>
+
+        <Internal>
+            <HeartbeatInterval>10ms</HeartbeatInterval>
+            <WriterLingerDuration>0ms</WriterLingerDuration>
+            <NackDelay>0ms</NackDelay>
+        </Internal>
+
+        <Tracing>
+            <Verbosity>none</Verbosity>
+        </Tracing>
+    </Domain>
+</CycloneDDS>
