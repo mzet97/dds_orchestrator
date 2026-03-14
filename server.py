@@ -376,24 +376,56 @@ class OrchestratorServer:
             proto_msg.role = msg.get("role", "user")
             proto_msg.content = msg.get("content", "")
 
-        logger.info(f"gRPC calling agent at {agent_grpc_url}")
+        logger.info(f"gRPC calling agent at {agent_grpc_url} via subprocess")
 
         try:
-            channel = _grpc.insecure_channel(agent_grpc_url)
-            stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
-            resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
-            channel.close()
+            import subprocess, json as _json, os as _os2
 
-            logger.info(f"gRPC response: success={resp.success}, len={len(resp.content)}")
+            # Use subprocess to avoid gRPC C core poller contention between
+            # server and client in the same process
+            script = f'''
+import sys, json
+sys.path.insert(0, "{_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'proto')}")
+import grpc
+from proto import orchestrator_pb2 as pb2, orchestrator_pb2_grpc as g
+ch = grpc.insecure_channel("{agent_grpc_url}")
+st = g.OrchestratorAgentServiceStub(ch)
+req = pb2.AgentTaskRequest(
+    task_id="{request_id}", requester_id="orchestrator",
+    task_type="chat", priority={priority},
+    timeout_ms={timeout_ms}, requires_context=False, stream=False)
+'''
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "user").replace('"', '\\"')
+                content = msg.get("content", "").replace('"', '\\"').replace('\n', '\\n')
+                script += f'msg{i} = req.messages.add(); msg{i}.role = "{role}"; msg{i}.content = "{content}"\n'
 
-            return {
-                "content": resp.content,
-                "success": resp.success,
-                "error": resp.error_message or "",
-                "prompt_tokens": resp.prompt_tokens,
-                "completion_tokens": resp.completion_tokens,
-                "processing_time_ms": resp.processing_time_ms,
-            }
+            script += f'''
+try:
+    r = st.SubmitTask(req, timeout={timeout_ms / 1000})
+    print(json.dumps({{"content": r.content, "success": r.success, "error": r.error_message or "",
+        "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens,
+        "processing_time_ms": r.processing_time_ms}}))
+except Exception as e:
+    print(json.dumps({{"content": "", "success": False, "error": str(e)}}))
+ch.close()
+'''
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True,
+                timeout=timeout_ms / 1000 + 5,
+                cwd=_os.path.dirname(_os.path.abspath(__file__)),
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                data = _json.loads(result.stdout.strip())
+                logger.info(f"gRPC response via subprocess: success={data.get('success')}")
+                return data
+            else:
+                err = result.stderr[:500] if result.stderr else "subprocess failed"
+                logger.error(f"gRPC subprocess error: {err}")
+                return {"content": "", "success": False, "error": err}
+
         except Exception as e:
             logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
