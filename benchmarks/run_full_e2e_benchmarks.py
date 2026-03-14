@@ -343,12 +343,14 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
     binary = find_llama_binary(ssh_agent)
     model_path = f"{MODELS_DIR}/{agent_cfg['model']}"
 
-    # 1. llama-server with gRPC enabled (agent connects via gRPC on port 50051)
+    # 1. llama-server (HTTP) — the gRPC bridge in llama.cpp_dds has a timeout bug
+    #    where inference results are not returned via the gRPC callback.
+    #    Agent connects to llama-server via HTTP as fallback.
+    #    The gRPC path is: client→gRPC→orch→gRPC→agent→HTTP→llama
     cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
-           f"--port 8082 --host 0.0.0.0 "
-           f"--enable-grpc --grpc-address 0.0.0.0:50051")
+           f"--port 8082 --host 0.0.0.0")
     ssh_agent.run_bg(cmd, "/tmp/llama_grpc.log")
-    print(f"    [OK] llama-server gRPC em {ssh_agent.ip}")
+    print(f"    [OK] llama-server em {ssh_agent.ip} (agent uses HTTP to llama)")
     wait_llama_health(ssh_agent)
 
     # 2. Orchestrator with gRPC enabled FIRST
