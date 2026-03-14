@@ -429,6 +429,21 @@ ch.close()
         except Exception as e:
             logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
+        finally:
+            # Release agent slot (sync — schedule on event loop)
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.registry.adjust_slots(agent.agent_id, delta=+1), loop
+                    ).result(timeout=5)
+                else:
+                    # Fallback: direct sync access
+                    if agent.agent_id in self.registry.agents:
+                        self.registry.agents[agent.agent_id].slots_idle += 1
+            except Exception as e:
+                logger.warning(f"Failed to release agent slot: {e}")
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""
@@ -791,29 +806,40 @@ ch.close()
             if not transport_success:
                 logger.info(f"Using HTTP fallback for task {task.task_id}")
                 agent_url = f"http://{agent.hostname}:{agent.port}"
-                logger.info(f"Calling agent at {agent_url}")
+                logger.info(f"HTTP fallback calling agent at {agent_url}/chat")
                 try:
-                    # Convert messages to prompt for /generate endpoint
-                    prompt = ""
-                    for msg in messages:
-                        role = msg.get("role", "user")
-                        content = msg.get("content", "")
-                        prompt += f"{role}: {content}\n"
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _session:
+                        async with _session.post(
+                            f"{agent_url}/chat",
+                            json={
+                                "messages": messages,
+                                "max_tokens": max_tokens,
+                                "temperature": temperature,
+                            },
+                            timeout=_aiohttp.ClientTimeout(total=max(1, task.timeout_ms // 1000))
+                        ) as _resp:
+                            http_result = await _resp.json()
 
-                    http_result = await self.dds.send_request_via_http(
-                        agent_url,
-                        {"prompt": prompt.strip(), "max_tokens": max_tokens, "temperature": temperature},
-                        timeout=max(1, task.timeout_ms // 1000)
-                    )
-                    logger.info(f"HTTP result: {http_result}")
+                    # Extract content from agent response
+                    content = http_result.get("content", "")
+                    if not content and "choices" in http_result:
+                        content = http_result["choices"][0].get("message", {}).get("content", "")
+                    if not content and "response" in http_result:
+                        content = http_result["response"]
+
+                    logger.info(f"HTTP result: content_len={len(content)}")
                     response_data = {
-                        "content": http_result.get("response", ""),
+                        "content": content,
                         "processing_time_ms": http_result.get("processing_time_ms", 0),
-                        "success": http_result.get("success", 1)
+                        "prompt_tokens": http_result.get("usage", {}).get("prompt_tokens", 0),
+                        "completion_tokens": http_result.get("usage", {}).get("completion_tokens", 0),
+                        "success": True,
                     }
+                    transport_success = True
                 except Exception as e:
                     logger.error(f"HTTP fallback also failed: {e}")
-                    response_data = {"content": "", "error": str(e), "success": 0}
+                    response_data = {"content": "", "error": str(e), "success": False}
 
             # Complete task with result - handle both dict and IdlStruct
             response_content = ""

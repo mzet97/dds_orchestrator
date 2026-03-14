@@ -329,6 +329,7 @@ def start_services_http(ssh_orch, ssh_agent, agent_cfg):
         "AGENT_PORT": "8081",
         "ORCHESTRATOR_URL": f"http://{ORCH_IP}:{ORCH_PORT}",
         "GPU_LAYERS": "99",
+        "HOSTNAME": ssh_agent.ip,  # Real IP so orchestrator can reach agent cross-VM
     }
     agent_cmd = f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm.py"
     ssh_agent.run_bg(agent_cmd, "/tmp/agent_http.log", env=agent_env)
