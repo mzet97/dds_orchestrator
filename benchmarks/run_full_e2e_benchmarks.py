@@ -293,53 +293,67 @@ def warmup_request(ssh_orch: SSHManager, model: str):
 
 # ─── Service Start Functions (per protocol) ──────────────────────────────────
 
+def wait_orchestrator_ready(ssh_orch: SSHManager, max_wait: int = 30) -> bool:
+    """Wait for orchestrator HTTP to respond."""
+    for i in range(max_wait // 2):
+        ec, out, _ = ssh_orch.run(f"curl -s http://localhost:{ORCH_PORT}/health", timeout=5)
+        if ec == 0 and out.strip():
+            print(f"    [OK] Orchestrator respondendo")
+            return True
+        time.sleep(2)
+    print(f"    [WARN] Orchestrator pode nao estar pronto")
+    return False
+
+
 def start_services_http(ssh_orch, ssh_agent, agent_cfg):
-    """Start HTTP-only services: llama-server(HTTP) + agent_llm.py + orchestrator(HTTP only)."""
+    """Start HTTP-only services: llama-server(HTTP) + orchestrator(HTTP) + agent."""
     binary = find_llama_binary(ssh_agent)
     model_path = f"{MODELS_DIR}/{agent_cfg['model']}"
 
-    # llama-server HTTP only
+    # 1. llama-server HTTP only
     cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
            f"--port 8082 --host 0.0.0.0")
     ssh_agent.run_bg(cmd, "/tmp/llama_http.log")
     print(f"    [OK] llama-server HTTP em {ssh_agent.ip}")
-
     wait_llama_health(ssh_agent)
 
-    # HTTP agent — use DDS agent with --no-server, but WITHOUT CYCLONEDDS_URI env.
-    # Without CycloneDDS config, the agent falls back to HTTP-only mode for
-    # communicating with the orchestrator. The agent still uses HTTP to talk
-    # to llama-server (which is the default path).
+    # 2. Orchestrator HTTP only FIRST (agent needs to register with it)
+    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
+                f"--port {ORCH_PORT} --log-level INFO")
+    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log")
+    print(f"    [OK] Orchestrator HTTP em {ssh_orch.ip}")
+    wait_orchestrator_ready(ssh_orch)
+
+    # 3. Agent AFTER orchestrator is ready
     agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_dds.py "
                  f"--model-name {agent_cfg['model_name']} "
                  f"--model-path {model_path} "
                  f"--orchestrator-url http://{ORCH_IP}:{ORCH_PORT} "
                  f"--port 8081 --llama-server-port 8082 --no-server")
-    # No CYCLONEDDS_URI → agent cannot init DDS → uses HTTP fallback
     ssh_agent.run_bg(agent_cmd, "/tmp/agent_http.log")
-    print(f"    [OK] Agent HTTP-fallback em {ssh_agent.ip}")
-
-    # Orchestrator HTTP only (no --dds-domain, no --grpc-enabled)
-    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
-                f"--port {ORCH_PORT} --log-level INFO")
-    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log")
-    print(f"    [OK] Orchestrator HTTP em {ssh_orch.ip}")
+    print(f"    [OK] Agent em {ssh_agent.ip}")
 
 
 def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
-    """Start gRPC services: llama-server(HTTP) + agent_llm_grpc.py + orchestrator(gRPC)."""
+    """Start gRPC services: llama-server + orchestrator(gRPC) + agent_llm_grpc."""
     binary = find_llama_binary(ssh_agent)
     model_path = f"{MODELS_DIR}/{agent_cfg['model']}"
 
-    # llama-server (HTTP for agent to call, agent forwards via gRPC to orchestrator)
+    # 1. llama-server
     cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
            f"--port 8082 --host 0.0.0.0")
     ssh_agent.run_bg(cmd, "/tmp/llama_grpc.log")
     print(f"    [OK] llama-server em {ssh_agent.ip}")
-
     wait_llama_health(ssh_agent)
 
-    # gRPC agent
+    # 2. Orchestrator with gRPC enabled FIRST
+    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
+                f"--port {ORCH_PORT} --grpc-enabled --grpc-port {ORCH_GRPC_PORT} --log-level INFO")
+    ssh_orch.run_bg(orch_cmd, "/tmp/orch_grpc.log")
+    print(f"    [OK] Orchestrator gRPC em {ssh_orch.ip}")
+    wait_orchestrator_ready(ssh_orch)
+
+    # 3. gRPC agent AFTER orchestrator is ready
     agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_grpc.py "
                  f"--model-name {agent_cfg['model_name']} "
                  f"--model-path {model_path} "
@@ -351,30 +365,30 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
     ssh_agent.run_bg(agent_cmd, "/tmp/agent_grpc.log")
     print(f"    [OK] Agent gRPC em {ssh_agent.ip}")
 
-    # Orchestrator with gRPC enabled
-    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
-                f"--port {ORCH_PORT} --grpc-enabled --grpc-port {ORCH_GRPC_PORT} --log-level INFO")
-    ssh_orch.run_bg(orch_cmd, "/tmp/orch_grpc.log")
-    print(f"    [OK] Orchestrator gRPC em {ssh_orch.ip}")
-
 
 def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
-    """Start DDS services: llama-server(DDS) + agent_llm_dds.py + orchestrator(DDS)."""
+    """Start DDS services: llama-server(DDS) + orchestrator(DDS) + agent_llm_dds."""
     binary = find_llama_binary(ssh_agent)
     model_path = f"{MODELS_DIR}/{agent_cfg['model']}"
     xml_agent = get_cyclonedds_xml(ssh_agent)
     xml_orch = get_cyclonedds_xml(ssh_orch)
 
-    # llama-server with DDS enabled
+    # 1. llama-server with DDS enabled
     cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
            f"--port 8082 --host 0.0.0.0 "
            f"--enable-dds --dds-domain 0 --dds-timeout 120")
     ssh_agent.run_bg(cmd, "/tmp/llama_dds.log", env={"CYCLONEDDS_URI": f"file://{xml_agent}"})
     print(f"    [OK] llama-server DDS em {ssh_agent.ip}")
-
     wait_llama_health(ssh_agent)
 
-    # DDS agent
+    # 2. Orchestrator with DDS FIRST
+    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
+                f"--port {ORCH_PORT} --dds-domain 0 --log-level INFO")
+    ssh_orch.run_bg(orch_cmd, "/tmp/orch_dds.log", env={"CYCLONEDDS_URI": f"file://{xml_orch}"})
+    print(f"    [OK] Orchestrator DDS em {ssh_orch.ip}")
+    wait_orchestrator_ready(ssh_orch)
+
+    # 3. DDS agent AFTER orchestrator is ready
     agent_cmd = (f"python3 -u {BASE_DIR}/dds_agent/python/agent_llm_dds.py "
                  f"--model-name {agent_cfg['model_name']} "
                  f"--model-path {model_path} "
@@ -382,12 +396,6 @@ def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
                  f"--port 8081 --llama-server-port 8082 --no-server")
     ssh_agent.run_bg(agent_cmd, "/tmp/agent_dds.log", env={"CYCLONEDDS_URI": f"file://{xml_agent}"})
     print(f"    [OK] Agent DDS em {ssh_agent.ip}")
-
-    # Orchestrator with DDS
-    orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
-                f"--port {ORCH_PORT} --dds-domain 0 --log-level INFO")
-    ssh_orch.run_bg(orch_cmd, "/tmp/orch_dds.log", env={"CYCLONEDDS_URI": f"file://{xml_orch}"})
-    print(f"    [OK] Orchestrator DDS em {ssh_orch.ip}")
 
 
 # ─── Local Benchmark Runner ─────────────────────────────────────────────────
