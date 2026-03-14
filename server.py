@@ -343,7 +343,7 @@ class OrchestratorServer:
         logger.info(f"Processing gRPC client request (sync): {request_id}")
 
         # Get agents directly from the registry (sync access to the dict)
-        agents = [a for a in self.registry._agents.values()
+        agents = [a for a in self.registry.agents.values()
                   if a.slots_idle > 0 and a.status in ("idle", "busy")]
         if not agents:
             return {"content": "", "success": False, "error": "No agents available"}
