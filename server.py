@@ -368,9 +368,11 @@ class OrchestratorServer:
             # Route via gRPC to agent
             agent_grpc_url = getattr(agent, "grpc_address", None)
             if not agent_grpc_url:
-                # Fallback: construct from agent hostname + known gRPC port
                 agent_grpc_url = f"{agent.hostname}:50053"
 
+            # For gRPC, publish_agent_request does the full RPC call and
+            # resolves the waiter internally. We prepare the waiter first,
+            # then publish (which resolves it), then collect the result.
             self.grpc.prepare_agent_response_waiter(request_id)
             await self.grpc.publish_agent_request(
                 task_request,
@@ -378,9 +380,19 @@ class OrchestratorServer:
                 agent_grpc_url=agent_grpc_url,
             )
 
-            agent_response = await self.grpc.wait_for_agent_response(
-                request_id, timeout_ms=timeout_ms
-            )
+            # publish_agent_request already resolved the waiter via _resolve_waiter.
+            # Retrieve result directly from the container (don't re-wait).
+            waiter = self.grpc._pending_agent_responses.get(request_id)
+            if waiter:
+                event, container = waiter
+                agent_response = container[0]
+                self.grpc._pending_agent_responses.pop(request_id, None)
+            else:
+                # Waiter was already cleaned up by _resolve_waiter + pop in wait_for
+                # Try wait with short timeout as fallback
+                agent_response = await self.grpc.wait_for_agent_response(
+                    request_id, timeout_ms=5000
+                )
 
             if isinstance(agent_response, dict):
                 return {
