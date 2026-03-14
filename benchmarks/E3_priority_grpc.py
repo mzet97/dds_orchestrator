@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-E3: Priorização sob Carga - gRPC + heapq
-========================================
-Mede latência de mensagens HIGH vs NORMAL com fila de prioridade Python (heapq) via gRPC.
+E3: Priorização sob Carga - gRPC Nativo + heapq
+================================================
+Mede latência de mensagens HIGH vs NORMAL com fila de prioridade Python (heapq)
+via gRPC nativo (protobuf) conectando diretamente ao llama-server.
 
-Requer: servidor gRPC rodando (_grpc_server.py --backend http://... --port 50051)
+Arquitetura medida:
+    Cliente → gRPC (protobuf) → llama-server (--enable-grpc)
 
-Metodologia (idêntica ao E3_priority_http.py, mas transporte é gRPC/HTTP/2):
+Metodologia (idêntica ao E3_priority_http.py, mas transporte é gRPC nativo):
   - Carga sustentada: 10 req/s com prioridade NORMAL
   - A cada inject_interval segundos: injeção de 1 requisição HIGH
   - Prioridade implementada via heapq em nível de aplicação (mesmo que HTTP)
   - max_tokens=5: minimiza inferência, isola latência de transporte+fila
 
 Usage:
-    python _grpc_server.py --backend http://localhost:8080 --port 50051 &
     python E3_priority_grpc.py --endpoint localhost:50051 --carga 10 --n 30 --duracao 300
 """
 
@@ -21,19 +22,18 @@ import argparse
 import asyncio
 import heapq
 import json
+import sys
 import time
 import statistics
+import uuid
 from pathlib import Path
 from typing import Dict, List
+
 import grpc
 
-
-def _json_serialize(obj: dict) -> bytes:
-    return json.dumps(obj).encode("utf-8")
-
-
-def _json_deserialize(data: bytes) -> dict:
-    return json.loads(data.decode("utf-8"))
+sys.path.insert(0, str(Path(__file__).parent))
+from proto import llama_service_pb2
+from proto import llama_service_pb2_grpc
 
 
 class PriorityQueueGRPC:
@@ -58,34 +58,34 @@ class PriorityQueueGRPC:
 
 
 class PriorityBenchmarkGRPC:
-    """Benchmark de priorização gRPC com heapq."""
+    """Benchmark de priorização gRPC nativo com heapq."""
 
     def __init__(self, endpoint: str, carga_req_s: int = 10):
         self.endpoint = endpoint
         self.carga_req_s = carga_req_s
         self.normal_results: List[Dict] = []
         self.stop_load = False
-        self._channel = grpc.insecure_channel(endpoint)
-        self._stub = self._channel.unary_unary(
-            "/LLMService/Chat",
-            request_serializer=_json_serialize,
-            response_deserializer=_json_deserialize,
+        self._channel = grpc.insecure_channel(
+            endpoint,
+            options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
         )
+        self._stub = llama_service_pb2_grpc.LlamaServiceStub(self._channel)
 
     def close(self):
         self._channel.close()
 
     def _send_grpc_request(self, priority: int) -> Dict:
-        """Envia requisição gRPC síncrona com priority no payload."""
-        payload = {
-            "model": "phi4-mini",
-            "content": "ok",
-            "max_tokens": 5,
-            "priority": priority
-        }
+        """Envia requisição gRPC nativa com protobuf."""
+        request = llama_service_pb2.ChatCompletionRequest(
+            request_id=str(uuid.uuid4()),
+            model="phi4-mini",
+            messages=[llama_service_pb2.ChatMessage(role="user", content="ok")],
+            max_tokens=5,
+            stream=False,
+        )
         send_time = time.perf_counter()
         try:
-            self._stub(payload, timeout=30)
+            self._stub.Chat(request, timeout=30)
             recv_time = time.perf_counter()
             return {
                 "priority": "HIGH" if priority >= 10 else "NORMAL",
@@ -124,7 +124,7 @@ class PriorityBenchmarkGRPC:
 
 
 async def run_benchmark(args):
-    """Executa benchmark de priorização gRPC."""
+    """Executa benchmark de priorização gRPC nativo."""
 
     endpoint = args.endpoint
     if endpoint.startswith("http"):
@@ -134,7 +134,7 @@ async def run_benchmark(args):
 
     benchmark = PriorityBenchmarkGRPC(endpoint=endpoint, carga_req_s=args.carga)
 
-    print(f"E3: Priorização - gRPC + heapq")
+    print(f"E3: Priorização - gRPC Nativo (protobuf) + heapq")
     print(f"Endpoint: {endpoint}")
     print(f"Carga NORMAL: {args.carga} req/s")
     print(f"Duração: {args.duracao}s")
@@ -178,7 +178,7 @@ async def run_benchmark(args):
         return None
 
     summary = {
-        "protocol": "GRPC_HEAPQ",
+        "protocol": "GRPC_NATIVE_HEAPQ",
         "endpoint": endpoint,
         "carga_req_s": args.carga,
         "duracao_s": args.duracao,
@@ -203,7 +203,7 @@ async def run_benchmark(args):
     diff = summary["normal"]["median_ms"] - summary["priority_high"]["median_ms"]
     summary["priority_advantage_ms"] = round(diff, 4)
 
-    csv_file = f"results/E3_GRPC_HEAPQ_carga{args.carga}.csv"
+    csv_file = f"results/E3_GRPC_NATIVE_HEAPQ_carga{args.carga}.csv"
     Path("results").mkdir(exist_ok=True)
 
     all_results = [(r, "NORMAL") for r in benchmark.normal_results] + \
@@ -216,7 +216,7 @@ async def run_benchmark(args):
             error = r.get("error", "")
             f.write(f"{prio},{r['latency_ms']},{elapsed},{error}\n")
 
-    json_file = f"results/E3_GRPC_HEAPQ_carga{args.carga}_summary.json"
+    json_file = f"results/E3_GRPC_NATIVE_HEAPQ_carga{args.carga}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -234,9 +234,9 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E3: Priorização - gRPC + heapq")
+    parser = argparse.ArgumentParser(description="E3: Priorização - gRPC Nativo + heapq")
     parser.add_argument("--endpoint", default="localhost:50051",
-                        help="Endereço do servidor gRPC")
+                        help="Endereço do llama-server gRPC")
     parser.add_argument("--url", dest="endpoint",
                         help="Alias para --endpoint (compatibilidade)")
     parser.add_argument("--carga", type=int, default=10)

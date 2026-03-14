@@ -37,7 +37,19 @@ class BenchmarkHeartbeat(IdlStruct, typename="BenchmarkHeartbeat"):
 try:
     participant = DomainParticipant(domain_id)
     topic = Topic(participant, "benchmark/heartbeat", BenchmarkHeartbeat)
-    writer = DataWriter(Publisher(participant), topic)
+
+    # QoS with DEADLINE + LIVELINESS — must match reader's requested QoS
+    lease_ms = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    qos_policies = [
+        Policy.Reliability.Reliable(duration(seconds=10)),
+        Policy.Deadline(duration(milliseconds=periodo_ms)),
+    ]
+    if lease_ms > 0:
+        qos_policies.append(
+            Policy.Liveliness.Automatic(lease_duration=duration(milliseconds=lease_ms))
+        )
+    qos = Qos(*qos_policies)
+    writer = DataWriter(Publisher(participant), topic, qos=qos)
 
     seq = 0
     while True:

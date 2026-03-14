@@ -4,6 +4,7 @@ Provides REST API for clients to interact with the orchestration system
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -26,12 +27,14 @@ class OrchestratorServer:
                  registry: AgentRegistry,
                  scheduler: TaskScheduler,
                  dds_layer: DDSLayer,
-                 selector: AgentSelector = None):
+                 selector: AgentSelector = None,
+                 grpc_layer=None):
         self.config = config
         self.registry = registry
         self.scheduler = scheduler
         self.dds = dds_layer
-        self.selector = selector or AgentSelector()  # Selector para escolher agente especializado
+        self.grpc = grpc_layer  # optional gRPC layer (mirrors DDS layer interface)
+        self.selector = selector or AgentSelector()
 
         self.app = None
         self.runner = None
@@ -42,6 +45,7 @@ class OrchestratorServer:
         self._cleanup_task = None
         self._dds_client_task = None
         self._response_dispatch_task = None
+        self._grpc_dispatch_task = None
         self._cleanup_lock = asyncio.Lock()
         self._inflight_dds_tasks: set = set()
 
@@ -65,6 +69,7 @@ class OrchestratorServer:
         self.app.router.add_get('/api/v1/agents', self.handle_list_agents)
         self.app.router.add_get('/api/v1/agents/{agent_id}', self.handle_get_agent)
         self.app.router.add_post('/api/v1/agents/register', self.handle_register_agent)
+        self.app.router.add_post('/api/v1/agents/{agent_id}/heartbeat', self.handle_agent_heartbeat)
         self.app.router.add_delete('/api/v1/agents/{agent_id}', self.handle_unregister_agent)
 
         # Task management
@@ -99,15 +104,17 @@ class OrchestratorServer:
         self._dds_client_task = asyncio.create_task(self._dds_client_loop())
         # Sole consumer of TOPIC_AGENT_RESPONSE — dispatches to per-task waiters
         self._response_dispatch_task = asyncio.create_task(self.dds.dispatch_agent_responses())
-        # NOTE: dispatch_client_responses is NOT started here because the
-        # orchestrator is a PRODUCER of client responses (publisher), not a
-        # consumer.  It is only useful when DDSLayer is used in a CLIENT role
-        # (e.g., benchmark scripts that subscribe to TOPIC_CLIENT_RESPONSE).
+
+        # Start gRPC layer if available
+        if self.grpc and self.grpc.is_available():
+            await self.grpc.start()
+            self._grpc_dispatch_task = asyncio.create_task(self.grpc.dispatch_agent_responses())
 
     async def stop(self):
         """Stop the orchestrator server"""
         for task in (self._heartbeat_task, self._cleanup_task,
-                     self._dds_client_task, self._response_dispatch_task):
+                     self._dds_client_task, self._response_dispatch_task,
+                     self._grpc_dispatch_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -122,6 +129,9 @@ class OrchestratorServer:
         if self._inflight_dds_tasks:
             await asyncio.gather(*self._inflight_dds_tasks, return_exceptions=True)
             self._inflight_dds_tasks.clear()
+
+        if self.grpc:
+            await self.grpc.stop()
 
         if self.site:
             await self.site.stop()
@@ -390,6 +400,7 @@ class OrchestratorServer:
             slots_total=data.get("slots_total", data.get("slots_idle", 1)),
             vision_enabled=data.get("vision_enabled", False),
             capabilities=data.get("capabilities", []),
+            grpc_address=data.get("grpc_address", ""),
         )
 
         await self.registry.register_agent(agent_info)
@@ -454,16 +465,13 @@ class OrchestratorServer:
         priority = data.get("priority", TaskPriority.NORMAL.value)
         task_type = data.get("task_type", "chat")
 
-        # Get any available agent from registry
-        agents = await self.registry.get_available_agents()
-        if not agents:
+        # Wait for an available agent (queue instead of 503 rejection)
+        agent = await self._wait_for_available_agent(timeout_s=300)
+        if not agent:
             return web.json_response({
-                "error": "No agents available for this task type",
+                "error": "No agents available after timeout",
                 "code": "NO_AGENTS"
             }, status=503)
-
-        # Select agent with most idle slots for load balancing
-        agent = max(agents, key=lambda a: a.slots_idle)
         logger.info(f"Selected agent: {agent.agent_id}")
 
         # Create task
@@ -478,60 +486,200 @@ class OrchestratorServer:
         )
 
         # Update agent status (atomic slot decrement, status auto-derived)
-        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
+        # Retry if another request grabbed the slot between wait and decrement
+        for _retry in range(3):
+            if await self.registry.adjust_slots(agent.agent_id, delta=-1):
+                break
+            agent = await self._wait_for_available_agent(timeout_s=300)
+            if not agent:
+                return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
+        else:
             return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
 
         # Track task (don't queue — we dispatch inline via DDS/HTTP below)
         await self.scheduler.track_task(task)
 
-        # Try DDS first, fall back to HTTP if it fails
-        dds_success = False
+        # Try gRPC first (if agent has grpc_address), then DDS, then HTTP fallback
+        transport_success = False
         response_data = {}
+        _streaming_handled = False  # Set by SSE streaming path to prevent double slot release
 
         try:
-            try:
-                # Send task to agent via DDS topic
-                dds_request = AgentTaskRequest(
-                    task_id=task.task_id,
-                    requester_id="orchestrator",
-                    task_type=task.task_type,
-                    messages=messages,
-                    priority=priority,
-                    timeout_ms=task.timeout_ms,
-                    requires_context=task.requires_context,
-                    stream=data.get("stream", False),
-                )
-                # Register waiter BEFORE publishing to avoid race condition
-                # where the response arrives before the waiter is set up.
-                self.dds.prepare_agent_response_waiter(task.task_id)
-                await self.dds.publish_agent_request(dds_request)
+            # === gRPC path (agent has grpc_address and orchestrator has grpc_layer) ===
+            stream_requested = data.get("stream", False)
+            if (not transport_success
+                    and self.grpc and self.grpc.is_available()
+                    and getattr(agent, "grpc_address", "")):
+                try:
+                    from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
+                    grpc_request = GRPCAgentTaskRequest(
+                        task_id=task.task_id,
+                        requester_id="orchestrator",
+                        task_type=task.task_type,
+                        messages=messages,
+                        priority=priority,
+                        timeout_ms=task.timeout_ms,
+                        requires_context=task.requires_context,
+                        stream=stream_requested,
+                    )
 
-                # Wait for response from agent via DDS topic
-                # Agent publishes to agent/response topic
-                response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)  # 120s timeout for DDS
-                # Only consider success if we got actual content (not just an error message)
-                # Response can be either a dict or an IdlStruct object
-                content = ""
-                if isinstance(response_data, dict):
-                    content = response_data.get("content", "")
-                else:
-                    content = getattr(response_data, "content", "")
+                    if stream_requested:
+                        # SSE streaming path via gRPC: forward chunks to client
+                        self.grpc.prepare_stream_waiter(task.task_id)
+                        # publish_agent_request will forward chunks to stream waiter
+                        asyncio.create_task(self.grpc.publish_agent_request(
+                            grpc_request,
+                            agent_id=agent.agent_id,
+                            agent_grpc_url=agent.grpc_address,
+                        ))
 
-                # Check if DDS transport actually delivered a response.
-                # wait_for_agent_response returns {"error": "DDS not available"} when
-                # DDS is disabled — treat that as a transport failure for HTTP fallback.
-                if isinstance(response_data, dict) and response_data.get("error") == "DDS not available":
-                    logger.info("DDS not available, will try HTTP fallback")
-                else:
-                    dds_success = True
-            except Exception as e:
-                logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
-                # Clean up the waiter since DDS path failed
-                self.dds._pending_agent_responses.pop(task.task_id, None)
+                        sse_response = web.StreamResponse(
+                            status=200,
+                            reason='OK',
+                            headers={
+                                'Content-Type': 'text/event-stream',
+                                'Cache-Control': 'no-cache',
+                                'Connection': 'keep-alive',
+                            }
+                        )
+                        await sse_response.prepare(request)
 
-            # If DDS failed, use HTTP fallback
-            logger.info(f"DDS result: dds_success={dds_success}, response_data={response_data}")
-            if not dds_success:
+                        try:
+                            async for chunk in self.grpc.stream_agent_response(task.task_id, timeout_ms=120000):
+                                content = chunk.get("content", "")
+                                is_final = chunk.get("is_final", False)
+
+                                if is_final and not content:
+                                    await sse_response.write(b"data: [DONE]\n\n")
+                                    break
+
+                                sse_data = json.dumps({
+                                    "id": task.task_id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": content},
+                                        "finish_reason": "stop" if is_final else None,
+                                    }],
+                                })
+                                await sse_response.write(f"data: {sse_data}\n\n".encode())
+
+                                if is_final:
+                                    await sse_response.write(b"data: [DONE]\n\n")
+                                    break
+                        finally:
+                            await self.registry.adjust_slots(agent.agent_id, delta=+1)
+                            await self.scheduler.complete_task(task.task_id, response="streaming")
+                            _streaming_handled = True
+
+                        return sse_response
+
+                    else:
+                        # Non-streaming gRPC path
+                        self.grpc.prepare_agent_response_waiter(task.task_id)
+                        await self.grpc.publish_agent_request(
+                            grpc_request,
+                            agent_id=agent.agent_id,
+                            agent_grpc_url=agent.grpc_address,
+                        )
+                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        if isinstance(response_data, dict) and response_data.get("error"):
+                            logger.warning(f"gRPC response error: {response_data.get('error')}")
+                        else:
+                            transport_success = True
+
+                except Exception as e:
+                    logger.warning(f"gRPC communication failed: {e}, trying DDS")
+
+            # === DDS path ===
+            if not transport_success:
+                try:
+                    dds_request = AgentTaskRequest(
+                        task_id=task.task_id,
+                        requester_id="orchestrator",
+                        task_type=task.task_type,
+                        messages=messages,
+                        priority=priority,
+                        timeout_ms=task.timeout_ms,
+                        requires_context=task.requires_context,
+                        stream=stream_requested,
+                    )
+
+                    # Map task priority to DDS TRANSPORT_PRIORITY
+                    priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
+                    dds_priority = priority_map.get(priority, 0)
+
+                    if stream_requested and self.dds.is_available():
+                        # SSE streaming path: forward individual chunks to client
+                        self.dds.prepare_stream_waiter(task.task_id)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority)
+
+                        sse_response = web.StreamResponse(
+                            status=200,
+                            reason='OK',
+                            headers={
+                                'Content-Type': 'text/event-stream',
+                                'Cache-Control': 'no-cache',
+                                'Connection': 'keep-alive',
+                            }
+                        )
+                        await sse_response.prepare(request)
+
+                        try:
+                            async for chunk in self.dds.stream_agent_response(task.task_id, timeout_ms=120000):
+                                content = chunk.get("content", "")
+                                is_final = chunk.get("is_final", False)
+
+                                if is_final and not content:
+                                    await sse_response.write(b"data: [DONE]\n\n")
+                                    break
+
+                                sse_data = json.dumps({
+                                    "id": task.task_id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": content},
+                                        "finish_reason": "stop" if is_final else None,
+                                    }],
+                                })
+                                await sse_response.write(f"data: {sse_data}\n\n".encode())
+
+                                if is_final:
+                                    await sse_response.write(b"data: [DONE]\n\n")
+                                    break
+                        finally:
+                            # Slot released here; outer finally skipped via _streaming_handled flag
+                            await self.registry.adjust_slots(agent.agent_id, delta=+1)
+                            await self.scheduler.complete_task(task.task_id, response="streaming")
+                            _streaming_handled = True
+
+                        return sse_response
+
+                    else:
+                        # Non-streaming DDS path
+                        self.dds.prepare_agent_response_waiter(task.task_id)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority)
+                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)
+
+                        content = ""
+                        if isinstance(response_data, dict):
+                            content = response_data.get("content", "")
+                        else:
+                            content = getattr(response_data, "content", "")
+
+                        if isinstance(response_data, dict) and response_data.get("error") == "DDS not available":
+                            logger.info("DDS not available, will try HTTP fallback")
+                        else:
+                            transport_success = True
+
+                except Exception as e:
+                    logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
+                    self.dds._pending_agent_responses.pop(task.task_id, None)
+                    self.dds._pending_agent_responses.pop(f"stream_{task.task_id}", None)
+
+            # If transport failed, use HTTP fallback
+            if not transport_success:
                 logger.info(f"Using HTTP fallback for task {task.task_id}")
                 agent_url = f"http://{agent.hostname}:{agent.port}"
                 logger.info(f"Calling agent at {agent_url}")
@@ -571,6 +719,7 @@ class OrchestratorServer:
                 processing_time = getattr(response_data, "processing_time_ms", 0)
                 if not getattr(response_data, "success", True):
                     response_error = getattr(response_data, "error_message", "Unknown error")
+            logger.debug(f"Transport result: success={transport_success}, content_len={len(response_content)}")
 
             await self.scheduler.complete_task(
                 task.task_id,
@@ -583,9 +732,9 @@ class OrchestratorServer:
             await self.scheduler.cancel_task(task.task_id)
             raise
         finally:
-            # Always restore slot — including on CancelledError (client disconnect)
-            # Status auto-derived from resulting slots_idle count
-            await self.registry.adjust_slots(agent.agent_id, delta=+1)
+            # Always restore slot — unless streaming path already handled it
+            if not _streaming_handled:
+                await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
         # Return OpenAI-compatible response for /api/v1/chat/completions
         return web.json_response({
@@ -607,6 +756,21 @@ class OrchestratorServer:
             "agent_id": agent.agent_id,
             "processing_time_ms": processing_time,
         })
+
+    async def _wait_for_available_agent(self, timeout_s=300):
+        """Wait for an agent with idle slots instead of returning 503 immediately.
+
+        This enables request queueing: when all agents are busy, requests wait
+        in line until an agent finishes its current task.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            agents = await self.registry.get_available_agents()
+            if agents:
+                return max(agents, key=lambda a: a.slots_idle)
+            await asyncio.sleep(0.1)  # 100ms polling — fast slot detection
+        return None
 
     async def handle_generate(self, request: web.Request) -> web.Response:
         """Handle generate request"""

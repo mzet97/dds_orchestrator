@@ -270,18 +270,28 @@ class DDSLayer:
         # QoS for reliable communication (requests, responses).
         # KeepLast(8): buffer up to 8 undelivered messages so that rapid
         # back-to-back writes under multi-client load are not silently dropped.
+        # TRANSPORT_PRIORITY(0): default priority; overridden per-request via priority writers.
         self.qos_reliable = Qos(
             Policy.Reliability.Reliable(duration(seconds=10)),
             Policy.Durability.Volatile,
             Policy.History.KeepLast(8),
+            Policy.TransportPriority(0),
         )
 
         # QoS for best effort (status, heartbeat)
+        # DEADLINE(2s): triggers on_requested_deadline_missed when data stops
+        # LIVELINESS AUTOMATIC(1s): middleware detects process failure via lease
         self.qos_best_effort = Qos(
             Policy.Reliability.BestEffort,
             Policy.Durability.Volatile,
             Policy.History.KeepLast(5),
+            Policy.Deadline(duration(seconds=2)),
+            Policy.Liveliness.Automatic(lease_duration=duration(seconds=1)),
         )
+
+        # Priority writers: CycloneDDS doesn't support per-write QoS override,
+        # so we create separate DataWriters with different TRANSPORT_PRIORITY values.
+        self._priority_writers: Dict[int, Any] = {}
 
         # Create publishers (orchestrator sends to agents and clients)
         self.publishers = {
@@ -325,7 +335,7 @@ class DDSLayer:
                     # Create message instance with all fields via constructor
                     msg = topic_type(**data)
                     self.publishers[topic].write(msg)
-                    logger.info(f"Published to {topic}: {data}")
+                    logger.debug(f"Published to {topic}: {data}")
             except Exception as e:
                 logger.error(f"Failed to publish to {topic}: {e}")
         else:
@@ -337,9 +347,8 @@ class DDSLayer:
             return []
 
         try:
-            from cyclonedds.util import duration
-            # Use take() with timeout to consume messages from the queue
-            samples = self.subscribers[topic].take(timeout=duration(milliseconds=timeout_ms))
+            # take() without timeout — some CycloneDDS versions don't support timeout kwarg
+            samples = self.subscribers[topic].take()
             result = []
             for s in samples:
                 # Handle both DataSample objects and raw data
@@ -349,7 +358,7 @@ class DDSLayer:
                 elif s:
                     result.append(s)
             if result:
-                logger.info(f"Read {len(result)} messages from {topic}")
+                logger.debug(f"Read {len(result)} messages from {topic}")
             return result
         except Exception as e:
             logger.debug(f"No messages from {topic}: {e}")
@@ -441,6 +450,46 @@ class DDSLayer:
         finally:
             self._pending_agent_responses.pop(task_id, None)
 
+    def prepare_stream_waiter(self, task_id: str):
+        """Pre-register a streaming waiter for the given task_id.
+
+        Unlike prepare_agent_response_waiter (single response), this creates
+        a waiter keyed as 'stream_{task_id}' that accumulates individual chunks.
+        """
+        key = f"stream_{task_id}"
+        if key not in self._pending_agent_responses:
+            event = asyncio.Event()
+            chunks = []  # list of chunk dicts
+            self._pending_agent_responses[key] = (event, chunks)
+
+    async def stream_agent_response(self, task_id: str, timeout_ms: int = 120000):
+        """Async generator that yields individual response chunks from agent.
+
+        Each chunk is a dict with keys: content, is_final, prompt_tokens,
+        completion_tokens, processing_time_ms.
+        """
+        key = f"stream_{task_id}"
+        if key not in self._pending_agent_responses:
+            self.prepare_stream_waiter(task_id)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout_ms / 1000)
+
+        while loop.time() < deadline:
+            if key in self._pending_agent_responses:
+                _, chunks = self._pending_agent_responses[key]
+                while chunks:
+                    chunk = chunks.pop(0)
+                    yield chunk
+                    if chunk.get("is_final", False):
+                        self._pending_agent_responses.pop(key, None)
+                        return
+            await asyncio.sleep(0.001)  # 1ms polling for low-latency streaming
+
+        # Timeout
+        self._pending_agent_responses.pop(key, None)
+        yield {"content": "", "is_final": True, "error": "timeout"}
+
     async def dispatch_client_responses(self):
         """Background loop: sole reader of TOPIC_CLIENT_RESPONSE.
 
@@ -463,15 +512,15 @@ class DDSLayer:
                             logger.debug(f"[DDS] Client response for unknown request_id={request_id} discarded")
             except Exception as e:
                 logger.debug(f"dispatch_client_responses error: {e}")
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.002)  # 2ms for responsive dispatch
 
     async def dispatch_agent_responses(self):
         """Background loop: sole reader of TOPIC_AGENT_RESPONSE.
 
         Reads samples and dispatches each one to the matching waiter in
-        _pending_agent_responses.  Running as a single consumer avoids the
-        race condition where two concurrent wait_for_agent_response() calls
-        each call take() and steal the other's sample.
+        _pending_agent_responses.  Supports both:
+        - Non-streaming: waiter keyed by task_id, container[0] = final sample
+        - Streaming: waiter keyed by 'stream_{task_id}', chunks appended to list
         """
         while True:
             try:
@@ -479,15 +528,37 @@ class DDSLayer:
                     samples = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=20)
                     for sample in samples:
                         task_id = getattr(sample, "task_id", None)
-                        if task_id and task_id in self._pending_agent_responses:
-                            event, container = self._pending_agent_responses[task_id]
-                            container[0] = sample
-                            event.set()
+                        if not task_id:
+                            continue
+                        is_final = getattr(sample, "is_final", True)
+
+                        # Streaming path: accumulate chunks
+                        stream_key = f"stream_{task_id}"
+                        if stream_key in self._pending_agent_responses:
+                            _, chunks = self._pending_agent_responses[stream_key]
+                            chunks.append({
+                                "content": getattr(sample, "content", ""),
+                                "is_final": bool(is_final),
+                                "prompt_tokens": getattr(sample, "prompt_tokens", 0),
+                                "completion_tokens": getattr(sample, "completion_tokens", 0),
+                                "processing_time_ms": getattr(sample, "processing_time_ms", 0),
+                            })
+                            if is_final:
+                                event, _ = self._pending_agent_responses[stream_key]
+                                event.set()
+                            continue
+
+                        # Non-streaming path: resolve waiter with final sample
+                        if task_id in self._pending_agent_responses:
+                            if is_final:
+                                event, container = self._pending_agent_responses[task_id]
+                                container[0] = sample
+                                event.set()
                         else:
                             logger.debug(f"[DDS] Response for unknown task_id={task_id} discarded")
             except Exception as e:
                 logger.debug(f"dispatch_agent_responses error: {e}")
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.002)  # 2ms for responsive dispatch
 
     async def subscribe(self, topic: str, handler: Callable):
         """Subscribe to topic with handler - creates a DataReader with Listener"""
@@ -534,9 +605,14 @@ class DDSLayer:
             logger.error(f"Failed to create subscription for {topic}: {e}")
             logger.info(f"Subscribed to {topic} (handler registered, no listener)")
 
-    async def publish_agent_request(self, request: AgentTaskRequest):
-        """Publish task request to agents"""
-        import json
+    async def publish_agent_request(self, request: AgentTaskRequest, priority: int = 0):
+        """Publish task request to agents with optional TRANSPORT_PRIORITY.
+
+        Args:
+            request: The task request to publish.
+            priority: DDS TRANSPORT_PRIORITY value (0=LOW, 5=NORMAL, 10=HIGH, 20=CRITICAL).
+                      Creates a dedicated DataWriter per priority level.
+        """
         # Convert to DDS format - messages need to be JSON string
         data = {
             "task_id": request.task_id,
@@ -550,7 +626,54 @@ class DDSLayer:
             "created_at": int(time.time()),
             "stream": request.stream,
         }
+
+        if not self.dds_available:
+            logger.debug("DDS unavailable, skipping publish_agent_request")
+            return
+
+        # Use priority-specific writer if priority > 0
+        if priority > 0:
+            writer = self._get_priority_writer(priority)
+            if writer:
+                try:
+                    topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
+                    if topic_type:
+                        msg = topic_type(**data)
+                        writer.write(msg)
+                        logger.debug(f"Published to {TOPIC_AGENT_REQUEST} with TRANSPORT_PRIORITY={priority}")
+                        return
+                except Exception as e:
+                    logger.error(f"Failed to publish with priority writer: {e}")
+
+        # Fallback to default writer (priority=0)
         await self.publish(TOPIC_AGENT_REQUEST, data)
+
+    def _get_priority_writer(self, priority: int):
+        """Get or create a DataWriter with the specified TRANSPORT_PRIORITY."""
+        if priority in self._priority_writers:
+            return self._priority_writers[priority]
+
+        try:
+            from cyclonedds.pub import DataWriter
+            from cyclonedds.core import Policy
+            from cyclonedds.qos import Qos
+            from cyclonedds.util import duration
+
+            qos = Qos(
+                Policy.Reliability.Reliable(duration(seconds=10)),
+                Policy.Durability.Volatile,
+                Policy.History.KeepLast(8),
+                Policy.TransportPriority(priority),
+            )
+            writer = DataWriter(
+                self.participant, self.topics[TOPIC_AGENT_REQUEST], qos
+            )
+            self._priority_writers[priority] = writer
+            logger.info(f"Created priority writer with TRANSPORT_PRIORITY={priority}")
+            return writer
+        except Exception as e:
+            logger.error(f"Failed to create priority writer: {e}")
+            return None
 
     async def publish_orchestrator_command(self, command_id: str,
                                           target_agent_id: str,

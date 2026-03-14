@@ -1,0 +1,60 @@
+// Llama gRPC Service - mirrors DDS IDL (idl/LlamaDDS.idl)
+// Copy of llama.cpp_dds/grpc/proto/llama_service.proto for Python stub generation.
+
+syntax = "proto3";
+package llama_grpc;
+
+// Chat message structure — mirrors llama::ChatMessage
+message ChatMessage {
+    string role    = 1;  // "system", "user", "assistant"
+    string content = 2;  // Message content
+}
+
+// Chat completion request — mirrors llama::ChatCompletionRequest
+message ChatCompletionRequest {
+    string              request_id  = 1;  // Unique UUID for correlation
+    string              model       = 2;  // Model name
+    repeated ChatMessage messages   = 3;  // Chat messages
+    float               temperature = 4;  // Sampling temperature (default 0.7)
+    int32               max_tokens  = 5;  // Max tokens to generate
+    bool                stream      = 6;  // Enable streaming mode
+
+    // Optional parameters — protobuf uses 'optional' keyword (proto3 field presence)
+    optional float  top_p = 7;            // Nucleus sampling
+    optional int32  n     = 8;            // Number of completions
+    repeated string stop  = 9;            // Stop sequences
+}
+
+// Chat completion response — mirrors llama::ChatCompletionResponse
+message ChatCompletionResponse {
+    string request_id        = 1;  // Correlates with request
+    string model             = 2;  // Model name
+    string content           = 3;  // Generated text
+    string finish_reason     = 4;  // "stop", "length", or "" for intermediate streaming chunks
+    bool   is_final          = 5;  // Last chunk?
+    int32  prompt_tokens     = 6;  // Tokens in prompt
+    int32  completion_tokens = 7;  // Tokens generated
+}
+
+// Server status/health — mirrors llama::ServerStatus
+message ServerStatus {
+    string server_id        = 1;  // Unique server identifier
+    int32  slots_idle       = 2;  // Number of idle slots
+    int32  slots_processing = 3;  // Number of processing slots
+    string model_loaded     = 4;  // Currently loaded model
+    bool   ready            = 5;  // Server ready for requests
+}
+
+message Empty {}
+
+// LlamaService — gRPC service for llama.cpp inference
+service LlamaService {
+    // Unary chat completion (non-streaming)
+    rpc Chat(ChatCompletionRequest) returns (ChatCompletionResponse);
+
+    // Server-streaming chat completion (streaming mode)
+    rpc StreamChat(ChatCompletionRequest) returns (stream ChatCompletionResponse);
+
+    // Get current server status
+    rpc GetStatus(Empty) returns (ServerStatus);
+}

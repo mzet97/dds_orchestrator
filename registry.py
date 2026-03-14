@@ -32,6 +32,7 @@ class AgentInfo:
     capabilities: List[str] = field(default_factory=list)
     llm_host: str = "localhost"  # Host da LLM que este agente gerencia
     llm_port: int = 8082  # Porta da LLM
+    grpc_address: str = ""  # gRPC endpoint (host:port) if agent supports gRPC
 
 
 class AgentRegistry:

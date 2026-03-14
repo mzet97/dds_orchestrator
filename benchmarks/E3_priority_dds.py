@@ -47,8 +47,8 @@ class PriorityBenchmarkDDS:
         """
         payload = {
             "model": "phi4-mini",
-            "messages": [{"role": "user", "content": "Responda apenas: ok"}],
-            "max_tokens": 5,
+            "messages": [{"role": "user", "content": "Responda: O que e 2+2?"}],
+            "max_tokens": 50,
             "priority": priority
         }
 
@@ -57,7 +57,7 @@ class PriorityBenchmarkDDS:
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
                 await resp.text()
                 recv_time = time.perf_counter()
@@ -152,7 +152,7 @@ async def run_benchmark(args):
         return None
 
     summary = {
-        "protocol": "DDS_TRANSPORT_PRIORITY",
+        "protocol": f"{args.protocol_label}_TRANSPORT_PRIORITY",
         "url": args.url,
         "carga_req_s": args.carga,
         "duracao_s": args.duracao,
@@ -179,7 +179,8 @@ async def run_benchmark(args):
     summary["priority_advantage_ms"] = round(diff, 4)
 
     # Salvar CSV
-    csv_file = f"results/E3_DDS_PRIORITY_carga{args.carga}.csv"
+    protocol_label = args.protocol_label
+    csv_file = f"results/E3_{protocol_label}_PRIORITY_carga{args.carga}.csv"
     Path("results").mkdir(exist_ok=True)
 
     all_results = [(r, "NORMAL") for r in benchmark.normal_results] + \
@@ -192,7 +193,7 @@ async def run_benchmark(args):
             error = r.get("error", "")
             f.write(f"{prio},{r['latency_ms']},{elapsed},{error}\n")
 
-    json_file = f"results/E3_DDS_PRIORITY_carga{args.carga}_summary.json"
+    json_file = f"results/E3_{protocol_label}_PRIORITY_carga{args.carga}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -215,6 +216,7 @@ def main():
     parser.add_argument("--carga", type=int, default=10, help="Carga NORMAL em req/s")
     parser.add_argument("--duracao", type=int, default=300, help="Duração em segundos (padrão: 300=5min)")
     parser.add_argument("--n", type=int, default=30, help="Número de injeções HIGH priority")
+    parser.add_argument("--protocol-label", default="DDS", help="Label do protocolo para nomes de arquivos")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

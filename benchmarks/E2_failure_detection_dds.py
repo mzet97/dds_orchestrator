@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """
-E2: Detecção de Falha - DDS DEADLINE
-=====================================
-Mede o tempo de detecção de falha usando a política DEADLINE do CycloneDDS.
+E2: Detecção de Falha - DDS DEADLINE + LIVELINESS
+===================================================
+Mede o tempo de detecção de falha usando políticas QoS do CycloneDDS.
+
+Mecanismos testados:
+  - DEADLINE: detecta ausência de dados (publicações não chegam no prazo).
+    Tempo de detecção ≈ periodo_ms (by design).
+  - LIVELINESS AUTOMATIC: detecta falha de processo (lease expira sem heartbeat).
+    Tempo de detecção ≈ lease_duration (configurável).
 
 Metodologia:
   1. Subprocesso publicador envia heartbeats a cada periodo_ms/10 ms.
-  2. DataReader configurado com DEADLINE = periodo_ms.
+  2. DataReader configurado com DEADLINE = periodo_ms e LIVELINESS = lease_ms.
   3. Publicador é terminado (kill -9, SIGTERM ou SIGSTOP).
-  4. A camada C++ do CycloneDDS detecta a ausência de mensagens e dispara
-     o callback on_requested_deadline_missed via Listener.
+  4. T_detect = primeiro callback disparado (DEADLINE ou LIVELINESS).
   5. Tempo de detecção = T_detect - T_fail (ms).
 
-Diferença em relação ao heartbeat HTTP/gRPC:
-  - DDS: detecção determinística em exatamente D ms após a falha (camada C++).
-  - HTTP/gRPC: detecção em até D ms após o próximo ciclo de polling Python.
+Comparação com gRPC:
+  - gRPC: TCP socket fecha imediatamente → detecção em ~5ms.
+  - DDS DEADLINE: espera período completo → detecção em ~D ms.
+  - DDS LIVELINESS: espera lease expirar → detecção em ~lease_ms.
 
 Tipos de falha:
-  - kill9:    kill -9 (terminação abrupta, sem shutdown gracioso)
+  - kill9:    kill -9 (terminação abrupta)
   - sigterm:  kill -15 (shutdown gracioso)
-  - deadlock: kill -STOP (processo travado, não envia mais mensagens)
+  - deadlock: kill -STOP (processo travado)
 
 Usage:
-    python E2_failure_detection_dds.py --periodo 1000 --tipo kill9 --n 50 --domain 0
+    python E2_failure_detection_dds.py --periodo 1000 --lease 200 --n 10 --domain 0
 """
 
 import argparse
@@ -38,14 +44,16 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-class DDSDeadlineDetector:
-    """Detecta falha de agente via política DEADLINE do CycloneDDS."""
+class DDSFailureDetector:
+    """Detecta falha via DEADLINE e/ou LIVELINESS do CycloneDDS."""
 
-    def __init__(self, periodo_ms: int, domain_id: int = 0):
+    def __init__(self, periodo_ms: int, lease_ms: int, domain_id: int = 0):
         self.periodo_ms = periodo_ms
+        self.lease_ms = lease_ms
         self.domain_id = domain_id
         self._detection_event: Optional[asyncio.Event] = None
         self._t_detect: Optional[float] = None
+        self._detected_by: Optional[str] = None
         self._dds_available = False
 
         # Inicializar CycloneDDS
@@ -76,8 +84,8 @@ class DDSDeadlineDetector:
             print("Instale: pip install cyclonedds", file=sys.stderr)
             raise
 
-    def _create_reader_with_deadline(self, event: asyncio.Event, loop: asyncio.AbstractEventLoop):
-        """Cria DataReader com DEADLINE QoS e Listener."""
+    def _create_reader(self, event: asyncio.Event, loop: asyncio.AbstractEventLoop):
+        """Cria DataReader com DEADLINE + LIVELINESS QoS e Listener."""
         from cyclonedds.sub import DataReader, Subscriber
         from cyclonedds.qos import Qos, Policy
         from cyclonedds.util import duration
@@ -85,15 +93,36 @@ class DDSDeadlineDetector:
 
         detector_self = self
 
-        class DeadlineListener(Listener):
+        class FailureListener(Listener):
             def on_requested_deadline_missed(self, reader, status):
                 """Chamado pelo C++ do CycloneDDS quando DEADLINE é violado."""
-                detector_self._t_detect = time.perf_counter()
-                # Sinalizar asyncio event de forma thread-safe
-                loop.call_soon_threadsafe(event.set)
+                if detector_self._t_detect is None:
+                    detector_self._t_detect = time.perf_counter()
+                    detector_self._detected_by = "DEADLINE"
+                    loop.call_soon_threadsafe(event.set)
 
-        qos = Qos(Policy.Deadline(duration(milliseconds=self.periodo_ms)))
-        self._listener = DeadlineListener()
+            def on_liveliness_changed(self, reader, status):
+                """Chamado pelo C++ do CycloneDDS quando LIVELINESS muda."""
+                # alive_count diminui = writer morreu
+                if status.alive_count == 0 and status.alive_count_change < 0:
+                    if detector_self._t_detect is None:
+                        detector_self._t_detect = time.perf_counter()
+                        detector_self._detected_by = "LIVELINESS"
+                        loop.call_soon_threadsafe(event.set)
+
+        qos_policies = [
+            Policy.Reliability.Reliable(duration(seconds=10)),
+            Policy.Deadline(duration(milliseconds=self.periodo_ms)),
+        ]
+
+        # Add LIVELINESS if lease_ms > 0
+        if self.lease_ms > 0:
+            qos_policies.append(
+                Policy.Liveliness.Automatic(lease_duration=duration(milliseconds=self.lease_ms))
+            )
+
+        qos = Qos(*qos_policies)
+        self._listener = FailureListener()
         self._reader = DataReader(
             Subscriber(self.participant),
             self.topic,
@@ -101,23 +130,24 @@ class DDSDeadlineDetector:
             listener=self._listener
         )
 
-    async def run_iteration(self, tipo: str) -> float:
+    async def run_iteration(self, tipo: str) -> dict:
         """
         Executa uma iteração: inicia publicador, espera conexão,
         simula falha e mede tempo de detecção.
-        Retorna tempo de detecção em ms, ou -1 em caso de falha.
+        Retorna dict com detection_time_ms e detected_by, ou detection_time_ms=-1.
         """
         loop = asyncio.get_running_loop()
         self._detection_event = asyncio.Event()
         self._t_detect = None
+        self._detected_by = None
 
-        # Criar reader com DEADLINE e listener
-        self._create_reader_with_deadline(self._detection_event, loop)
+        # Criar reader com DEADLINE + LIVELINESS e listener
+        self._create_reader(self._detection_event, loop)
 
         # Iniciar publicador como subprocesso
         publisher_script = Path(__file__).parent / "_e2_heartbeat_publisher.py"
         pub_proc = subprocess.Popen(
-            [sys.executable, str(publisher_script), str(self.periodo_ms), str(self.domain_id)],
+            [sys.executable, str(publisher_script), str(self.periodo_ms), str(self.domain_id), str(self.lease_ms)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -128,7 +158,7 @@ class DDSDeadlineDetector:
         # Confirmar que publicador está rodando
         if pub_proc.poll() is not None:
             stderr = pub_proc.stderr.read().decode()
-            return -1  # publicador falhou ao iniciar
+            return {"detection_time_ms": -1, "detected_by": "NONE"}
 
         # Executar falha e registrar T_fail
         t_fail = time.perf_counter()
@@ -143,14 +173,19 @@ class DDSDeadlineDetector:
             else:
                 pub_proc.kill()       # Windows: sem SIGSTOP, usar SIGKILL
 
-        # Aguardar DEADLINE disparar (máximo: 3x o período)
-        timeout_s = (self.periodo_ms * 3) / 1000.0
+        # Aguardar detecção (máximo: 3x o período ou 3x o lease, o que for maior)
+        max_wait = max(self.periodo_ms, self.lease_ms) * 3
+        timeout_s = max_wait / 1000.0
         try:
             await asyncio.wait_for(self._detection_event.wait(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            # DEADLINE não disparou dentro do timeout esperado
             pub_proc.kill()
-            return -1
+            try:
+                pub_proc.wait(timeout=2)
+            except Exception:
+                pass
+            del self._reader
+            return {"detection_time_ms": -1, "detected_by": "TIMEOUT"}
 
         t_detect = self._t_detect
         detection_ms = (t_detect - t_fail) * 1000.0
@@ -160,7 +195,10 @@ class DDSDeadlineDetector:
             pub_proc.kill()
         except Exception:
             pass
-        pub_proc.wait(timeout=2)
+        try:
+            pub_proc.wait(timeout=2)
+        except Exception:
+            pass
 
         # Destruir reader para próxima iteração ter estado limpo
         del self._reader
@@ -168,54 +206,69 @@ class DDSDeadlineDetector:
         # Pequena pausa para DDS estabilizar entre iterações
         await asyncio.sleep(0.5)
 
-        return detection_ms
+        return {"detection_time_ms": detection_ms, "detected_by": self._detected_by}
 
 
 async def run_benchmark(args):
-    """Executa benchmark de detecção de falha com DDS DEADLINE."""
+    """Executa benchmark de detecção de falha com DDS DEADLINE + LIVELINESS."""
 
-    print(f"E2: Detecção de Falha - DDS DEADLINE")
+    print(f"E2: Detecção de Falha - DDS (DEADLINE + LIVELINESS)")
     print(f"Período DEADLINE: {args.periodo}ms")
+    print(f"Lease LIVELINESS: {args.lease}ms (0=disabled)")
     print(f"Tipo de falha: {args.tipo}")
     print(f"Iterações: {args.n}")
     print(f"DDS Domain: {args.domain}")
-    print("-" * 50)
+    print("-" * 60)
 
     try:
-        detector = DDSDeadlineDetector(periodo_ms=args.periodo, domain_id=args.domain)
+        detector = DDSFailureDetector(
+            periodo_ms=args.periodo,
+            lease_ms=args.lease,
+            domain_id=args.domain,
+        )
     except ImportError:
         sys.exit(1)
 
     results = []
 
     for i in range(args.n):
-        detection_time = await detector.run_iteration(args.tipo)
+        result = await detector.run_iteration(args.tipo)
 
         results.append({
             "iteration": i + 1,
-            "detection_time_ms": detection_time,
+            "detection_time_ms": result["detection_time_ms"],
+            "detected_by": result["detected_by"],
             "tipo": args.tipo,
-            "periodo_ms": args.periodo
+            "periodo_ms": args.periodo,
+            "lease_ms": args.lease,
         })
 
-        status = f"{detection_time:.2f}ms" if detection_time > 0 else "TIMEOUT"
+        dt = result["detection_time_ms"]
+        by = result["detected_by"]
+        status = f"{dt:.2f}ms ({by})" if dt > 0 else f"TIMEOUT ({by})"
         print(f"Iteração {i+1}/{args.n}: {status}")
 
     # Estatísticas
     detection_times = [r["detection_time_ms"] for r in results if r["detection_time_ms"] > 0]
     timeout_count = sum(1 for r in results if r["detection_time_ms"] < 0)
+    detected_by_counts = {}
+    for r in results:
+        by = r["detected_by"]
+        detected_by_counts[by] = detected_by_counts.get(by, 0) + 1
 
     if not detection_times:
         print("ERRO: nenhuma detecção bem-sucedida. Verifique se cyclonedds está instalado.")
         return None
 
     summary = {
-        "protocol": "DDS_DEADLINE",
+        "protocol": "DDS_DEADLINE_LIVELINESS",
         "periodo_ms": args.periodo,
+        "lease_ms": args.lease,
         "tipo_falha": args.tipo,
         "n_total": args.n,
         "n_successful": len(detection_times),
         "n_timeout": timeout_count,
+        "detected_by_counts": detected_by_counts,
         "detection_mean_ms": round(statistics.mean(detection_times), 2),
         "detection_median_ms": round(statistics.median(detection_times), 2),
         "detection_stdev_ms": round(statistics.stdev(detection_times), 2) if len(detection_times) > 1 else 0,
@@ -225,22 +278,25 @@ async def run_benchmark(args):
     }
 
     # Salvar CSV
-    csv_file = f"results/E2_DDS_DEADLINE_{args.tipo}_{args.periodo}ms.csv"
+    lease_label = f"_lease{args.lease}ms" if args.lease > 0 else ""
+    csv_file = f"results/E2_DDS_{args.tipo}_{args.periodo}ms{lease_label}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
-        f.write("iteration,detection_time_ms,tipo,periodo_ms\n")
+        f.write("iteration,detection_time_ms,detected_by,tipo,periodo_ms,lease_ms\n")
         for r in results:
-            f.write(f"{r['iteration']},{r['detection_time_ms']},{r['tipo']},{r['periodo_ms']}\n")
+            f.write(f"{r['iteration']},{r['detection_time_ms']},{r['detected_by']},"
+                    f"{r['tipo']},{r['periodo_ms']},{r['lease_ms']}\n")
 
-    json_file = f"results/E2_DDS_DEADLINE_{args.tipo}_{args.periodo}ms_summary.json"
+    json_file = csv_file.replace(".csv", "_summary.json")
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print("\nResultados:")
+    print(f"\nResultados:")
     print(f"Tempo médio de detecção: {summary['detection_mean_ms']:.2f}ms")
     print(f"Mediana:                 {summary['detection_median_ms']:.2f}ms")
     print(f"p95:                     {summary['detection_p95_ms']:.2f}ms")
+    print(f"Detecção por mecanismo:  {detected_by_counts}")
     print(f"Timeouts:                {timeout_count}/{args.n}")
     print(f"\nCSV: {csv_file}")
     print(f"JSON: {json_file}")
@@ -249,12 +305,14 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E2: Detecção de Falha - DDS DEADLINE")
+    parser = argparse.ArgumentParser(description="E2: Detecção de Falha - DDS DEADLINE + LIVELINESS")
     parser.add_argument("--periodo", type=int, default=1000,
-                        help="Período DEADLINE em ms (1000, 5000, 10000)")
+                        help="Período DEADLINE em ms (default: 1000)")
+    parser.add_argument("--lease", type=int, default=200,
+                        help="Lease LIVELINESS em ms (0=disabled, default: 200)")
     parser.add_argument("--tipo", choices=["kill9", "sigterm", "deadlock"], default="kill9",
                         help="Tipo de falha")
-    parser.add_argument("--n", type=int, default=50, help="Número de iterações")
+    parser.add_argument("--n", type=int, default=10, help="Número de iterações")
     parser.add_argument("--domain", type=int, default=0, help="DDS Domain ID")
 
     args = parser.parse_args()

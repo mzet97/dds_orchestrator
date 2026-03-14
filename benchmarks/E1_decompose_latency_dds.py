@@ -60,24 +60,19 @@ class LatencyDecomposerDDS:
         t1_end = time.perf_counter_ns()
         T1 = (t1_end - t1_start) / 1e6  # ms
 
-        # T2+T3+T4+T5: round-trip completo (envio + fila + inferência + retorno)
-        t2_start = time.perf_counter_ns()
+        # T_rtt: round-trip completo (serialização + envio + fila + inferência + retorno + deserialização)
+        t_rtt_start = time.perf_counter_ns()
         response_text = ""
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
                 data=serialized,
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=60)
+                timeout=aiohttp.ClientTimeout(total=120)
             ) as resp:
-                # T3+T4+T5 começa quando o request chega ao servidor
-                t345_start = time.perf_counter_ns()
                 response_text = await resp.text()
-                t345_end = time.perf_counter_ns()
-                T3_plus_T4_plus_T5 = (t345_end - t345_start) / 1e6  # ms
-
-        t2_end = time.perf_counter_ns()
-        T2 = max((t2_end - t2_start) / 1e6 - T3_plus_T4_plus_T5, 0.001)  # ms (envio puro)
+        t_rtt_end = time.perf_counter_ns()
+        T_rtt = (t_rtt_end - t_rtt_start) / 1e6  # ms
 
         # T6: Deserialização
         t6_start = time.perf_counter_ns()
@@ -91,23 +86,23 @@ class LatencyDecomposerDDS:
         t6_end = time.perf_counter_ns()
         T6 = (t6_end - t6_start) / 1e6  # ms
 
-        # Estimativas de T3 e T5 (não separáveis sem instrumentação do agente)
-        # DDS usa UDP: T5 DDS < T5 HTTP (sem TCP teardown)
-        T3 = 0.1    # ms - fila localhost estimada
-        T5 = 0.01   # ms - retorno UDP DDS (< 0.1ms TCP HTTP)
-        T4 = max(T3_plus_T4_plus_T5 - T3 - T5, 0.0)  # inferência dominante
+        # T4: Inferência real (reportada pelo servidor no campo processing_time_ms)
+        T4 = response_json.get("processing_time_ms", 0)
 
-        T_total = T1 + T2 + T3_plus_T4_plus_T5 + T6
+        # T_transport: overhead de transporte = round-trip - inferência
+        T_transport = max(T_rtt - T4, 0)
+
+        T_total = T1 + T_rtt + T6  # Total wall-clock incluindo serialização
 
         return {
             "T1_serialization_ms": T1,
-            "T2_transport_send_ms": T2,
-            "T3_queue_ms": T3,
+            "T2_transport_send_ms": T_transport / 2,  # estimativa: metade ida, metade volta
+            "T3_queue_ms": 0,  # incluído em T_transport
             "T4_inference_ms": T4,
-            "T5_transport_return_ms": T5,
+            "T5_transport_return_ms": T_transport / 2,
             "T6_deserialization_ms": T6,
-            "T_total_ms": T_total,
-            "transport_overhead_pct": ((T2 + T5) / T_total) * 100 if T_total > 0 else 0
+            "T_total_ms": T_rtt,  # round-trip é o total real
+            "transport_overhead_pct": (T_transport / T_rtt * 100) if T_rtt > 0 else 0
         }
 
 
@@ -154,7 +149,8 @@ async def run_benchmark(args):
                "T4_inference_ms", "T5_transport_return_ms", "T6_deserialization_ms",
                "T_total_ms", "transport_overhead_pct"]
 
-    summary = {"protocol": "DDS", "model": args.model, "prompt_type": args.prompt_type, "n": len(results)}
+    protocol_label = args.protocol_label
+    summary = {"protocol": protocol_label, "model": args.model, "prompt_type": args.prompt_type, "n": len(results)}
 
     for m in metrics:
         values = [r[m] for r in results if m in r]
@@ -168,7 +164,7 @@ async def run_benchmark(args):
             summary[f"{m}_max"] = round(max(values), 4)
 
     # Salvar CSV
-    csv_file = f"results/E1_DDS_{args.model}_{args.prompt_type}.csv"
+    csv_file = f"results/E1_{protocol_label}_{args.model}_{args.prompt_type}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
@@ -177,7 +173,7 @@ async def run_benchmark(args):
             f.write(",".join([str(r.get(m, 0)) for m in ["iteration"] + metrics]) + "\n")
 
     # Salvar JSON summary
-    json_file = f"results/E1_DDS_{args.model}_{args.prompt_type}_summary.json"
+    json_file = f"results/E1_{protocol_label}_{args.model}_{args.prompt_type}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -198,6 +194,7 @@ def main():
     parser.add_argument("--prompt", dest="prompt_type", choices=["short", "long"], default="short",
                         help="Tipo de prompt")
     parser.add_argument("--n", type=int, default=100, help="Número de iterações")
+    parser.add_argument("--protocol-label", default="DDS", help="Label do protocolo para nomes de arquivos (DDS, gRPC, HTTP)")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

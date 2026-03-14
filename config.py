@@ -29,6 +29,10 @@ class OrchestratorConfig:
     max_concurrent_tasks: int = 50
     task_timeout_seconds: int = 120
 
+    # gRPC settings
+    grpc_enabled: bool = False
+    grpc_port: int = 50052  # orchestrator gRPC listen port
+
     # Logging
     log_level: str = "INFO"
 
@@ -51,6 +55,8 @@ class OrchestratorConfig:
         "default_model": str,
         "default_max_tokens": int,
         "default_temperature": float,
+        "grpc_enabled": bool,
+        "grpc_port": int,
     }
 
     def load_from_file(self, config_path: Path):

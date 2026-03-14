@@ -1,0 +1,416 @@
+"""
+gRPC Communication Layer for the Orchestrator.
+Mirrors DDSLayer (dds.py) interface for fair protocol comparison.
+
+Uses grpc.aio for native asyncio integration with the aiohttp server.
+"""
+
+import asyncio
+import json
+import logging
+import time
+from typing import Dict, Optional, Callable, Any
+from dataclasses import dataclass
+
+import grpc
+import grpc.aio
+
+logger = logging.getLogger(__name__)
+
+# Import generated stubs lazily
+_stubs_loaded = False
+_pb2 = None
+_pb2_grpc = None
+
+
+def _ensure_stubs():
+    """Load generated protobuf stubs on first use."""
+    global _stubs_loaded, _pb2, _pb2_grpc
+    if _stubs_loaded:
+        return True
+    try:
+        from proto import orchestrator_pb2 as pb2
+        from proto import orchestrator_pb2_grpc as pb2_grpc
+        _pb2 = pb2
+        _pb2_grpc = pb2_grpc
+        _stubs_loaded = True
+        return True
+    except ImportError as e:
+        logger.warning(f"gRPC stubs not available: {e}. Run: "
+                       "python -m grpc_tools.protoc -I proto --python_out=proto "
+                       "--grpc_python_out=proto proto/orchestrator.proto")
+        return False
+
+
+@dataclass
+class AgentTaskRequest:
+    """Task request to agent — mirrors dds.AgentTaskRequest"""
+    task_id: str
+    requester_id: str
+    task_type: str
+    messages: list
+    priority: int
+    timeout_ms: int
+    requires_context: bool
+    stream: bool = False
+
+
+@dataclass
+class AgentTaskResponse:
+    """Task response from agent — mirrors dds.AgentTaskResponse"""
+    task_id: str
+    agent_id: str
+    content: str
+    is_final: bool
+    prompt_tokens: int
+    completion_tokens: int
+    processing_time_ms: int
+    success: bool
+    error_message: Optional[str] = None
+
+
+class GRPCLayer:
+    """gRPC communication layer — same interface as DDSLayer.
+
+    The orchestrator uses this to communicate with agents via gRPC
+    instead of DDS pub/sub topics.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.grpc_available = False
+
+        # Per-task waiters: task_id -> (asyncio.Event, [result])
+        self._pending_agent_responses: Dict[str, Any] = {}
+
+        # Agent channels: agent_id -> grpc.aio.Channel
+        self._agent_channels: Dict[str, grpc.aio.Channel] = {}
+        # Agent stubs: agent_id -> stub
+        self._agent_stubs: Dict[str, Any] = {}
+
+        # Server for receiving connections from agents
+        self._server = None
+        self._port = getattr(config, "grpc_port", 50052)
+
+        if getattr(config, "grpc_enabled", False):
+            self._init_grpc()
+
+    def _init_grpc(self):
+        """Initialize gRPC"""
+        if not _ensure_stubs():
+            logger.warning("gRPC stubs not available, gRPC layer disabled")
+            return
+
+        self.grpc_available = True
+        logger.info(f"gRPC layer initialized (port {self._port})")
+
+    async def start(self):
+        """Start gRPC server for receiving agent connections."""
+        if not self.grpc_available:
+            return
+
+        # Start gRPC server (agents connect to orchestrator)
+        self._server = grpc.aio.server()
+        servicer_cls = _make_servicer_class()
+        _pb2_grpc.add_OrchestratorAgentServiceServicer_to_server(
+            servicer_cls(self), self._server
+        )
+        listen_addr = f"0.0.0.0:{self._port}"
+        self._server.add_insecure_port(listen_addr)
+        await self._server.start()
+        logger.info(f"gRPC server started on {listen_addr}")
+
+    async def stop(self):
+        """Stop gRPC server and close channels."""
+        if self._server:
+            await self._server.stop(grace=5)
+            self._server = None
+
+        for channel in self._agent_channels.values():
+            await channel.close()
+        self._agent_channels.clear()
+        self._agent_stubs.clear()
+        self.grpc_available = False
+        logger.info("gRPC layer stopped")
+
+    def _get_or_create_stub(self, agent_id: str, agent_url: str):
+        """Get or create a gRPC stub for an agent."""
+        if agent_id in self._agent_stubs:
+            return self._agent_stubs[agent_id]
+
+        # Extract host:port from agent URL
+        # agent_url is like "http://host:port" or "host:port"
+        addr = agent_url.replace("http://", "").replace("https://", "")
+        # Use gRPC port (agent's gRPC port, typically agent_http_port + 1000 or configured)
+        # For now, use the address as-is (agent should expose gRPC on a known port)
+
+        channel = grpc.aio.insecure_channel(addr)
+        stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
+        self._agent_channels[agent_id] = channel
+        self._agent_stubs[agent_id] = stub
+        logger.info(f"Created gRPC stub for agent {agent_id} at {addr}")
+        return stub
+
+    def prepare_agent_response_waiter(self, task_id: str):
+        """Pre-register a waiter for the given task_id.
+        Mirrors DDSLayer.prepare_agent_response_waiter().
+        """
+        if task_id not in self._pending_agent_responses:
+            event = asyncio.Event()
+            result_container = [None]
+            self._pending_agent_responses[task_id] = (event, result_container)
+
+    def prepare_stream_waiter(self, task_id: str):
+        """Pre-register a streaming waiter for the given task_id.
+        Mirrors DDSLayer.prepare_stream_waiter().
+        """
+        key = f"stream_{task_id}"
+        if key not in self._pending_agent_responses:
+            event = asyncio.Event()
+            chunks = []  # list of chunk dicts
+            self._pending_agent_responses[key] = (event, chunks)
+
+    async def stream_agent_response(self, task_id: str, timeout_ms: int = 120000):
+        """Async generator that yields individual response chunks from agent.
+        Mirrors DDSLayer.stream_agent_response().
+        """
+        key = f"stream_{task_id}"
+        if key not in self._pending_agent_responses:
+            self.prepare_stream_waiter(task_id)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout_ms / 1000)
+
+        while loop.time() < deadline:
+            if key in self._pending_agent_responses:
+                _, chunks = self._pending_agent_responses[key]
+                while chunks:
+                    chunk = chunks.pop(0)
+                    yield chunk
+                    if chunk.get("is_final", False):
+                        self._pending_agent_responses.pop(key, None)
+                        return
+            await asyncio.sleep(0.001)  # 1ms polling
+
+        # Timeout
+        self._pending_agent_responses.pop(key, None)
+        yield {"content": "", "is_final": True, "error": "timeout"}
+
+    async def publish_agent_request(self, request: AgentTaskRequest,
+                                     agent_id: str = None,
+                                     agent_grpc_url: str = None):
+        """Send task request to agent via gRPC.
+
+        Unlike DDS pub/sub, gRPC requires a direct connection to the agent.
+        The agent_id and agent_grpc_url are used to find/create the stub.
+        """
+        if not self.grpc_available:
+            logger.warning("gRPC not available, cannot send request")
+            return
+
+        if not agent_grpc_url:
+            logger.error("agent_grpc_url required for gRPC publish_agent_request")
+            return
+
+        stub = self._get_or_create_stub(agent_id or "unknown", agent_grpc_url)
+
+        # Convert to protobuf
+        proto_req = _pb2.AgentTaskRequest(
+            task_id=request.task_id,
+            requester_id=request.requester_id,
+            task_type=request.task_type,
+            priority=request.priority,
+            timeout_ms=request.timeout_ms,
+            requires_context=request.requires_context,
+            stream=request.stream,
+        )
+        for msg in request.messages:
+            proto_msg = proto_req.messages.add()
+            proto_msg.role = msg.get("role", "user")
+            proto_msg.content = msg.get("content", "")
+
+        try:
+            if request.stream:
+                # Server-streaming — forward chunks to stream waiter if present
+                stream_key = f"stream_{request.task_id}"
+                response_stream = stub.StreamTask(proto_req)
+
+                if stream_key in self._pending_agent_responses:
+                    # Per-chunk forwarding (SSE streaming path)
+                    async for proto_resp in response_stream:
+                        _, chunks = self._pending_agent_responses.get(stream_key, (None, []))
+                        chunk = {
+                            "content": proto_resp.content,
+                            "is_final": bool(proto_resp.is_final),
+                            "prompt_tokens": proto_resp.prompt_tokens,
+                            "completion_tokens": proto_resp.completion_tokens,
+                            "processing_time_ms": proto_resp.processing_time_ms,
+                        }
+                        chunks.append(chunk)
+                        if proto_resp.is_final:
+                            break
+                else:
+                    # Accumulate all content (non-SSE path)
+                    accumulated_content = ""
+                    async for proto_resp in response_stream:
+                        accumulated_content += proto_resp.content
+                        if proto_resp.is_final:
+                            result = AgentTaskResponse(
+                                task_id=proto_resp.task_id,
+                                agent_id=proto_resp.agent_id,
+                                content=accumulated_content,
+                                is_final=True,
+                                prompt_tokens=proto_resp.prompt_tokens,
+                                completion_tokens=proto_resp.completion_tokens,
+                                processing_time_ms=proto_resp.processing_time_ms,
+                                success=proto_resp.success,
+                                error_message=proto_resp.error_message or None,
+                            )
+                            self._resolve_waiter(request.task_id, result)
+            else:
+                # Unary
+                proto_resp = await stub.SubmitTask(proto_req)
+                result = AgentTaskResponse(
+                    task_id=proto_resp.task_id,
+                    agent_id=proto_resp.agent_id,
+                    content=proto_resp.content,
+                    is_final=proto_resp.is_final,
+                    prompt_tokens=proto_resp.prompt_tokens,
+                    completion_tokens=proto_resp.completion_tokens,
+                    processing_time_ms=proto_resp.processing_time_ms,
+                    success=proto_resp.success,
+                    error_message=proto_resp.error_message or None,
+                )
+                self._resolve_waiter(request.task_id, result)
+
+        except grpc.aio.AioRpcError as e:
+            logger.error(f"gRPC request failed for task {request.task_id}: {e.code()} {e.details()}")
+            result = AgentTaskResponse(
+                task_id=request.task_id,
+                agent_id=agent_id or "unknown",
+                content="",
+                is_final=True,
+                prompt_tokens=0,
+                completion_tokens=0,
+                processing_time_ms=0,
+                success=False,
+                error_message=f"gRPC error: {e.code()} {e.details()}",
+            )
+            self._resolve_waiter(request.task_id, result)
+
+    def _resolve_waiter(self, task_id: str, result):
+        """Resolve a pending waiter with a result."""
+        if task_id in self._pending_agent_responses:
+            event, container = self._pending_agent_responses[task_id]
+            container[0] = result
+            event.set()
+
+    async def wait_for_agent_response(self, task_id: str, timeout_ms: int = 60000) -> dict:
+        """Wait for a specific agent response by task_id.
+        Mirrors DDSLayer.wait_for_agent_response().
+        """
+        if not self.grpc_available:
+            logger.warning("gRPC not available, cannot wait for response")
+            return {"content": "", "error": "gRPC not available"}
+
+        if task_id in self._pending_agent_responses:
+            event, result_container = self._pending_agent_responses[task_id]
+        else:
+            event = asyncio.Event()
+            result_container = [None]
+            self._pending_agent_responses[task_id] = (event, result_container)
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout_ms / 1000.0)
+            result = result_container[0]
+            if result is None:
+                return {"content": "", "error": "No response received"}
+            # Convert AgentTaskResponse to dict for compatibility
+            if isinstance(result, AgentTaskResponse):
+                return {
+                    "task_id": result.task_id,
+                    "agent_id": result.agent_id,
+                    "content": result.content,
+                    "is_final": result.is_final,
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "processing_time_ms": result.processing_time_ms,
+                    "success": result.success,
+                    "error_message": result.error_message,
+                }
+            return result
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for gRPC response for task {task_id}")
+            return {"content": "", "error": "Timeout waiting for response"}
+        finally:
+            self._pending_agent_responses.pop(task_id, None)
+
+    async def dispatch_agent_responses(self):
+        """Background loop — for gRPC this is a no-op since responses arrive
+        via direct RPC calls (not pub/sub polling). Kept for interface compatibility.
+        """
+        while True:
+            await asyncio.sleep(3600)  # effectively idle
+
+    # HTTP Fallback (reused from DDSLayer)
+    async def send_request_via_http(self, agent_url: str, request: dict,
+                                     timeout: int = 120) -> dict:
+        """Send request via HTTP fallback"""
+        import aiohttp
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{agent_url}/generate",
+                    json=request,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    return await response.json()
+        except Exception as e:
+            logger.error(f"HTTP request failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def is_available(self) -> bool:
+        """Check if gRPC is available"""
+        return self.grpc_available
+
+    def close(self):
+        """Synchronous close (for cleanup)."""
+        self._agent_stubs.clear()
+        self._agent_channels.clear()
+        self.grpc_available = False
+
+
+def _make_servicer_class():
+    """Create the servicer class after stubs are loaded."""
+    class _OrchestratorServicer(_pb2_grpc.OrchestratorAgentServiceServicer):
+        """gRPC server-side handler for agents connecting to orchestrator.
+
+        In the current architecture, the orchestrator calls agents (client mode).
+        This servicer handles the reverse direction if agents push responses.
+        """
+
+        def __init__(self, layer: GRPCLayer):
+            self._layer = layer
+
+        async def Heartbeat(self, request, context):
+            """Handle agent heartbeat."""
+            logger.debug(f"Heartbeat from agent {request.agent_id}: state={request.state}")
+            return _pb2.HeartbeatResponse(
+                acknowledged=True,
+                message="OK"
+            )
+
+        async def SubmitTask(self, request, context):
+            """Handle task submission from agent (reverse direction)."""
+            # Not used in current flow — orchestrator is the one calling agents
+            return _pb2.AgentTaskResponse(
+                task_id=request.task_id,
+                agent_id="orchestrator",
+                content="",
+                is_final=True,
+                success=False,
+                error_message="Orchestrator does not accept tasks via gRPC",
+            )
+
+    return _OrchestratorServicer

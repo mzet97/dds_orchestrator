@@ -61,7 +61,7 @@ class ScalabilityBenchmarkDDS:
                     "messages": [{"role": "user", "content": "O que e 2+2?"}],
                     "max_tokens": 20
                 },
-                timeout=aiohttp.ClientTimeout(total=120)
+                timeout=aiohttp.ClientTimeout(total=300)
             ) as resp:
                 await resp.text()
                 end = time.perf_counter()
@@ -78,15 +78,20 @@ class ScalabilityBenchmarkDDS:
                 "error": str(e)
             }
 
-    async def run_concurrent(self, num_clientes: int, n_per_client: int) -> List[Dict]:
-        """Executa num_clientes × n_per_client requisições concorrentes."""
+    async def run_concurrent(self, num_clientes: int, n_per_client: int):
+        """Executa num_clientes × n_per_client requisições concorrentes.
+
+        Returns: (results, wall_time_s) tuple
+        """
         total = num_clientes * n_per_client
 
+        wall_start = time.perf_counter()
         async with aiohttp.ClientSession() as session:
             tasks = [self._single_request(session) for _ in range(total)]
             results = await asyncio.gather(*tasks)
+        wall_end = time.perf_counter()
 
-        return list(results)
+        return list(results), wall_end - wall_start
 
     def get_orchestrador_resources(self) -> Dict:
         """Captura CPU e memória do processo orquestrador."""
@@ -109,7 +114,7 @@ class ScalabilityBenchmarkDDS:
 
 def compute_summary(protocol: str, phase: str, num_agentes: int,
                     num_clientes: int, results: List[Dict],
-                    resources: Dict) -> Dict:
+                    resources: Dict, wall_time_s: float = 0) -> Dict:
     """Calcula métricas estatísticas de uma rodada."""
     latencies = sorted([r["latency_ms"] for r in results if r.get("success")])
     successes = len(latencies)
@@ -118,8 +123,8 @@ def compute_summary(protocol: str, phase: str, num_agentes: int,
     if not latencies:
         return {"error": "nenhuma requisição bem-sucedida"}
 
-    # Throughput: requisições bem-sucedidas / tempo da requisição mais longa
-    throughput = successes / (latencies[-1] / 1000.0) if latencies[-1] > 0 else 0
+    # Throughput: requisições bem-sucedidas / wall-clock time
+    throughput = successes / wall_time_s if wall_time_s > 0 else 0
 
     return {
         "protocol": protocol,
@@ -146,6 +151,7 @@ async def run_benchmark(args):
     num_agentes = len(agentes)
     phase = "A" if num_agentes == 1 else "B" if num_agentes == 2 else f"{num_agentes}ag"
 
+    protocol_label = args.protocol_label
     benchmark = ScalabilityBenchmarkDDS(
         orchestrador_url=args.orchestrador,
         agentes=agentes
@@ -169,7 +175,7 @@ async def run_benchmark(args):
         resources_before = benchmark.get_orchestrador_resources()
 
         # Executar rodada
-        results = await benchmark.run_concurrent(num_clientes, args.n)
+        results, wall_time_s = await benchmark.run_concurrent(num_clientes, args.n)
 
         resources_after = benchmark.get_orchestrador_resources()
         resources = {
@@ -178,12 +184,13 @@ async def run_benchmark(args):
         }
 
         summary = compute_summary(
-            protocol="DDS",
+            protocol=protocol_label,
             phase=phase,
             num_agentes=num_agentes,
             num_clientes=num_clientes,
             results=results,
-            resources=resources
+            resources=resources,
+            wall_time_s=wall_time_s,
         )
         all_summaries.append(summary)
 
@@ -194,7 +201,7 @@ async def run_benchmark(args):
         print(f"  Sucesso: {summary.get('successful_requests', 0)}/{summary.get('total_requests', 0)}")
 
         # Salvar CSV desta rodada
-        csv_file = f"results/E4_DDS_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
+        csv_file = f"results/E4_{protocol_label}_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
         with open(csv_file, "w") as f:
             f.write("latency_ms,success\n")
             for r in results:
@@ -204,7 +211,7 @@ async def run_benchmark(args):
         await asyncio.sleep(2.0)
 
     # Salvar JSON consolidado
-    json_file = f"results/E4_DDS_fase{phase}_{num_agentes}ag_summary.json"
+    json_file = f"results/E4_{protocol_label}_fase{phase}_{num_agentes}ag_summary.json"
     with open(json_file, "w") as f:
         json.dump(all_summaries, f, indent=2)
 
@@ -229,6 +236,7 @@ def main():
                              "1 agente = Fase A, 2 agentes = Fase B")
     parser.add_argument("--n", type=int, default=50,
                         help="Requisições por cliente por configuração")
+    parser.add_argument("--protocol-label", default="DDS", help="Label do protocolo para nomes de arquivos")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

@@ -1,92 +1,88 @@
 #!/usr/bin/env python3
 """
-E5: Streaming Token-a-Token - gRPC Server Streaming
-====================================================
-Mede TTFT (Time-to-First-Token) e ITL (Inter-Token Latency) via gRPC streaming.
-
-Requer: servidor gRPC rodando (_grpc_server.py --backend http://... --port 50051)
+E5: Streaming Token-a-Token - gRPC Nativo (StreamChat RPC)
+===========================================================
+Mede TTFT (Time-to-First-Token) e ITL (Inter-Token Latency) via gRPC nativo
+usando LlamaService.StreamChat server-streaming RPC.
 
 Arquitetura medida:
-    Cliente → gRPC server streaming → _grpc_server.py → HTTP SSE → llama-server
+    Cliente → gRPC StreamChat (protobuf) → llama-server (--enable-grpc)
 
-Cada token do llama-server é encaminhado como um StreamChunk gRPC separado,
-permitindo medir ITL genuíno no nível do protocolo gRPC.
+Conexão direta ao llama-server. Cada token é um ChatCompletionResponse protobuf
+com is_final=false, até o último chunk com is_final=true.
 
 Métricas:
-  TTFT = tempo até receber o primeiro StreamChunk com token (ms)
-  ITL  = tempo entre StreamChunks consecutivos (ms)
+  TTFT = tempo até receber o primeiro ChatCompletionResponse com content não-vazio (ms)
+  ITL  = tempo entre ChatCompletionResponses consecutivos (ms)
 
 Usage:
-    python _grpc_server.py --backend http://192.168.1.60:8082 --port 50051 &
-    python E5_streaming_grpc.py --endpoint 192.168.1.60:50051 --model phi4-mini --n 50
+    python E5_streaming_grpc.py --endpoint localhost:50051 --model phi4-mini --n 50
 """
 
 import argparse
 import asyncio
 import json
+import sys
 import time
 import statistics
+import uuid
 from pathlib import Path
 from typing import Dict, List
+
 import grpc
 
-
-def _json_serialize(obj: dict) -> bytes:
-    return json.dumps(obj).encode("utf-8")
-
-
-def _json_deserialize(data: bytes) -> dict:
-    return json.loads(data.decode("utf-8"))
+sys.path.insert(0, str(Path(__file__).parent))
+from proto import llama_service_pb2
+from proto import llama_service_pb2_grpc
 
 
 class StreamingBenchmarkGRPC:
-    """Benchmark de streaming token-a-token via gRPC server streaming."""
+    """Benchmark de streaming token-a-token via gRPC nativo StreamChat RPC."""
 
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
-        self._channel = grpc.insecure_channel(endpoint)
-        # gRPC unary-to-server-streaming stub
-        self._stream_stub = self._channel.unary_stream(
-            "/LLMService/StreamChat",
-            request_serializer=_json_serialize,
-            response_deserializer=_json_deserialize,
+        self._channel = grpc.insecure_channel(
+            endpoint,
+            options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
         )
+        self._stub = llama_service_pb2_grpc.LlamaServiceStub(self._channel)
 
     def close(self):
         self._channel.close()
 
     def measure_streaming(self, model: str, prompt: str, max_tokens: int = 200) -> Dict:
         """
-        Mede TTFT e ITL com gRPC server streaming.
-        Síncrono para precisão de medição de timestamps.
+        Mede TTFT e ITL com gRPC nativo StreamChat RPC.
+        Síncrono para precisão de timestamps.
         """
         ttft = None
         itl_list = []
         total_tokens = 0
         previous_time = None
 
-        payload = {
-            "model": model,
-            "content": prompt,
-            "max_tokens": max_tokens
-        }
+        request = llama_service_pb2.ChatCompletionRequest(
+            request_id=str(uuid.uuid4()),
+            model=model,
+            messages=[llama_service_pb2.ChatMessage(role="user", content=prompt)],
+            max_tokens=max_tokens,
+            stream=True,
+        )
 
         start = time.perf_counter()
 
         try:
-            stream = self._stream_stub(payload, timeout=120)
+            stream = self._stub.StreamChat(request, timeout=120)
 
-            for chunk in stream:
-                if chunk.get("error"):
-                    return {"error": chunk["error"]}
-
+            for response in stream:
                 current_time = time.perf_counter()
 
-                if chunk.get("done", False):
+                # Fim do stream
+                if response.is_final:
                     break
 
-                token = chunk.get("token", "")
-                if not token:
+                # Pular chunks sem conteúdo
+                content = response.content
+                if not content:
                     continue
 
                 # Primeiro token = TTFT
@@ -126,7 +122,7 @@ class StreamingBenchmarkGRPC:
 
 
 async def run_benchmark(args):
-    """Executa benchmark de streaming gRPC."""
+    """Executa benchmark de streaming gRPC nativo."""
 
     endpoint = args.endpoint
     if endpoint.startswith("http"):
@@ -134,10 +130,9 @@ async def run_benchmark(args):
         parsed = urlparse(endpoint)
         endpoint = f"{parsed.hostname}:{parsed.port or 50051}"
 
-    # Prompt padronizado conforme dissertação (~200 tokens)
     prompt = "Conte uma historia sobre um robo que aprende a sentir emocoes. Com pelo menos 200 palavras."
 
-    print(f"E5: Streaming Token-a-Token - gRPC")
+    print(f"E5: Streaming Token-a-Token - gRPC Nativo (StreamChat RPC)")
     print(f"Endpoint: {endpoint}")
     print(f"Modelo: {args.model}")
     print(f"Iterações: {args.n}")
@@ -175,7 +170,7 @@ async def run_benchmark(args):
         benchmark.close()
 
     if not results:
-        print("Nenhum resultado coletado. Verifique se _grpc_server.py está rodando.")
+        print("Nenhum resultado coletado. Verifique se llama-server com --enable-grpc está rodando.")
         return None
 
     ttft_values = [r["ttft_ms"] for r in results]
@@ -184,7 +179,7 @@ async def run_benchmark(args):
     tokens_values = [r["tokens"] for r in results]
 
     summary = {
-        "protocol": "gRPC_STREAMING",
+        "protocol": "gRPC_NATIVE_STREAMING",
         "model": args.model,
         "endpoint": endpoint,
         "n": len(results),
@@ -207,7 +202,7 @@ async def run_benchmark(args):
         }
     }
 
-    csv_file = f"results/E5_gRPC_streaming_{args.model}.csv"
+    csv_file = f"results/E5_gRPC_NATIVE_streaming_{args.model}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
@@ -216,7 +211,7 @@ async def run_benchmark(args):
             f.write(f"{r['iteration']},{r['ttft_ms']},{r['itl_mean_ms']},"
                     f"{r['itl_median_ms']},{r['itl_p99_ms']},{r['tokens']},{r['total_time_ms']}\n")
 
-    json_file = f"results/E5_gRPC_streaming_{args.model}_summary.json"
+    json_file = f"results/E5_gRPC_NATIVE_streaming_{args.model}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -231,9 +226,9 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - gRPC")
+    parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - gRPC Nativo")
     parser.add_argument("--endpoint", default="localhost:50051",
-                        help="Endereço do servidor gRPC")
+                        help="Endereço do llama-server gRPC")
     parser.add_argument("--url", dest="endpoint",
                         help="Alias para --endpoint (compatibilidade)")
     parser.add_argument("--model", default="phi4-mini")

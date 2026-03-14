@@ -160,7 +160,7 @@ async def run_benchmark(args):
     tokens_values = [r["tokens"] for r in results]
 
     summary = {
-        "protocol": "DDS_VIA_ORCHESTRADOR",
+        "protocol": f"{args.protocol_label}_VIA_ORCHESTRADOR",
         "model": args.model,
         "n": len(results),
         "ttft": {
@@ -182,7 +182,7 @@ async def run_benchmark(args):
     }
 
     # Salvar CSV - nome distinto para DDS
-    csv_file = f"results/E5_DDS_VIA_ORCH_streaming_{args.model}.csv"
+    csv_file = f"results/E5_{args.protocol_label}_VIA_ORCH_streaming_{args.model}.csv"
     Path("results").mkdir(exist_ok=True)
 
     with open(csv_file, "w") as f:
@@ -191,7 +191,7 @@ async def run_benchmark(args):
             f.write(f"{r['iteration']},{r['ttft_ms']},{r['itl_mean_ms']},{r['itl_median_ms']},{r['itl_p99_ms']},{r['tokens']},{r['total_time_ms']}\n")
 
     # Salvar JSON
-    json_file = f"results/E5_DDS_VIA_ORCH_streaming_{args.model}_summary.json"
+    json_file = f"results/E5_{args.protocol_label}_VIA_ORCH_streaming_{args.model}_summary.json"
     with open(json_file, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -210,6 +210,7 @@ def main():
     parser.add_argument("--model", default="phi4-mini", help="Modelo a usar")
     parser.add_argument("--url", default="http://localhost:8080", help="URL do orquestrador DDS")
     parser.add_argument("--n", type=int, default=50, help="Numero de iteracoes")
+    parser.add_argument("--protocol-label", default="DDS", help="Label do protocolo para nomes de arquivos")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

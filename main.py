@@ -37,6 +37,10 @@ async def main():
     parser.add_argument("--log-level", type=str, default=None,
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="Log level")
+    parser.add_argument("--grpc-enabled", action="store_true", default=None,
+                       help="Enable gRPC transport")
+    parser.add_argument("--grpc-port", type=int, default=None,
+                       help="gRPC listen port (default: 50052)")
 
     args = parser.parse_args()
 
@@ -57,12 +61,20 @@ async def main():
             config.dds_domain = args.dds_domain
         if args.log_level is not None:
             config.log_level = args.log_level
+        if args.grpc_enabled is not None:
+            config.grpc_enabled = args.grpc_enabled
+        if args.grpc_port is not None:
+            config.grpc_port = args.grpc_port
     else:
         config = load_config_from_env()
         config.port = args.port if args.port is not None else config.port
         config.host = args.host if args.host is not None else config.host
         config.dds_domain = args.dds_domain if args.dds_domain is not None else config.dds_domain
         config.log_level = args.log_level if args.log_level is not None else config.log_level
+        if args.grpc_enabled is not None:
+            config.grpc_enabled = args.grpc_enabled
+        if args.grpc_port is not None:
+            config.grpc_port = args.grpc_port
 
     logger.info("=" * 60)
     logger.info("DDS-LLM Orchestrator Starting")
@@ -71,13 +83,22 @@ async def main():
     logger.info(f"Port: {config.port}")
     logger.info(f"DDS Domain: {config.dds_domain}")
     logger.info(f"DDS Enabled: {config.dds_enabled}")
+    logger.info(f"gRPC Enabled: {config.grpc_enabled}")
+    if config.grpc_enabled:
+        logger.info(f"gRPC Port: {config.grpc_port}")
     logger.info("=" * 60)
 
     # Initialize components
     registry = AgentRegistry(config)
     scheduler = TaskScheduler(config)
     dds_layer = DDSLayer(config)
-    selector = AgentSelector()  # Seletor de agentes especializados
+    selector = AgentSelector()
+
+    # Initialize gRPC layer if enabled
+    grpc_layer = None
+    if config.grpc_enabled:
+        from grpc_layer import GRPCLayer
+        grpc_layer = GRPCLayer(config)
 
     # Create server
     server = OrchestratorServer(
@@ -85,7 +106,8 @@ async def main():
         registry=registry,
         scheduler=scheduler,
         dds_layer=dds_layer,
-        selector=selector
+        selector=selector,
+        grpc_layer=grpc_layer,
     )
 
     # Start server

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-E4: Escalabilidade Multi-Agente - gRPC
-======================================
-Avalia throughput e latência com múltiplos clientes via gRPC.
+E4: Escalabilidade Multi-Agente - gRPC Nativo
+==============================================
+Avalia throughput e latência com múltiplos clientes via gRPC nativo (protobuf)
+conectando diretamente ao llama-server.
 
-Requer: servidor(es) gRPC rodando (_grpc_server.py --backend http://... --port 50051)
+Arquitetura medida:
+    Clientes → gRPC (protobuf) → llama-server(s) (--enable-grpc)
+
+Canais gRPC persistentes (HTTP/2 multiplexing) por agente.
 
 Design experimental (conforme dissertação):
   Fase A: 1 agente, clientes = 1, 2, 4, 8
@@ -12,9 +16,6 @@ Design experimental (conforme dissertação):
   N = 50 requisições por cliente por configuração
 
 Usage:
-    # Iniciar servidores gRPC nas VMs (VM1 e VM2):
-    python _grpc_server.py --backend http://localhost:8082 --port 50051
-
     # Fase A (1 agente):
     python E4_scalability_grpc.py --agentes 192.168.1.60:50051 --n 50
 
@@ -26,40 +27,39 @@ import argparse
 import asyncio
 import json
 import random
+import sys
 import time
 import statistics
-import psutil
+import uuid
 from pathlib import Path
 from typing import Dict, List
+
 import grpc
+import psutil
 
-
-def _json_serialize(obj: dict) -> bytes:
-    return json.dumps(obj).encode("utf-8")
-
-
-def _json_deserialize(data: bytes) -> dict:
-    return json.loads(data.decode("utf-8"))
+sys.path.insert(0, str(Path(__file__).parent))
+from proto import llama_service_pb2
+from proto import llama_service_pb2_grpc
 
 
 CLIENT_COUNTS = [1, 2, 4, 8]
 
 
 class ScalabilityBenchmarkGRPC:
-    """Benchmark de escalabilidade com gRPC."""
+    """Benchmark de escalabilidade com gRPC nativo (protobuf)."""
 
     def __init__(self, agentes: List[str]):
         self.agentes = agentes
-        # Canal por agente (reutilizado)
+        # Canal persistente por agente (reutilizado — HTTP/2 multiplexing)
         self._channels = {
-            addr: grpc.insecure_channel(addr) for addr in agentes
+            addr: grpc.insecure_channel(
+                addr,
+                options=[("grpc.max_receive_message_length", 64 * 1024 * 1024)],
+            )
+            for addr in agentes
         }
         self._stubs = {
-            addr: ch.unary_unary(
-                "/LLMService/Chat",
-                request_serializer=_json_serialize,
-                response_deserializer=_json_deserialize,
-            )
+            addr: llama_service_pb2_grpc.LlamaServiceStub(ch)
             for addr, ch in self._channels.items()
         }
 
@@ -68,16 +68,18 @@ class ScalabilityBenchmarkGRPC:
             ch.close()
 
     def _single_request(self, addr: str) -> Dict:
-        """Requisição síncrona ao servidor gRPC."""
+        """Requisição síncrona ao llama-server via gRPC nativo."""
         stub = self._stubs[addr]
-        payload = {
-            "model": "phi4-mini",
-            "content": "O que e 2+2?",
-            "max_tokens": 20
-        }
+        request = llama_service_pb2.ChatCompletionRequest(
+            request_id=str(uuid.uuid4()),
+            model="phi4-mini",
+            messages=[llama_service_pb2.ChatMessage(role="user", content="O que e 2+2?")],
+            max_tokens=20,
+            stream=False,
+        )
         start = time.perf_counter()
         try:
-            stub(payload, timeout=120)
+            stub.Chat(request, timeout=120)
             end = time.perf_counter()
             return {"success": True, "latency_ms": (end - start) * 1000}
         except grpc.RpcError as e:
@@ -104,7 +106,6 @@ async def run_benchmark(args):
     """Executa benchmark E4 completo (Fase A e Fase B)."""
 
     raw_agentes = [a.strip() for a in args.agentes.split(",") if a.strip()]
-    # Normalizar: remover prefixo http:// se presente
     agentes = []
     for a in raw_agentes:
         if a.startswith("http"):
@@ -119,7 +120,7 @@ async def run_benchmark(args):
 
     benchmark = ScalabilityBenchmarkGRPC(agentes)
 
-    print(f"E4: Escalabilidade Multi-Agente - gRPC")
+    print(f"E4: Escalabilidade Multi-Agente - gRPC Nativo (protobuf)")
     print(f"Agentes ({num_agentes}): {agentes}")
     print(f"Fase: {phase}")
     print(f"Configurações de clientes: {CLIENT_COUNTS}")
@@ -147,7 +148,7 @@ async def run_benchmark(args):
             throughput = successes / (latencies[-1] / 1000.0) if latencies[-1] > 0 else 0
 
             summary = {
-                "protocol": "gRPC",
+                "protocol": "gRPC_NATIVE",
                 "phase": phase,
                 "num_agentes": num_agentes,
                 "num_clientes": num_clientes,
@@ -170,7 +171,7 @@ async def run_benchmark(args):
                   f"p99: {summary['latency_p99_ms']:.2f}ms")
             print(f"  Sucesso: {successes}/{total}")
 
-            csv_file = f"results/E4_gRPC_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
+            csv_file = f"results/E4_gRPC_NATIVE_fase{phase}_{num_agentes}ag_{num_clientes}cl.csv"
             with open(csv_file, "w") as f:
                 f.write("latency_ms,success\n")
                 for r in results:
@@ -181,7 +182,7 @@ async def run_benchmark(args):
     finally:
         benchmark.close()
 
-    json_file = f"results/E4_gRPC_fase{phase}_{num_agentes}ag_summary.json"
+    json_file = f"results/E4_gRPC_NATIVE_fase{phase}_{num_agentes}ag_summary.json"
     with open(json_file, "w") as f:
         json.dump(all_summaries, f, indent=2)
 
@@ -198,9 +199,9 @@ async def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E4: Escalabilidade - gRPC")
+    parser = argparse.ArgumentParser(description="E4: Escalabilidade - gRPC Nativo")
     parser.add_argument("--agentes", default="localhost:50051",
-                        help="Endereços gRPC dos agentes separados por vírgula. "
+                        help="Endereços gRPC dos llama-servers separados por vírgula. "
                              "1 agente = Fase A, 2 agentes = Fase B")
     parser.add_argument("--n", type=int, default=50,
                         help="Requisições por cliente por configuração")

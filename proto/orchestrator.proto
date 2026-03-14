@@ -1,0 +1,58 @@
+// Orchestrator ↔ Agent gRPC service
+// Mirrors the DDS topics: agent/request, agent/response, agent/status
+
+syntax = "proto3";
+package orchestrator_grpc;
+
+message ChatMessage {
+    string role    = 1;
+    string content = 2;
+}
+
+message AgentTaskRequest {
+    string              task_id         = 1;
+    string              requester_id    = 2;
+    string              task_type       = 3;
+    repeated ChatMessage messages       = 4;
+    int32               priority        = 5;
+    int32               timeout_ms      = 6;
+    bool                requires_context = 7;
+    bool                stream          = 8;
+}
+
+message AgentTaskResponse {
+    string task_id            = 1;
+    string agent_id           = 2;
+    string content            = 3;
+    bool   is_final           = 4;
+    int32  prompt_tokens      = 5;
+    int32  completion_tokens  = 6;
+    int32  processing_time_ms = 7;
+    bool   success            = 8;
+    string error_message      = 9;
+}
+
+message HeartbeatRequest {
+    string agent_id       = 1;
+    string state          = 2;  // idle, busy, error
+    int32  current_slots  = 3;
+    int32  memory_usage_mb = 4;
+}
+
+message HeartbeatResponse {
+    bool   acknowledged = 1;
+    string message      = 2;
+}
+
+message Empty {}
+
+service OrchestratorAgentService {
+    // Unary task submission
+    rpc SubmitTask(AgentTaskRequest) returns (AgentTaskResponse);
+
+    // Server-streaming task submission
+    rpc StreamTask(AgentTaskRequest) returns (stream AgentTaskResponse);
+
+    // Heartbeat
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
