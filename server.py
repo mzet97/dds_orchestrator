@@ -113,7 +113,7 @@ class OrchestratorServer:
         # Start gRPC layer if available
         if self.grpc and self.grpc.is_available():
             # Wire client request handler so gRPC clients can submit tasks
-            self.grpc._client_request_handler = self._process_grpc_client_request
+            self.grpc._client_request_handler = self._process_grpc_client_request_sync
             await self.grpc.start()
             self._grpc_dispatch_task = asyncio.create_task(self.grpc.dispatch_agent_responses())
 
@@ -328,72 +328,63 @@ class OrchestratorServer:
 
         await self.dds.publish_client_response(response)
 
-    async def _process_grpc_client_request(self, request_id, messages, model="",
-                                            max_tokens=50, temperature=0.7,
-                                            priority=5, timeout_ms=120000,
-                                            stream=False) -> dict:
-        """Process a client request arriving via gRPC.
+    def _process_grpc_client_request_sync(self, request_id, messages, model="",
+                                          max_tokens=50, temperature=0.7,
+                                          priority=5, timeout_ms=120000,
+                                          stream=False) -> dict:
+        """Process a client request arriving via gRPC — fully synchronous.
 
-        Called by the ClientOrchestratorService.Chat handler in grpc_layer.py.
-        Routes: Client --gRPC--> Orchestrator --gRPC--> Agent --gRPC--> llama-server
-        Returns dict with content, success, error, tokens, etc.
+        Called from the sync gRPC server thread pool.
+        Routes: Client --gRPC--> Orchestrator --gRPC--> Agent --HTTP--> llama-server
         """
-        import json
+        import grpc as _grpc
+        import os as _os
 
-        logger.info(f"Processing gRPC client request: {request_id}")
+        logger.info(f"Processing gRPC client request (sync): {request_id}")
 
-        # Get available agent
-        agents = await self.registry.get_available_agents()
+        # Get agents directly from the registry (sync access to the dict)
+        agents = [a for a in self.registry._agents.values()
+                  if a.slots_idle > 0 and a.status in ("idle", "busy")]
         if not agents:
             return {"content": "", "success": False, "error": "No agents available"}
 
         agent = max(agents, key=lambda a: a.slots_idle)
-        logger.info(f"Selected agent for gRPC client: {agent.agent_id}")
+        logger.info(f"Selected agent for gRPC: {agent.agent_id} at {agent.hostname}")
 
-        if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
-            return {"content": "", "success": False, "error": "Agent no longer available"}
+        # Build gRPC request to agent
+        _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
+        if _proto_dir not in sys.path:
+            sys.path.insert(0, _proto_dir)
+        from proto import orchestrator_pb2 as _pb2
+        from proto import orchestrator_pb2_grpc as _pb2_grpc
+
+        agent_grpc_url = getattr(agent, "grpc_address", None)
+        if not agent_grpc_url:
+            agent_grpc_url = f"{agent.hostname}:50053"
+
+        proto_req = _pb2.AgentTaskRequest(
+            task_id=request_id,
+            requester_id="orchestrator",
+            task_type="chat",
+            priority=priority,
+            timeout_ms=timeout_ms,
+            requires_context=False,
+            stream=stream,
+        )
+        for msg in messages:
+            proto_msg = proto_req.messages.add()
+            proto_msg.role = msg.get("role", "user")
+            proto_msg.content = msg.get("content", "")
+
+        logger.info(f"gRPC calling agent at {agent_grpc_url}")
 
         try:
-            import grpc
-            import os as _os
-            _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
-            if _proto_dir not in sys.path:
-                sys.path.insert(0, _proto_dir)
-            from proto import orchestrator_pb2 as _pb2
-            from proto import orchestrator_pb2_grpc as _pb2_grpc
+            channel = _grpc.insecure_channel(agent_grpc_url)
+            stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
+            resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
+            channel.close()
 
-            agent_grpc_url = getattr(agent, "grpc_address", None)
-            if not agent_grpc_url:
-                agent_grpc_url = f"{agent.hostname}:50053"
-
-            proto_req = _pb2.AgentTaskRequest(
-                task_id=request_id,
-                requester_id="orchestrator",
-                task_type="chat",
-                priority=priority,
-                timeout_ms=timeout_ms,
-                requires_context=False,
-                stream=stream,
-            )
-            for msg in messages:
-                proto_msg = proto_req.messages.add()
-                proto_msg.role = msg.get("role", "user")
-                proto_msg.content = msg.get("content", "")
-
-            logger.info(f"gRPC calling agent {agent.agent_id} at {agent_grpc_url}")
-
-            # Use synchronous gRPC in a thread executor to avoid grpc.aio event loop issues
-            def _sync_grpc_call():
-                channel = grpc.insecure_channel(agent_grpc_url)
-                stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
-                resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
-                channel.close()
-                return resp
-
-            loop = asyncio.get_running_loop()
-            resp = await loop.run_in_executor(None, _sync_grpc_call)
-
-            logger.info(f"gRPC response: success={resp.success}, content_len={len(resp.content)}")
+            logger.info(f"gRPC response: success={resp.success}, len={len(resp.content)}")
 
             return {
                 "content": resp.content,
@@ -404,10 +395,8 @@ class OrchestratorServer:
                 "processing_time_ms": resp.processing_time_ms,
             }
         except Exception as e:
-            logger.error(f"Error in gRPC client request: {e}", exc_info=True)
+            logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
-        finally:
-            await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""

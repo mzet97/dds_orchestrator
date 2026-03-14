@@ -479,23 +479,17 @@ def _make_client_servicer_class_sync():
             try:
                 messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
-                # Schedule the async handler on the main event loop
-                import asyncio
-                loop = self._layer._event_loop
-                future = asyncio.run_coroutine_threadsafe(
-                    handler(
-                        request_id=request.request_id,
-                        messages=messages,
-                        model=request.model,
-                        max_tokens=request.max_tokens,
-                        temperature=request.temperature,
-                        priority=request.priority,
-                        timeout_ms=request.timeout_ms or 120000,
-                        stream=False,
-                    ),
-                    loop,
+                # Handler is now fully synchronous — call directly
+                result = handler(
+                    request_id=request.request_id,
+                    messages=messages,
+                    model=request.model,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    priority=request.priority,
+                    timeout_ms=request.timeout_ms or 120000,
+                    stream=False,
                 )
-                result = future.result(timeout=(request.timeout_ms or 120000) / 1000)
 
                 return _pb2.ClientChatResponse(
                     request_id=request.request_id,
