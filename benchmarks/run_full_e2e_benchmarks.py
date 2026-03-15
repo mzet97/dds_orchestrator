@@ -78,8 +78,8 @@ VM_CONFIG = {
         "user": "oldds",
         "password": "Admin@123",
         "role": "agent",
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-9B-Q4_K_M.gguf",
+        "model_name": "Qwen3.5-9B",
         "desc": "Agent 2 - RTX 3080 10GB",
         "gpu_target": None,
     },
@@ -428,7 +428,7 @@ def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
 # ─── Local Benchmark Runner ─────────────────────────────────────────────────
 
 def run_benchmark_on_client(ssh_client: 'SSHManager', protocol: str, model: str,
-                            n: int, scenario: str = "all") -> int:
+                            n: int, scenario: str = "all", max_tokens: int = 50) -> int:
     """Run benchmark on dedicated client VM (.63) via SSH.
 
     All 3 protocols (HTTP, gRPC, DDS) run from the client VM to ensure
@@ -450,7 +450,8 @@ def run_benchmark_on_client(ssh_client: 'SSHManager', protocol: str, model: str,
            f"--domain 0 "
            f"--model {model} "
            f"--scenario {scenario} "
-           f"--n {n}")
+           f"--n {n} "
+           f"--max-tokens {max_tokens}")
 
     print(f"\n    -> {protocol.upper()} benchmark on client VM {ssh_client.ip} (scenario={scenario}, n={n})")
     ec, out, err = ssh_client.run(cmd, timeout=600)
@@ -508,7 +509,9 @@ def main():
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--output", default="e2e_full_results.json")
     parser.add_argument("--agent", choices=["agent1", "agent2"], default="agent1",
-                        help="Agent primario (agent1=RX6600M GPU, agent2=RTX3080 no driver)")
+                        help="Agent primario (agent1=RX6600M GPU, agent2=RTX3080)")
+    parser.add_argument("--max-tokens", type=int, default=50,
+                        help="Max tokens for inference (use 200+ for thinking models)")
 
     args = parser.parse_args()
     phases = [p.strip().lower() for p in args.phases.split(",")]
@@ -622,7 +625,8 @@ def main():
 
         # ─── Run benchmarks on client VM (.63) ────────────────────────────
         print(f"\n  FASE {phase.upper()}: Benchmarks E1/E3/E4/E5 (n={args.n})")
-        rc = run_benchmark_on_client(ssh_client, phase, model_name, args.n, args.scenario)
+        rc = run_benchmark_on_client(ssh_client, phase, model_name, args.n, args.scenario,
+                                     max_tokens=args.max_tokens)
         results[phase.upper()] = {"exit_code": rc, "status": "OK" if rc == 0 else "FAIL"}
 
         # Kill services

@@ -411,7 +411,7 @@ PROMPTS = {
 
 # ─── Benchmark Scenarios ─────────────────────────────────────────────────────
 
-async def run_E1(client, model: str, n: int) -> Dict:
+async def run_E1(client, model: str, n: int, max_tokens: int = 50) -> Dict:
     """E1: Decomposição de latência end-to-end."""
     results = {"short": [], "long": []}
 
@@ -421,7 +421,7 @@ async def run_E1(client, model: str, n: int) -> Dict:
 
         print(f"  E1 {client.protocol} {prompt_type}: ", end="", flush=True)
         for i in range(n):
-            r = await client.chat(messages, model=model, max_tokens=50)
+            r = await client.chat(messages, model=model, max_tokens=max_tokens)
             results[prompt_type].append({
                 "iteration": i,
                 "roundtrip_ms": r.get("roundtrip_ms", 0),
@@ -568,7 +568,8 @@ async def run_benchmarks(args):
         print(f"{'='*60}")
 
         if scenario == "E1":
-            all_results["E1"] = await run_E1(client, args.model, args.n)
+            all_results["E1"] = await run_E1(client, args.model, args.n,
+                                              max_tokens=getattr(args, 'max_tokens', 50))
         elif scenario == "E3":
             all_results["E3"] = await run_E3(client, args.model, args.n)
         elif scenario == "E4":
@@ -604,6 +605,7 @@ def main():
     parser.add_argument("--scenario", choices=["all", "E1", "E3", "E4", "E5"],
                         default="all", help="Scenario to run (E2 is standalone)")
     parser.add_argument("--n", type=int, default=5, help="Iterations per test")
+    parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens for inference")
 
     args = parser.parse_args()
     asyncio.run(run_benchmarks(args))
