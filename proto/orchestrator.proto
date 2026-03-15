@@ -18,6 +18,8 @@ message AgentTaskRequest {
     int32               timeout_ms      = 6;
     bool                requires_context = 7;
     bool                stream          = 8;
+    int32               max_tokens      = 9;
+    float               temperature     = 10;
 }
 
 message AgentTaskResponse {

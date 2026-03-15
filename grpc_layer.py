@@ -59,6 +59,8 @@ class AgentTaskRequest:
     timeout_ms: int
     requires_context: bool
     stream: bool = False
+    max_tokens: int = 50
+    temperature: float = 0.7
 
 
 @dataclass

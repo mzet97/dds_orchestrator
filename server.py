@@ -269,6 +269,8 @@ class OrchestratorServer:
                 priority=5,
                 timeout_ms=60000,
                 requires_context=False,
+                max_tokens=50,
+                temperature=0.7,
             )
             # Register waiter BEFORE publishing to avoid race where response arrives first
             self.dds.prepare_agent_response_waiter(request_id)
@@ -374,6 +376,8 @@ class OrchestratorServer:
             timeout_ms=timeout_ms,
             requires_context=False,
             stream=stream,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         for msg in messages:
             proto_msg = proto_req.messages.add()
@@ -700,6 +704,8 @@ class OrchestratorServer:
                         priority=priority,
                         timeout_ms=task.timeout_ms,
                         requires_context=task.requires_context,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
                         stream=stream_requested,
                     )
 

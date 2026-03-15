@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12orchestrator.proto\x12\x11orchestrator_grpc\",\n\x0b\x43hatMessage\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\"\xce\x01\n\x10\x41gentTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x14\n\x0crequester_id\x18\x02 \x01(\t\x12\x11\n\ttask_type\x18\x03 \x01(\t\x12\x30\n\x08messages\x18\x04 \x03(\x0b\x32\x1e.orchestrator_grpc.ChatMessage\x12\x10\n\x08priority\x18\x05 \x01(\x05\x12\x12\n\ntimeout_ms\x18\x06 \x01(\x05\x12\x18\n\x10requires_context\x18\x07 \x01(\x08\x12\x0e\n\x06stream\x18\x08 \x01(\x08\"\xcf\x01\n\x11\x41gentTaskResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x10\n\x08\x61gent_id\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\t\x12\x10\n\x08is_final\x18\x04 \x01(\x08\x12\x15\n\rprompt_tokens\x18\x05 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x06 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x07 \x01(\x05\x12\x0f\n\x07success\x18\x08 \x01(\x08\x12\x15\n\rerror_message\x18\t \x01(\t\"c\n\x10HeartbeatRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\r\n\x05state\x18\x02 \x01(\t\x12\x15\n\rcurrent_slots\x18\x03 \x01(\x05\x12\x17\n\x0fmemory_usage_mb\x18\x04 \x01(\x05\":\n\x11HeartbeatResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x07\n\x05\x45mpty\"\xc7\x01\n\x11\x43lientChatRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\r\n\x05model\x18\x02 \x01(\t\x12\x30\n\x08messages\x18\x03 \x03(\x0b\x32\x1e.orchestrator_grpc.ChatMessage\x12\x13\n\x0btemperature\x18\x04 \x01(\x02\x12\x12\n\nmax_tokens\x18\x05 \x01(\x05\x12\x0e\n\x06stream\x18\x06 \x01(\x08\x12\x10\n\x08priority\x18\x07 \x01(\x05\x12\x12\n\ntimeout_ms\x18\x08 \x01(\x05\"\xd0\x01\n\x12\x43lientChatResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x10\n\x08is_final\x18\x03 \x01(\x08\x12\x15\n\rprompt_tokens\x18\x04 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\x12\x0f\n\x07success\x18\x07 \x01(\x08\x12\x15\n\rerror_message\x18\x08 \x01(\t\x12\r\n\x05model\x18\t \x01(\t2\xa6\x02\n\x18OrchestratorAgentService\x12W\n\nSubmitTask\x12#.orchestrator_grpc.AgentTaskRequest\x1a$.orchestrator_grpc.AgentTaskResponse\x12Y\n\nStreamTask\x12#.orchestrator_grpc.AgentTaskRequest\x1a$.orchestrator_grpc.AgentTaskResponse0\x01\x12V\n\tHeartbeat\x12#.orchestrator_grpc.HeartbeatRequest\x1a$.orchestrator_grpc.HeartbeatResponse2\xcd\x01\n\x19\x43lientOrchestratorService\x12S\n\x04\x43hat\x12$.orchestrator_grpc.ClientChatRequest\x1a%.orchestrator_grpc.ClientChatResponse\x12[\n\nStreamChat\x12$.orchestrator_grpc.ClientChatRequest\x1a%.orchestrator_grpc.ClientChatResponse0\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12orchestrator.proto\x12\x11orchestrator_grpc\",\n\x0b\x43hatMessage\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\"\xf7\x01\n\x10\x41gentTaskRequest\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x14\n\x0crequester_id\x18\x02 \x01(\t\x12\x11\n\ttask_type\x18\x03 \x01(\t\x12\x30\n\x08messages\x18\x04 \x03(\x0b\x32\x1e.orchestrator_grpc.ChatMessage\x12\x10\n\x08priority\x18\x05 \x01(\x05\x12\x12\n\ntimeout_ms\x18\x06 \x01(\x05\x12\x18\n\x10requires_context\x18\x07 \x01(\x08\x12\x0e\n\x06stream\x18\x08 \x01(\x08\x12\x12\n\nmax_tokens\x18\t \x01(\x05\x12\x13\n\x0btemperature\x18\n \x01(\x02\"\xcf\x01\n\x11\x41gentTaskResponse\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x10\n\x08\x61gent_id\x18\x02 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x03 \x01(\t\x12\x10\n\x08is_final\x18\x04 \x01(\x08\x12\x15\n\rprompt_tokens\x18\x05 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x06 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x07 \x01(\x05\x12\x0f\n\x07success\x18\x08 \x01(\x08\x12\x15\n\rerror_message\x18\t \x01(\t\"c\n\x10HeartbeatRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\r\n\x05state\x18\x02 \x01(\t\x12\x15\n\rcurrent_slots\x18\x03 \x01(\x05\x12\x17\n\x0fmemory_usage_mb\x18\x04 \x01(\x05\":\n\x11HeartbeatResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x07\n\x05\x45mpty\"\xc7\x01\n\x11\x43lientChatRequest\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\r\n\x05model\x18\x02 \x01(\t\x12\x30\n\x08messages\x18\x03 \x03(\x0b\x32\x1e.orchestrator_grpc.ChatMessage\x12\x13\n\x0btemperature\x18\x04 \x01(\x02\x12\x12\n\nmax_tokens\x18\x05 \x01(\x05\x12\x0e\n\x06stream\x18\x06 \x01(\x08\x12\x10\n\x08priority\x18\x07 \x01(\x05\x12\x12\n\ntimeout_ms\x18\x08 \x01(\x05\"\xd0\x01\n\x12\x43lientChatResponse\x12\x12\n\nrequest_id\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x10\n\x08is_final\x18\x03 \x01(\x08\x12\x15\n\rprompt_tokens\x18\x04 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x05 \x01(\x05\x12\x1a\n\x12processing_time_ms\x18\x06 \x01(\x05\x12\x0f\n\x07success\x18\x07 \x01(\x08\x12\x15\n\rerror_message\x18\x08 \x01(\t\x12\r\n\x05model\x18\t \x01(\t2\xa6\x02\n\x18OrchestratorAgentService\x12W\n\nSubmitTask\x12#.orchestrator_grpc.AgentTaskRequest\x1a$.orchestrator_grpc.AgentTaskResponse\x12Y\n\nStreamTask\x12#.orchestrator_grpc.AgentTaskRequest\x1a$.orchestrator_grpc.AgentTaskResponse0\x01\x12V\n\tHeartbeat\x12#.orchestrator_grpc.HeartbeatRequest\x1a$.orchestrator_grpc.HeartbeatResponse2\xcd\x01\n\x19\x43lientOrchestratorService\x12S\n\x04\x43hat\x12$.orchestrator_grpc.ClientChatRequest\x1a%.orchestrator_grpc.ClientChatResponse\x12[\n\nStreamChat\x12$.orchestrator_grpc.ClientChatRequest\x1a%.orchestrator_grpc.ClientChatResponse0\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,21 +34,21 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CHATMESSAGE']._serialized_start=41
   _globals['_CHATMESSAGE']._serialized_end=85
   _globals['_AGENTTASKREQUEST']._serialized_start=88
-  _globals['_AGENTTASKREQUEST']._serialized_end=294
-  _globals['_AGENTTASKRESPONSE']._serialized_start=297
-  _globals['_AGENTTASKRESPONSE']._serialized_end=504
-  _globals['_HEARTBEATREQUEST']._serialized_start=506
-  _globals['_HEARTBEATREQUEST']._serialized_end=605
-  _globals['_HEARTBEATRESPONSE']._serialized_start=607
-  _globals['_HEARTBEATRESPONSE']._serialized_end=665
-  _globals['_EMPTY']._serialized_start=667
-  _globals['_EMPTY']._serialized_end=674
-  _globals['_CLIENTCHATREQUEST']._serialized_start=677
-  _globals['_CLIENTCHATREQUEST']._serialized_end=876
-  _globals['_CLIENTCHATRESPONSE']._serialized_start=879
-  _globals['_CLIENTCHATRESPONSE']._serialized_end=1087
-  _globals['_ORCHESTRATORAGENTSERVICE']._serialized_start=1090
-  _globals['_ORCHESTRATORAGENTSERVICE']._serialized_end=1384
-  _globals['_CLIENTORCHESTRATORSERVICE']._serialized_start=1387
-  _globals['_CLIENTORCHESTRATORSERVICE']._serialized_end=1592
+  _globals['_AGENTTASKREQUEST']._serialized_end=335
+  _globals['_AGENTTASKRESPONSE']._serialized_start=338
+  _globals['_AGENTTASKRESPONSE']._serialized_end=545
+  _globals['_HEARTBEATREQUEST']._serialized_start=547
+  _globals['_HEARTBEATREQUEST']._serialized_end=646
+  _globals['_HEARTBEATRESPONSE']._serialized_start=648
+  _globals['_HEARTBEATRESPONSE']._serialized_end=706
+  _globals['_EMPTY']._serialized_start=708
+  _globals['_EMPTY']._serialized_end=715
+  _globals['_CLIENTCHATREQUEST']._serialized_start=718
+  _globals['_CLIENTCHATREQUEST']._serialized_end=917
+  _globals['_CLIENTCHATRESPONSE']._serialized_start=920
+  _globals['_CLIENTCHATRESPONSE']._serialized_end=1128
+  _globals['_ORCHESTRATORAGENTSERVICE']._serialized_start=1131
+  _globals['_ORCHESTRATORAGENTSERVICE']._serialized_end=1425
+  _globals['_CLIENTORCHESTRATORSERVICE']._serialized_start=1428
+  _globals['_CLIENTORCHESTRATORSERVICE']._serialized_end=1633
 # @@protoc_insertion_point(module_scope)
