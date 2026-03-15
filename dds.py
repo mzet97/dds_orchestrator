@@ -625,8 +625,10 @@ class DDSLayer:
             "timeout_ms": request.timeout_ms,
             "requires_context": bool(request.requires_context),
             "context_id": "",
-            "created_at": int(time.time()),
+            "created_at": int(time.time() * 1000),
             "stream": request.stream,
+            "max_tokens": getattr(request, "max_tokens", 50),
+            "temperature": getattr(request, "temperature", 0.7),
         }
 
         if not self.dds_available:
