@@ -363,7 +363,7 @@ class DDSBenchmarkClient:
                         }
             except Exception:
                 pass
-            time.sleep(0.005)
+            time.sleep(0.001)  # 1ms poll (was 5ms)
 
         t_end = time.perf_counter_ns()
         return {"content": "", "success": False, "error": "Timeout",

@@ -172,7 +172,7 @@ class OrchestratorServer:
         self._last_debug = time.time()
         while True:
             try:
-                await asyncio.sleep(0.1)  # Poll every 100ms
+                await asyncio.sleep(0.005)  # Poll every 5ms (was 100ms — major latency source)
 
                 if not self.dds.is_available():
                     continue
