@@ -112,12 +112,17 @@ class SSHManager:
 
     def connect(self) -> bool:
         try:
+            import socket
             self.client = paramiko.SSHClient()
             self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            print(f"  Conectando em {self.ip} ({self.desc})...")
+            print(f"  Conectando em {self.ip} ({self.desc})...", flush=True)
+            # Force IPv4 to avoid DNS/IPv6 issues on Windows
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(30)
+            sock.connect((self.ip, 22))
             self.client.connect(
                 hostname=self.ip, username=self.user, password=self.password,
-                timeout=30, banner_timeout=30
+                timeout=30, banner_timeout=30, sock=sock
             )
             transport = self.client.get_transport()
             if transport:
