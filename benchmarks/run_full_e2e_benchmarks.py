@@ -326,7 +326,8 @@ def start_services_http(ssh_orch, ssh_agent, agent_cfg):
     # 1. Orchestrator HTTP only FIRST — explicitly disable DDS
     orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
                 f"--port {ORCH_PORT} --log-level INFO")
-    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log", env={"DDS_ENABLED": "false"})
+    # Must prefix command directly with env var (run_bg's bash -c export may not propagate)
+    ssh_orch.run_bg(f"DDS_ENABLED=false {orch_cmd}", "/tmp/orch_http.log")
     print(f"    [OK] Orchestrator HTTP-only em {ssh_orch.ip}")
     wait_orchestrator_ready(ssh_orch)
 
