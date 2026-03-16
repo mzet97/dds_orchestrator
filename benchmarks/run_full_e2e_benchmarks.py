@@ -170,8 +170,8 @@ class SSHManager:
             return False
         try:
             if env:
-                exports = " && ".join(f"export {k}={v}" for k, v in env.items())
-                cmd = f"bash -c '{exports} && nohup {command} > {logfile} 2>&1 &'"
+                env_str = " ".join(f"{k}={v}" for k, v in env.items())
+                cmd = f"bash -c 'export {env_str} && nohup {command} > {logfile} 2>&1 &'"
             else:
                 cmd = f"nohup {command} > {logfile} 2>&1 &"
             self.client.exec_command(cmd, timeout=10)
@@ -326,8 +326,8 @@ def start_services_http(ssh_orch, ssh_agent, agent_cfg):
     # 1. Orchestrator HTTP only FIRST — explicitly disable DDS
     orch_cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
                 f"--port {ORCH_PORT} --log-level INFO")
-    # Must prefix command directly with env var (run_bg's bash -c export may not propagate)
-    ssh_orch.run_bg(f"DDS_ENABLED=false {orch_cmd}", "/tmp/orch_http.log")
+    # Use env command to set DDS_ENABLED=false before launching orchestrator
+    ssh_orch.run_bg(orch_cmd, "/tmp/orch_http.log", env={"DDS_ENABLED": "false"})
     print(f"    [OK] Orchestrator HTTP-only em {ssh_orch.ip}")
     wait_orchestrator_ready(ssh_orch)
 
