@@ -358,7 +358,7 @@ def start_services_grpc(ssh_orch, ssh_agent, agent_cfg):
 
     # 1. llama-server (HTTP) — agent uses HTTP fallback for local llama calls
     #    The gRPC bridge in llama.cpp_dds has a bug, so agent falls back to HTTP
-    cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
+    cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 --reasoning-budget 0 "
            f"--port 8082 --host 0.0.0.0")
     ssh_agent.run_bg(cmd, "/tmp/llama_grpc.log")
     print(f"    [OK] llama-server em {ssh_agent.ip}")
@@ -401,7 +401,7 @@ def start_services_dds(ssh_orch, ssh_agent, agent_cfg):
     xml_orch = get_cyclonedds_xml(ssh_orch)
 
     # 1. llama-server with DDS enabled
-    cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 "
+    cmd = (f"{binary} -m {model_path} -c 2048 --threads 8 -ngl 99 --reasoning-budget 0 "
            f"--port 8082 --host 0.0.0.0 "
            f"--enable-dds --dds-domain 0 --dds-timeout 120")
     ssh_agent.run_bg(cmd, "/tmp/llama_dds.log", env={"CYCLONEDDS_URI": f"file://{xml_agent}"})
