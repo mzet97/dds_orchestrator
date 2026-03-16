@@ -33,6 +33,13 @@ class AgentInfo:
     llm_host: str = "localhost"  # Host da LLM que este agente gerencia
     llm_port: int = 8082  # Porta da LLM
     grpc_address: str = ""  # gRPC endpoint (host:port) if agent supports gRPC
+    # Fuzzy decision metrics (updated after each response)
+    avg_latency_ms: float = 0.0       # Exponential moving average of response latency
+    error_rate: float = 0.0            # Error rate from accumulated counts
+    success_count: int = 0             # Accumulated successful responses
+    total_count: int = 0               # Accumulated total responses
+    agent_profile: str = "balanced"    # "fast" | "quality" | "balanced" | "backup"
+    gpu_type: str = ""                 # "rtx3080" | "rx6600m" | ""
 
 
 class AgentRegistry:
@@ -132,6 +139,27 @@ class AgentRegistry:
                 agent.status = "idle" if agent.slots_idle > 0 else "busy"
             agent.last_heartbeat = time.time()
             return True
+
+    async def update_response_metrics(self, agent_id: str, latency_ms: float, success: bool):
+        """Update running metrics after a response is received.
+
+        Uses exponential moving average (alpha=0.1, ~50-sample window) for latency.
+        """
+        async with self._lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                return
+            agent.total_count += 1
+            if success:
+                agent.success_count += 1
+            # Exponential moving average for latency
+            alpha = 0.1
+            if agent.avg_latency_ms == 0.0:
+                agent.avg_latency_ms = latency_ms  # First sample
+            else:
+                agent.avg_latency_ms = alpha * latency_ms + (1 - alpha) * agent.avg_latency_ms
+            # Error rate from accumulated counts
+            agent.error_rate = 1.0 - (agent.success_count / max(1, agent.total_count))
 
     async def remove_stale_agents(self, timeout_seconds: int = None) -> List[str]:
         """Remove agents that haven't sent heartbeat"""

@@ -41,6 +41,8 @@ async def main():
                        help="Enable gRPC transport")
     parser.add_argument("--grpc-port", type=int, default=None,
                        help="gRPC listen port (default: 50052)")
+    parser.add_argument("--fuzzy", action="store_true", default=None,
+                       help="Enable fuzzy logic agent selection")
 
     args = parser.parse_args()
 
@@ -65,6 +67,8 @@ async def main():
             config.grpc_enabled = args.grpc_enabled
         if args.grpc_port is not None:
             config.grpc_port = args.grpc_port
+        if args.fuzzy is not None:
+            config.fuzzy_enabled = args.fuzzy
     else:
         config = load_config_from_env()
         config.port = args.port if args.port is not None else config.port
@@ -75,6 +79,8 @@ async def main():
             config.grpc_enabled = args.grpc_enabled
         if args.grpc_port is not None:
             config.grpc_port = args.grpc_port
+        if args.fuzzy is not None:
+            config.fuzzy_enabled = args.fuzzy
 
     logger.info("=" * 60)
     logger.info("DDS-LLM Orchestrator Starting")
@@ -86,6 +92,7 @@ async def main():
     logger.info(f"gRPC Enabled: {config.grpc_enabled}")
     if config.grpc_enabled:
         logger.info(f"gRPC Port: {config.grpc_port}")
+    logger.info(f"Fuzzy Enabled: {config.fuzzy_enabled}")
     logger.info("=" * 60)
 
     # Initialize components
@@ -100,6 +107,16 @@ async def main():
         from grpc_layer import GRPCLayer
         grpc_layer = GRPCLayer(config)
 
+    # Initialize fuzzy decision engine if enabled
+    fuzzy_engine = None
+    if config.fuzzy_enabled:
+        try:
+            from fuzzy_selector import FuzzyDecisionEngine
+            fuzzy_engine = FuzzyDecisionEngine()
+            logger.info("Fuzzy decision engine initialized")
+        except ImportError as e:
+            logger.warning(f"Fuzzy engine not available: {e}. Using baseline selector.")
+
     # Create server
     server = OrchestratorServer(
         config=config,
@@ -108,6 +125,7 @@ async def main():
         dds_layer=dds_layer,
         selector=selector,
         grpc_layer=grpc_layer,
+        fuzzy_engine=fuzzy_engine,
     )
 
     # Start server

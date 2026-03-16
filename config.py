@@ -33,6 +33,11 @@ class OrchestratorConfig:
     grpc_enabled: bool = False
     grpc_port: int = 50052  # orchestrator gRPC listen port
 
+    # Fuzzy logic settings
+    fuzzy_enabled: bool = False
+    fuzzy_default_urgency: int = 5
+    fuzzy_default_complexity: int = 5
+
     # Logging
     log_level: str = "INFO"
 

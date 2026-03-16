@@ -29,13 +29,15 @@ class OrchestratorServer:
                  scheduler: TaskScheduler,
                  dds_layer: DDSLayer,
                  selector: AgentSelector = None,
-                 grpc_layer=None):
+                 grpc_layer=None,
+                 fuzzy_engine=None):
         self.config = config
         self.registry = registry
         self.scheduler = scheduler
         self.dds = dds_layer
         self.grpc = grpc_layer  # optional gRPC layer (mirrors DDS layer interface)
         self.selector = selector or AgentSelector()
+        self.fuzzy = fuzzy_engine  # optional fuzzy decision engine
 
         self.app = None
         self.runner = None
@@ -568,13 +570,19 @@ class OrchestratorServer:
         task_type = data.get("task_type", "chat")
 
         # Wait for an available agent (queue instead of 503 rejection)
-        agent = await self._wait_for_available_agent(timeout_s=300)
+        # Fuzzy engine selects best agent + QoS profile + strategy
+        fuzzy_urgency = data.get("urgency")
+        fuzzy_complexity = data.get("complexity")
+        agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
+            timeout_s=300, messages=messages, priority=priority,
+            urgency=fuzzy_urgency, complexity=fuzzy_complexity,
+        )
         if not agent:
             return web.json_response({
                 "error": "No agents available after timeout",
                 "code": "NO_AGENTS"
             }, status=503)
-        logger.info(f"Selected agent: {agent.agent_id}")
+        logger.info(f"Selected agent: {agent.agent_id} (qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
         # Create task
         task = Task(
@@ -592,7 +600,8 @@ class OrchestratorServer:
         for _retry in range(3):
             if await self.registry.adjust_slots(agent.agent_id, delta=-1):
                 break
-            agent = await self._wait_for_available_agent(timeout_s=300)
+            agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
+                timeout_s=300, messages=messages, priority=priority)
             if not agent:
                 return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
         else:
@@ -716,7 +725,8 @@ class OrchestratorServer:
                     if stream_requested and self.dds.is_available():
                         # SSE streaming path: forward individual chunks to client
                         self.dds.prepare_stream_waiter(task.task_id)
-                        await self.dds.publish_agent_request(dds_request, priority=dds_priority)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority,
+                                                              qos_profile=fuzzy_qos)
 
                         sse_response = web.StreamResponse(
                             status=200,
@@ -763,7 +773,8 @@ class OrchestratorServer:
                     else:
                         # Non-streaming DDS path
                         self.dds.prepare_agent_response_waiter(task.task_id)
-                        await self.dds.publish_agent_request(dds_request, priority=dds_priority)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority,
+                                                              qos_profile=fuzzy_qos)
                         response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)
 
                         content = ""
@@ -842,6 +853,13 @@ class OrchestratorServer:
                 error=response_error,
                 processing_time_ms=processing_time
             )
+
+            # Update agent metrics for fuzzy decision feedback
+            await self.registry.update_response_metrics(
+                agent.agent_id,
+                latency_ms=processing_time,
+                success=bool(response_content),
+            )
         except asyncio.CancelledError:
             # Client disconnected — mark task as cancelled so it doesn't stay "running"
             await self.scheduler.cancel_task(task.task_id)
@@ -872,20 +890,44 @@ class OrchestratorServer:
             "processing_time_ms": processing_time,
         })
 
-    async def _wait_for_available_agent(self, timeout_s=300):
-        """Wait for an agent with idle slots instead of returning 503 immediately.
+    def _select_with_fuzzy(self, agents: list, messages: list = None,
+                           priority: int = 5, urgency: int = None,
+                           complexity: int = None) -> tuple:
+        """Select agent using fuzzy engine if available, otherwise max(slots_idle).
 
-        This enables request queueing: when all agents are busy, requests wait
-        in line until an agent finishes its current task.
+        Returns: (agent, qos_profile, strategy)
+          - qos_profile: "low_cost" | "balanced" | "critical" | None
+          - strategy: "single" | "retry" | "fanout"
+        """
+        if self.fuzzy and agents:
+            task_input = {
+                "urgency": urgency or priority,
+                "complexity": complexity,
+                "messages": messages or [],
+                "priority": priority,
+            }
+            decision = self.fuzzy.select(task_input, agents)
+            agent = next((a for a in agents if a.agent_id == decision.agent_id), agents[0])
+            return agent, decision.qos_profile, decision.strategy
+
+        # Fallback: baseline selection
+        agent = max(agents, key=lambda a: a.slots_idle)
+        return agent, None, "single"
+
+    async def _wait_for_available_agent(self, timeout_s=300, messages=None,
+                                         priority=5, urgency=None, complexity=None):
+        """Wait for an agent with idle slots, then select using fuzzy or baseline.
+
+        Returns: (agent, qos_profile, strategy) or (None, None, None)
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         while loop.time() < deadline:
             agents = await self.registry.get_available_agents()
             if agents:
-                return max(agents, key=lambda a: a.slots_idle)
-            await asyncio.sleep(0.1)  # 100ms polling — fast slot detection
-        return None
+                return self._select_with_fuzzy(agents, messages, priority, urgency, complexity)
+            await asyncio.sleep(0.1)
+        return None, None, None
 
     async def handle_generate(self, request: web.Request) -> web.Response:
         """Handle generate request"""

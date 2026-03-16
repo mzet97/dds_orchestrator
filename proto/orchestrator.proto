@@ -20,6 +20,8 @@ message AgentTaskRequest {
     bool                stream          = 8;
     int32               max_tokens      = 9;
     float               temperature     = 10;
+    int32               urgency         = 11;
+    int32               complexity      = 12;
 }
 
 message AgentTaskResponse {

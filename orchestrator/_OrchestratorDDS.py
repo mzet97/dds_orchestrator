@@ -66,6 +66,8 @@ class TaskRequest(idl.IdlStruct, typename="orchestrator.TaskRequest"):
     stream: bool = False
     max_tokens: types.int32 = 50
     temperature: types.float32 = 0.7
+    urgency: types.int32 = 5
+    complexity: types.int32 = 5
 
 
 @dataclass

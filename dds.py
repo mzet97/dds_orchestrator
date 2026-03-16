@@ -97,6 +97,8 @@ class AgentTaskRequest:
     stream: bool = False
     max_tokens: int = 50
     temperature: float = 0.7
+    urgency: int = 5
+    complexity: int = 5
 
 
 @dataclass
@@ -294,6 +296,8 @@ class DDSLayer:
         # Priority writers: CycloneDDS doesn't support per-write QoS override,
         # so we create separate DataWriters with different TRANSPORT_PRIORITY values.
         self._priority_writers: Dict[int, Any] = {}
+        # QoS profile writers: keyed by profile name (low_cost, balanced, critical)
+        self._qos_profile_writers: Dict[str, Any] = {}
 
         # Create publishers (orchestrator sends to agents and clients)
         self.publishers = {
@@ -607,13 +611,15 @@ class DDSLayer:
             logger.error(f"Failed to create subscription for {topic}: {e}")
             logger.info(f"Subscribed to {topic} (handler registered, no listener)")
 
-    async def publish_agent_request(self, request: AgentTaskRequest, priority: int = 0):
-        """Publish task request to agents with optional TRANSPORT_PRIORITY.
+    async def publish_agent_request(self, request: AgentTaskRequest, priority: int = 0,
+                                     qos_profile: str = None):
+        """Publish task request to agents with optional TRANSPORT_PRIORITY or QoS profile.
 
         Args:
             request: The task request to publish.
             priority: DDS TRANSPORT_PRIORITY value (0=LOW, 5=NORMAL, 10=HIGH, 20=CRITICAL).
-                      Creates a dedicated DataWriter per priority level.
+            qos_profile: Named QoS profile ("low_cost", "balanced", "critical").
+                         If specified, overrides the priority-based writer.
         """
         # Convert to DDS format - messages need to be JSON string
         data = {
@@ -634,6 +640,20 @@ class DDSLayer:
         if not self.dds_available:
             logger.debug("DDS unavailable, skipping publish_agent_request")
             return
+
+        # Use QoS profile writer if specified (from fuzzy decision)
+        if qos_profile:
+            writer = self._get_qos_profile_writer(qos_profile)
+            if writer:
+                try:
+                    topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
+                    if topic_type:
+                        msg = topic_type(**data)
+                        writer.write(msg)
+                        logger.debug(f"Published to {TOPIC_AGENT_REQUEST} with QoS profile={qos_profile}")
+                        return
+                except Exception as e:
+                    logger.warning(f"QoS profile writer failed: {e}, falling back to default")
 
         # Use priority-specific writer if priority > 0
         if priority > 0:
@@ -677,6 +697,34 @@ class DDSLayer:
             return writer
         except Exception as e:
             logger.error(f"Failed to create priority writer: {e}")
+            return None
+
+    def _get_qos_profile_writer(self, profile_name: str):
+        """Get or create a DataWriter for the named QoS profile.
+
+        Uses qos_profiles.py factory to create CycloneDDS Qos objects.
+        Writers are cached for reuse.
+        """
+        if profile_name in self._qos_profile_writers:
+            return self._qos_profile_writers[profile_name]
+
+        try:
+            from cyclonedds.pub import DataWriter
+            from qos_profiles import QoSProfile, create_qos
+
+            profile = QoSProfile(profile_name)
+            qos = create_qos(profile)
+            if qos is None:
+                return None
+
+            writer = DataWriter(
+                self.participant, self.topics[TOPIC_AGENT_REQUEST], qos
+            )
+            self._qos_profile_writers[profile_name] = writer
+            logger.info(f"Created QoS profile writer: {profile_name}")
+            return writer
+        except Exception as e:
+            logger.error(f"Failed to create QoS profile writer '{profile_name}': {e}")
             return None
 
     async def publish_orchestrator_command(self, command_id: str,
