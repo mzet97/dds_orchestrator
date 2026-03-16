@@ -113,10 +113,16 @@ _ssh_cache: Dict[str, paramiko.SSHClient] = {}
 def ssh_connect(ip: str) -> paramiko.SSHClient:
     if ip in _ssh_cache:
         try:
-            _ssh_cache[ip].exec_command("echo ok", timeout=3)
-            return _ssh_cache[ip]
+            t = _ssh_cache[ip].get_transport()
+            if t and t.is_active():
+                _ssh_cache[ip].exec_command("echo ok", timeout=3)
+                return _ssh_cache[ip]
         except Exception:
-            pass
+            try:
+                _ssh_cache[ip].close()
+            except Exception:
+                pass
+            del _ssh_cache[ip]
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
