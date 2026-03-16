@@ -83,7 +83,7 @@ class AgentRegistry:
         """Unregister an agent"""
         async with self._lock:
             if agent_id in self.agents:
-                del self.agents[agent_id]
+                self.agents.pop(agent_id, None)
                 logger.info(f"Unregistered agent {agent_id}")
                 return True
             return False
@@ -171,7 +171,7 @@ class AgentRegistry:
             for agent_id, agent in list(self.agents.items()):
                 if current_time - agent.last_heartbeat > timeout:
                     stale_ids.append(agent_id)
-                    del self.agents[agent_id]
+                    self.agents.pop(agent_id, None)
 
         if stale_ids:
             logger.warning(f"Removed {len(stale_ids)} stale agents")

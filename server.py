@@ -169,7 +169,7 @@ class OrchestratorServer:
         """Background task to process DDS client requests"""
         import sys
         import time
-        print("DDS client loop started", flush=True, file=sys.stderr)
+        logger.info("DDS client loop started")
         logger.info("DDS client loop started")
         self._last_debug = time.time()
         while True:
@@ -183,7 +183,7 @@ class OrchestratorServer:
                 now = time.time()
                 if now - self._last_debug > 10:
                     msg = f"[DDS] Polling for client requests... DDS available: {self.dds.is_available()}"
-                    print(msg, flush=True)  # Goes to stdout which is captured by nohup
+                    logger.info(msg)
                     logger.info(msg)
                     self._last_debug = now
 
@@ -354,19 +354,25 @@ class OrchestratorServer:
 
         logger.info(f"Processing gRPC client request (sync): {request_id}")
 
-        # Get agents directly from the registry (sync access to the dict)
-        agents = [a for a in self.registry.agents.values()
-                  if a.slots_idle > 0 and a.status in ("idle", "busy")]
-        if not agents:
-            return {"content": "", "success": False, "error": "No agents available"}
+        # Thread-safe agent selection: use a threading.Lock for sync access
+        # (asyncio.Lock only works in the event loop thread)
+        import threading
+        if not hasattr(self.registry, '_thread_lock'):
+            self.registry._thread_lock = threading.Lock()
 
-        # Select agent: fuzzy if enabled, otherwise max idle slots
-        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-            agents, messages=messages, priority=priority)
-        # Decrement slot (sync, direct dict access)
-        agent.slots_idle = max(0, agent.slots_idle - 1)
-        if agent.slots_idle == 0:
-            agent.status = "busy"
+        with self.registry._thread_lock:
+            agents = [a for a in self.registry.agents.values()
+                      if a.slots_idle > 0 and a.status in ("idle", "busy")]
+            if not agents:
+                return {"content": "", "success": False, "error": "No agents available"}
+
+            agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+                agents, messages=messages, priority=priority)
+            # Atomic slot decrement under lock
+            agent.slots_idle = max(0, agent.slots_idle - 1)
+            if agent.slots_idle == 0:
+                agent.status = "busy"
+
         logger.info(f"Selected agent for gRPC: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
         # Build gRPC request to agent
@@ -423,15 +429,17 @@ class OrchestratorServer:
             logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
         finally:
-            # Release agent slot — direct dict access (safe from thread, registry
-            # uses simple dict without async locks for slot fields)
+            # Release agent slot under thread lock (same lock as selection)
             try:
-                a = self.registry.agents.get(agent.agent_id)
-                if a:
-                    a.slots_idle = min(a.slots_idle + 1, a.slots_total if hasattr(a, 'slots_total') else 1)
-                    if a.slots_idle > 0:
-                        a.status = "idle"
-                    logger.debug(f"Released slot for {agent.agent_id}, now {a.slots_idle} idle")
+                import threading
+                if not hasattr(self.registry, '_thread_lock'):
+                    self.registry._thread_lock = threading.Lock()
+                with self.registry._thread_lock:
+                    a = self.registry.agents.get(agent.agent_id)
+                    if a:
+                        a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 1))
+                        if a.slots_idle > 0:
+                            a.status = "idle"
             except Exception as e:
                 logger.warning(f"Failed to release agent slot: {e}")
 

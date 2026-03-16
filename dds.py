@@ -220,11 +220,9 @@ class DDSLayer:
             # Create publishers and subscribers
             self._create_pubsub()
 
-            # Capture the running event loop for thread-safe callbacks from DDS listener threads
-            try:
-                self._event_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                self._event_loop = None
+            # Event loop will be captured lazily when subscribe() is called
+            # (at init time the loop is not yet running)
+            self._event_loop = None
 
             self.dds_available = True
             logger.info(f"DDS initialized on domain {self.config.dds_domain}")
@@ -585,6 +583,11 @@ class DDSLayer:
 
             handler_ref = handler
 
+            # Capture event loop lazily (now we're inside an async context)
+            try:
+                self._event_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
             captured_loop = self._event_loop
 
             class TopicListener(Listener):

@@ -231,19 +231,37 @@ class TaskScheduler:
                         if t.status == TaskStatus.COMPLETED]
             return sorted(completed, key=lambda t: t.completed_at or 0, reverse=True)[:limit]
 
-    async def cleanup_old_tasks(self, max_tasks: int = 1000, max_age_seconds: int = 3600):
-        """Remove old completed/failed/cancelled tasks when limit exceeded"""
+    async def cleanup_old_tasks(self, max_tasks: int = 500, max_age_seconds: int = 300):
+        """Remove old completed/failed/cancelled tasks to prevent memory growth.
+
+        Cleanup triggers when task count exceeds max_tasks. Removes completed
+        tasks older than max_age_seconds (default 5 min). If still over limit
+        after age-based cleanup, removes oldest completed tasks by completed_at.
+        """
         async with self._lock:
             if len(self.tasks) <= max_tasks:
                 return
+            completed_statuses = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT}
+            now = time.time()
+            # Phase 1: remove tasks older than max_age_seconds
             tasks_to_remove = []
             for task_id, task in self.tasks.items():
-                if task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.TIMEOUT]:
-                    if task.completed_at is not None and time.time() - task.completed_at > max_age_seconds:
+                if task.status in completed_statuses:
+                    if task.completed_at is not None and now - task.completed_at > max_age_seconds:
                         tasks_to_remove.append(task_id)
+            # Phase 2: if still over limit, remove oldest completed tasks
+            if len(self.tasks) - len(tasks_to_remove) > max_tasks:
+                remaining = [(tid, t) for tid, t in self.tasks.items()
+                             if tid not in set(tasks_to_remove) and t.status in completed_statuses
+                             and t.completed_at is not None]
+                remaining.sort(key=lambda x: x[1].completed_at)
+                excess = len(self.tasks) - len(tasks_to_remove) - max_tasks
+                tasks_to_remove.extend(tid for tid, _ in remaining[:excess])
             for task_id in tasks_to_remove:
-                del self.tasks[task_id]
+                self.tasks.pop(task_id, None)
                 self.running_tasks.pop(task_id, None)
+            if tasks_to_remove:
+                logger.info(f"Cleaned up {len(tasks_to_remove)} old tasks, {len(self.tasks)} remaining")
 
     async def get_stats(self) -> dict:
         """Get scheduler statistics"""
