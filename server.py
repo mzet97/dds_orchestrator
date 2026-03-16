@@ -251,9 +251,10 @@ class OrchestratorServer:
             await self._send_dds_client_response(request_id, client_id, "", success=0, error="No agents available")
             return
 
-        # Select agent with most idle slots for load balancing
-        agent = max(agents, key=lambda a: a.slots_idle)
-        logger.info(f"Selected agent: {agent.agent_id}")
+        # Select agent: fuzzy if enabled, otherwise max idle slots
+        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+            agents, messages=messages, priority=5)
+        logger.info(f"Selected agent: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
         # Acquire agent slot (status auto-derived: idle if slots remain, busy if 0)
         if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
@@ -277,7 +278,7 @@ class OrchestratorServer:
             # Register waiter BEFORE publishing to avoid race where response arrives first
             self.dds.prepare_agent_response_waiter(request_id)
             try:
-                await self.dds.publish_agent_request(dds_request)
+                await self.dds.publish_agent_request(dds_request, qos_profile=fuzzy_qos)
 
                 # Wait for agent response
                 agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
@@ -309,6 +310,13 @@ class OrchestratorServer:
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 processing_time_ms=processing_time_ms,
+            )
+
+            # Update agent metrics for fuzzy feedback
+            await self.registry.update_response_metrics(
+                agent.agent_id,
+                latency_ms=processing_time_ms or 0,
+                success=bool(content),
             )
         finally:
             # Always release agent slot
@@ -352,12 +360,14 @@ class OrchestratorServer:
         if not agents:
             return {"content": "", "success": False, "error": "No agents available"}
 
-        agent = max(agents, key=lambda a: a.slots_idle)
+        # Select agent: fuzzy if enabled, otherwise max idle slots
+        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+            agents, messages=messages, priority=priority)
         # Decrement slot (sync, direct dict access)
         agent.slots_idle = max(0, agent.slots_idle - 1)
         if agent.slots_idle == 0:
             agent.status = "busy"
-        logger.info(f"Selected agent for gRPC: {agent.agent_id} at {agent.hostname} (slots_idle={agent.slots_idle})")
+        logger.info(f"Selected agent for gRPC: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
         # Build gRPC request to agent
         _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
@@ -505,9 +515,24 @@ class OrchestratorServer:
             vision_enabled=data.get("vision_enabled", False),
             capabilities=data.get("capabilities", []),
             grpc_address=data.get("grpc_address", ""),
+            agent_profile=data.get("agent_profile", "balanced"),
+            gpu_type=data.get("gpu_type", ""),
         )
 
+        # Auto-assign agent profile based on port if not provided
+        if not agent_info.agent_profile or agent_info.agent_profile == "balanced":
+            port = agent_info.port
+            if port == 8081:
+                agent_info.agent_profile = "fast"
+            elif port == 8091:
+                agent_info.agent_profile = "quality"
+            elif port == 8092:
+                agent_info.agent_profile = "balanced"
+            else:
+                agent_info.agent_profile = "balanced"
+
         await self.registry.register_agent(agent_info)
+        logger.info(f"Agent {agent_id} registered with profile={agent_info.agent_profile}")
 
         # Registrar também no selector para seleção inteligente
         try:
