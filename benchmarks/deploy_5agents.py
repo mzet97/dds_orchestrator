@@ -183,7 +183,8 @@ def start_llama_servers():
                    f"-c {agent['context_size']} "
                    f"--threads {agent['threads']} "
                    f"-ngl 99 --reasoning-budget 0 "
-                   f"--port {agent['llama_port']} --host 0.0.0.0")
+                   f"--port {agent['llama_port']} --host 0.0.0.0 "
+                   f"--enable-dds --dds-domain 0 --dds-timeout 120")
             logfile = f"/tmp/llama_{agent['id']}.log"
             ssh_bg(vm_ip, cmd, logfile)
             print(f"  {vm_ip}:{agent['llama_port']} - {agent['desc']}")
