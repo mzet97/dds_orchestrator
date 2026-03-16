@@ -454,7 +454,7 @@ def run_benchmark_on_client(ssh_client: 'SSHManager', protocol: str, model: str,
            f"--max-tokens {max_tokens}")
 
     print(f"\n    -> {protocol.upper()} benchmark on client VM {ssh_client.ip} (scenario={scenario}, n={n})")
-    ec, out, err = ssh_client.run(cmd, timeout=600)
+    ec, out, err = ssh_client.run(cmd, timeout=7200)  # 2h for n=1000
     for line in out.strip().split('\n')[-10:]:
         print(f"      {line}")
     if ec != 0 and err:
