@@ -171,7 +171,7 @@ class DDSOrchestratorClient:
                         }
             except Exception:
                 pass
-            time.sleep(0.005)  # 5ms poll
+            time.sleep(0.001)  # 1ms poll (was 5ms)
 
         return {"error": "Timeout", "request_id": request_id}
 

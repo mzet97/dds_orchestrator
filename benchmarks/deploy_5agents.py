@@ -207,7 +207,7 @@ def start_orchestrator(fuzzy: bool = False, dds: bool = True):
     """Start orchestrator on .62."""
     print(f"\nStarting orchestrator (fuzzy={'ON' if fuzzy else 'OFF'})...")
 
-    xml = f"{BASE_DIR}/llama.cpp_dds/dds/cyclonedds-network-ultra.xml"
+    xml = f"{BASE_DIR}/llama.cpp_dds/dds/cyclonedds-network-optimized.xml"
     cmd = (f"python3 -u {BASE_DIR}/dds_orchestrator/main.py "
            f"--port {ORCH_PORT} --log-level INFO")
     env = {}
@@ -236,7 +236,7 @@ def start_agents(transport: str = "dds"):
     """Start agent proxies for all 5 agents."""
     print(f"\nStarting {len(AGENTS)} agents ({transport})...")
 
-    xml = f"{BASE_DIR}/llama.cpp_dds/dds/cyclonedds-network-ultra.xml"
+    xml = f"{BASE_DIR}/llama.cpp_dds/dds/cyclonedds-network-optimized.xml"
 
     for agent in AGENTS:
         vm_ip = agent["vm_ip"]

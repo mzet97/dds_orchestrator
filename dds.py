@@ -274,10 +274,11 @@ class DDSLayer:
         # back-to-back writes under multi-client load are not silently dropped.
         # TRANSPORT_PRIORITY(0): default priority; overridden per-request via priority writers.
         self.qos_reliable = Qos(
-            Policy.Reliability.Reliable(duration(seconds=10)),
+            Policy.Reliability.Reliable(duration(seconds=2)),
             Policy.Durability.Volatile,
-            Policy.History.KeepLast(8),
+            Policy.History.KeepLast(1),
             Policy.TransportPriority(0),
+            Policy.LatencyBudget(duration(microseconds=0)),
         )
 
         # QoS for best effort (status, heartbeat)
@@ -516,7 +517,7 @@ class DDSLayer:
                             logger.debug(f"[DDS] Client response for unknown request_id={request_id} discarded")
             except Exception as e:
                 logger.debug(f"dispatch_client_responses error: {e}")
-            await asyncio.sleep(0.002)  # 2ms for responsive dispatch
+            await asyncio.sleep(0.0005)  # 0.5ms dispatch (was 2ms)
 
     async def dispatch_agent_responses(self):
         """Background loop: sole reader of TOPIC_AGENT_RESPONSE.
@@ -562,7 +563,7 @@ class DDSLayer:
                             logger.debug(f"[DDS] Response for unknown task_id={task_id} discarded")
             except Exception as e:
                 logger.debug(f"dispatch_agent_responses error: {e}")
-            await asyncio.sleep(0.002)  # 2ms for responsive dispatch
+            await asyncio.sleep(0.0005)  # 0.5ms dispatch (was 2ms)
 
     async def subscribe(self, topic: str, handler: Callable):
         """Subscribe to topic with handler - creates a DataReader with Listener"""
