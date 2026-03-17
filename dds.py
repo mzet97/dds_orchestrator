@@ -552,8 +552,9 @@ class DDSLayer:
         """
         from cyclonedds.core import WaitSet, ReadCondition
         try:
-            # mask=0 means "any sample state" in CycloneDDS Python
-            cond = ReadCondition(reader, 0)
+            # mask = SampleState.Any | ViewState.Any | InstanceState.Any
+            # SampleState.Any=3, ViewState.Any=12, InstanceState.Any=112 → 127
+            cond = ReadCondition(reader, 127)
             ws = WaitSet(self.participant)
             ws.attach(cond)
         except Exception as e:
