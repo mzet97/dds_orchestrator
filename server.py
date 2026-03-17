@@ -169,36 +169,19 @@ class OrchestratorServer:
 
     async def _dds_client_loop(self):
         """Background task to process DDS client requests"""
-        import sys
-        import time
         logger.info("DDS client loop started")
-        logger.info("DDS client loop started")
-        self._last_debug = time.time()
         while True:
             try:
-                await asyncio.sleep(0.001)  # Poll every 1ms (was 5ms)
+                await asyncio.sleep(0.001)  # Poll every 1ms
 
                 if not self.dds.is_available():
                     continue
-
-                # Debug: print every few seconds that we're polling
-                now = time.time()
-                if now - self._last_debug > 10:
-                    msg = f"[DDS] Polling for client requests... DDS available: {self.dds.is_available()}"
-                    logger.info(msg)
-                    logger.info(msg)
-                    self._last_debug = now
 
                 # Read client requests from DDS
                 client_requests = await self.dds.read_client_requests(timeout_ms=100)
 
                 if client_requests:
-                    # print(f"RECEIVED {len(client_requests)} CLIENT REQUESTS!", flush=True, file=sys.stderr)
-                    logger.info(f"Received {len(client_requests)} client requests via DDS")
-                else:
-                    # Debug: check if there are any messages at all
-                    # This helps debug if the reader is working
-                    pass  # Debug: no requests found
+                    logger.debug(f"Received {len(client_requests)} client requests via DDS")
 
                 for req in client_requests:
                     # Filter out empty/phantom DDS samples (dispose notifications, etc.)
@@ -356,12 +339,7 @@ class OrchestratorServer:
 
         logger.info(f"Processing gRPC client request (sync): {request_id}")
 
-        # Thread-safe agent selection: use a threading.Lock for sync access
-        # (asyncio.Lock only works in the event loop thread)
-        import threading
-        if not hasattr(self.registry, '_thread_lock'):
-            self.registry._thread_lock = threading.Lock()
-
+        # Thread-safe agent selection (lock pre-created in AgentRegistry.__init__)
         with self.registry._thread_lock:
             agents = [a for a in self.registry.agents.values()
                       if a.slots_idle > 0 and a.status in ("idle", "busy")]
@@ -957,11 +935,18 @@ class OrchestratorServer:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
+        # First check without delay
+        agents = await self.registry.get_available_agents()
+        if agents:
+            return self._select_with_fuzzy(agents, messages, priority, urgency, complexity)
+        # Poll with exponential backoff: 5ms → 10ms → 20ms → 40ms → 50ms cap
+        delay = 0.005
         while loop.time() < deadline:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.05)
             agents = await self.registry.get_available_agents()
             if agents:
                 return self._select_with_fuzzy(agents, messages, priority, urgency, complexity)
-            await asyncio.sleep(0.1)
         return None, None, None
 
     async def handle_generate(self, request: web.Request) -> web.Response:

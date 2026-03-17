@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class AgentInfo:
     """Information about a registered agent"""
     agent_id: str
@@ -45,10 +45,15 @@ class AgentInfo:
 class AgentRegistry:
     """Registry for managing agents in the orchestrator"""
 
+    _EMA_ALPHA = 0.1
+    _EMA_COMPLEMENT = 0.9  # 1 - _EMA_ALPHA
+
     def __init__(self, config):
         self.config = config
         self.agents: Dict[str, AgentInfo] = {}
         self._lock = asyncio.Lock()
+        import threading
+        self._thread_lock = threading.Lock()
 
     async def register_agent(self, agent_info) -> str:
         """Register a new agent or update existing.
@@ -153,11 +158,10 @@ class AgentRegistry:
             if success:
                 agent.success_count += 1
             # Exponential moving average for latency
-            alpha = 0.1
             if agent.avg_latency_ms == 0.0:
                 agent.avg_latency_ms = latency_ms  # First sample
             else:
-                agent.avg_latency_ms = alpha * latency_ms + (1 - alpha) * agent.avg_latency_ms
+                agent.avg_latency_ms = self._EMA_ALPHA * latency_ms + self._EMA_COMPLEMENT * agent.avg_latency_ms
             # Error rate from accumulated counts
             agent.error_rate = 1.0 - (agent.success_count / max(1, agent.total_count))
 

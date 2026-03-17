@@ -11,12 +11,12 @@ from dataclasses import dataclass, asdict
 
 try:
     import orjson
-    def _json_dumps(obj): return or_json_dumps(obj).decode('utf-8')
-    def _json_loads(s): return or_json_loads(s) if isinstance(s, (bytes, bytearray)) else or_json_loads(s.encode('utf-8'))
+    def _json_dumps(obj): return orjson.dumps(obj).decode('utf-8')
+    def _json_loads(s): return orjson.loads(s) if isinstance(s, (bytes, bytearray)) else orjson.loads(s.encode('utf-8'))
 except ImportError:
     import json
-    def _json_dumps(obj): return _json_dumps(obj)
-    def _json_loads(s): return _json_loads(s)
+    def _json_dumps(obj): return json.dumps(obj)
+    def _json_loads(s): return json.loads(s)
 
 # Ensure orchestrator package is importable
 import os
