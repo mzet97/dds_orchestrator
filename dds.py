@@ -503,87 +503,60 @@ class DDSLayer:
         self._pending_agent_responses.pop(key, None)
         yield {"content": "", "is_final": True, "error": "timeout"}
 
-    def start_waitset_dispatchers(self):
-        """Start WaitSet-based dispatch threads (replaces polling loops).
+    def start_dispatchers(self):
+        """Start dedicated dispatch threads for DDS responses.
 
-        Uses CycloneDDS ReadCondition + WaitSet in dedicated threads.
-        Dispatches to asyncio via call_soon_threadsafe — zero polling overhead.
+        Uses tight take() loops in daemon threads with call_soon_threadsafe
+        to dispatch samples to the asyncio event loop without blocking it.
         """
         if not self.dds_available:
             return
 
         import threading
-        try:
-            from cyclonedds.core import WaitSet, ReadCondition
-        except ImportError:
-            logger.warning("WaitSet not available, falling back to polling dispatch")
-            return
 
         # Capture event loop for cross-thread dispatch
         try:
             self._event_loop = asyncio.get_running_loop()
         except RuntimeError:
-            logger.warning("No running event loop for WaitSet dispatch")
+            logger.warning("No running event loop for dispatch threads")
             return
 
         # Agent response dispatcher thread
         if TOPIC_AGENT_RESPONSE in self.subscribers:
             reader = self.subscribers[TOPIC_AGENT_RESPONSE]
             t = threading.Thread(
-                target=self._waitset_dispatch_loop,
+                target=self._take_dispatch_loop,
                 args=(reader, self._dispatch_agent_response_sample),
                 daemon=True, name="dds-agent-resp-dispatch")
             t.start()
-            logger.info("Started WaitSet dispatch for agent responses")
+            logger.info("Started dispatch thread for agent responses")
 
         # Client response dispatcher thread
         if TOPIC_CLIENT_RESPONSE in self.subscribers:
             reader = self.subscribers[TOPIC_CLIENT_RESPONSE]
             t = threading.Thread(
-                target=self._waitset_dispatch_loop,
+                target=self._take_dispatch_loop,
                 args=(reader, self._dispatch_client_response_sample),
                 daemon=True, name="dds-client-resp-dispatch")
             t.start()
-            logger.info("Started WaitSet dispatch for client responses")
+            logger.info("Started dispatch thread for client responses")
 
-    def _waitset_dispatch_loop(self, reader, dispatch_fn):
-        """WaitSet loop running in a dedicated thread.
-        Blocks until data arrives, then dispatches via call_soon_threadsafe.
-        """
-        from cyclonedds.core import WaitSet, ReadCondition
-        try:
-            # mask = SampleState.Any | ViewState.Any | InstanceState.Any
-            # SampleState.Any=3, ViewState.Any=12, InstanceState.Any=112 → 127
-            cond = ReadCondition(reader, 127)
-            ws = WaitSet(self.participant)
-            ws.attach(cond)
-        except Exception as e:
-            logger.error(f"Failed to create WaitSet: {e}, falling back to take() loop")
-            # Fallback: tight take() loop without WaitSet
-            while self.dds_available:
-                try:
-                    samples = reader.take()
-                    if samples and self._event_loop and not self._event_loop.is_closed():
-                        for sample in samples:
-                            if sample:
-                                self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
-                except Exception:
-                    pass
-                import time; time.sleep(0.001)
-            return
+    # Keep old name as alias for server.py compatibility
+    start_waitset_dispatchers = start_dispatchers
 
+    def _take_dispatch_loop(self, reader, dispatch_fn):
+        """Tight take() loop in dedicated thread. 0.5ms sleep between polls."""
+        import time as _time
         while self.dds_available:
             try:
-                triggered = ws.wait(timeout=1.0)
-                if triggered:
-                    samples = reader.take()
-                    if samples and self._event_loop and not self._event_loop.is_closed():
-                        for sample in samples:
-                            if sample:
-                                self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
-            except Exception as e:
-                if self.dds_available:
-                    logger.debug(f"WaitSet dispatch error: {e}")
+                samples = reader.take()
+                if samples and self._event_loop and not self._event_loop.is_closed():
+                    for sample in samples:
+                        if sample:
+                            self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
+            except Exception:
+                pass
+            _time.sleep(0.0005)  # 0.5ms — balances latency vs CPU
 
     def _dispatch_agent_response_sample(self, sample):
         """Dispatch a single agent response sample (called from asyncio thread)."""
