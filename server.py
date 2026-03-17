@@ -492,9 +492,17 @@ class OrchestratorServer:
         import uuid
         agent_id = data.get("agent_id") or str(uuid.uuid4())
 
+        # Use remote IP as hostname if agent sends "localhost" or "unknown"
+        reported_host = data.get("hostname", "unknown")
+        if reported_host in ("localhost", "127.0.0.1", "unknown", ""):
+            remote_ip = request.remote
+            if remote_ip:
+                reported_host = remote_ip
+                logger.info(f"Agent {agent_id} reported hostname={data.get('hostname')}, using remote IP {remote_ip}")
+
         agent_info = AgentInfo(
             agent_id=agent_id,
-            hostname=data.get("hostname", "unknown"),
+            hostname=reported_host,
             port=data.get("port", 8080),
             model=data.get("model", "unknown"),
             vram_available_mb=data.get("vram_available_mb", 0),
