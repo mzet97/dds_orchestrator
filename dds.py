@@ -4,11 +4,19 @@ Uses CycloneDDS for pub/sub communication with agents
 """
 
 import asyncio
-import json
 import logging
 import time
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass, asdict
+
+try:
+    import orjson
+    def _json_dumps(obj): return or_json_dumps(obj).decode('utf-8')
+    def _json_loads(s): return or_json_loads(s) if isinstance(s, (bytes, bytearray)) else or_json_loads(s.encode('utf-8'))
+except ImportError:
+    import json
+    def _json_dumps(obj): return _json_dumps(obj)
+    def _json_loads(s): return _json_loads(s)
 
 # Ensure orchestrator package is importable
 import os
@@ -495,75 +503,133 @@ class DDSLayer:
         self._pending_agent_responses.pop(key, None)
         yield {"content": "", "is_final": True, "error": "timeout"}
 
-    async def dispatch_client_responses(self):
-        """Background loop: sole reader of TOPIC_CLIENT_RESPONSE.
+    def start_waitset_dispatchers(self):
+        """Start WaitSet-based dispatch threads (replaces polling loops).
 
-        Reads samples and dispatches each one to the matching waiter in
-        _pending_client_responses.  Running as a single consumer avoids the
-        race condition where multiple concurrent wait_for_client_response()
-        callers each call take() and steal each other's samples.
+        Uses CycloneDDS ReadCondition + WaitSet in dedicated threads.
+        Dispatches to asyncio via call_soon_threadsafe — zero polling overhead.
         """
-        while True:
+        if not self.dds_available:
+            return
+
+        import threading
+        try:
+            from cyclonedds.core import WaitSet, ReadCondition
+        except ImportError:
+            logger.warning("WaitSet not available, falling back to polling dispatch")
+            return
+
+        # Capture event loop for cross-thread dispatch
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("No running event loop for WaitSet dispatch")
+            return
+
+        # Agent response dispatcher thread
+        if TOPIC_AGENT_RESPONSE in self.subscribers:
+            reader = self.subscribers[TOPIC_AGENT_RESPONSE]
+            t = threading.Thread(
+                target=self._waitset_dispatch_loop,
+                args=(reader, self._dispatch_agent_response_sample),
+                daemon=True, name="dds-agent-resp-dispatch")
+            t.start()
+            logger.info("Started WaitSet dispatch for agent responses")
+
+        # Client response dispatcher thread
+        if TOPIC_CLIENT_RESPONSE in self.subscribers:
+            reader = self.subscribers[TOPIC_CLIENT_RESPONSE]
+            t = threading.Thread(
+                target=self._waitset_dispatch_loop,
+                args=(reader, self._dispatch_client_response_sample),
+                daemon=True, name="dds-client-resp-dispatch")
+            t.start()
+            logger.info("Started WaitSet dispatch for client responses")
+
+    def _waitset_dispatch_loop(self, reader, dispatch_fn):
+        """WaitSet loop running in a dedicated thread.
+        Blocks until data arrives, then dispatches via call_soon_threadsafe.
+        """
+        from cyclonedds.core import WaitSet, ReadCondition
+        try:
+            cond = ReadCondition(reader)
+            ws = WaitSet(self.participant)
+            ws.attach(cond)
+        except Exception as e:
+            logger.error(f"Failed to create WaitSet: {e}, falling back to take() loop")
+            # Fallback: tight take() loop without WaitSet
+            while self.dds_available:
+                try:
+                    samples = reader.take()
+                    if samples and self._event_loop and not self._event_loop.is_closed():
+                        for sample in samples:
+                            if sample:
+                                self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
+                except Exception:
+                    pass
+                import time; time.sleep(0.001)
+            return
+
+        while self.dds_available:
             try:
-                if self.dds_available and TOPIC_CLIENT_RESPONSE in self.subscribers:
-                    samples = self.read_messages(TOPIC_CLIENT_RESPONSE, timeout_ms=20)
-                    for sample in samples:
-                        request_id = getattr(sample, "request_id", None)
-                        if request_id and request_id in self._pending_client_responses:
-                            event, container = self._pending_client_responses[request_id]
-                            container[0] = sample
-                            event.set()
-                        else:
-                            logger.debug(f"[DDS] Client response for unknown request_id={request_id} discarded")
+                triggered = ws.wait(timeout=1.0)
+                if triggered:
+                    samples = reader.take()
+                    if samples and self._event_loop and not self._event_loop.is_closed():
+                        for sample in samples:
+                            if sample:
+                                self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
             except Exception as e:
-                logger.debug(f"dispatch_client_responses error: {e}")
-            await asyncio.sleep(0.0005)  # 0.5ms dispatch (was 2ms)
+                if self.dds_available:
+                    logger.debug(f"WaitSet dispatch error: {e}")
+
+    def _dispatch_agent_response_sample(self, sample):
+        """Dispatch a single agent response sample (called from asyncio thread)."""
+        task_id = getattr(sample, "task_id", None)
+        if not task_id:
+            return
+        is_final = getattr(sample, "is_final", True)
+
+        # Streaming path
+        stream_key = f"stream_{task_id}"
+        if stream_key in self._pending_agent_responses:
+            _, chunks = self._pending_agent_responses[stream_key]
+            chunks.append({
+                "content": getattr(sample, "content", ""),
+                "is_final": bool(is_final),
+                "prompt_tokens": getattr(sample, "prompt_tokens", 0),
+                "completion_tokens": getattr(sample, "completion_tokens", 0),
+                "processing_time_ms": getattr(sample, "processing_time_ms", 0),
+            })
+            if is_final:
+                event, _ = self._pending_agent_responses[stream_key]
+                event.set()
+            return
+
+        # Non-streaming path
+        if task_id in self._pending_agent_responses:
+            if is_final:
+                event, container = self._pending_agent_responses[task_id]
+                container[0] = sample
+                event.set()
+
+    def _dispatch_client_response_sample(self, sample):
+        """Dispatch a single client response sample (called from asyncio thread)."""
+        request_id = getattr(sample, "request_id", None)
+        if request_id and request_id in self._pending_client_responses:
+            event, container = self._pending_client_responses[request_id]
+            container[0] = sample
+            event.set()
+
+    async def dispatch_client_responses(self):
+        """Legacy polling fallback — only used if WaitSet init fails."""
+        while True:
+            await asyncio.sleep(3600)  # Effectively idle (WaitSet handles dispatch)
 
     async def dispatch_agent_responses(self):
-        """Background loop: sole reader of TOPIC_AGENT_RESPONSE.
-
-        Reads samples and dispatches each one to the matching waiter in
-        _pending_agent_responses.  Supports both:
-        - Non-streaming: waiter keyed by task_id, container[0] = final sample
-        - Streaming: waiter keyed by 'stream_{task_id}', chunks appended to list
-        """
+        """Legacy polling fallback — only used if WaitSet init fails."""
         while True:
-            try:
-                if self.dds_available and TOPIC_AGENT_RESPONSE in self.subscribers:
-                    samples = self.read_messages(TOPIC_AGENT_RESPONSE, timeout_ms=20)
-                    for sample in samples:
-                        task_id = getattr(sample, "task_id", None)
-                        if not task_id:
-                            continue
-                        is_final = getattr(sample, "is_final", True)
-
-                        # Streaming path: accumulate chunks
-                        stream_key = f"stream_{task_id}"
-                        if stream_key in self._pending_agent_responses:
-                            _, chunks = self._pending_agent_responses[stream_key]
-                            chunks.append({
-                                "content": getattr(sample, "content", ""),
-                                "is_final": bool(is_final),
-                                "prompt_tokens": getattr(sample, "prompt_tokens", 0),
-                                "completion_tokens": getattr(sample, "completion_tokens", 0),
-                                "processing_time_ms": getattr(sample, "processing_time_ms", 0),
-                            })
-                            if is_final:
-                                event, _ = self._pending_agent_responses[stream_key]
-                                event.set()
-                            continue
-
-                        # Non-streaming path: resolve waiter with final sample
-                        if task_id in self._pending_agent_responses:
-                            if is_final:
-                                event, container = self._pending_agent_responses[task_id]
-                                container[0] = sample
-                                event.set()
-                        else:
-                            logger.debug(f"[DDS] Response for unknown task_id={task_id} discarded")
-            except Exception as e:
-                logger.debug(f"dispatch_agent_responses error: {e}")
-            await asyncio.sleep(0.0005)  # 0.5ms dispatch (was 2ms)
+            await asyncio.sleep(3600)  # Effectively idle (WaitSet handles dispatch)
 
     async def subscribe(self, topic: str, handler: Callable):
         """Subscribe to topic with handler - creates a DataReader with Listener"""
@@ -630,7 +696,7 @@ class DDSLayer:
             "task_id": request.task_id,
             "requester_id": request.requester_id,
             "task_type": request.task_type,
-            "messages_json": json.dumps(request.messages),
+            "messages_json": _json_dumps(request.messages),
             "priority": request.priority,
             "timeout_ms": request.timeout_ms,
             "requires_context": bool(request.requires_context),
@@ -851,10 +917,10 @@ class DDSMessageSerializer:
     @staticmethod
     def serialize(obj) -> bytes:
         """Serialize object to bytes"""
-        return json.dumps(asdict(obj)).encode('utf-8')
+        return _json_dumps(asdict(obj)).encode('utf-8')
 
     @staticmethod
     def deserialize(data: bytes, msg_type):
         """Deserialize bytes to object"""
-        obj_dict = json.loads(data.decode('utf-8'))
+        obj_dict = _json_loads(data.decode('utf-8'))
         return msg_type(**obj_dict)

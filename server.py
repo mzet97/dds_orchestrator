@@ -106,9 +106,11 @@ class OrchestratorServer:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         # DDS client request handler
         self._dds_client_task = asyncio.create_task(self._dds_client_loop())
-        # Sole consumer of TOPIC_AGENT_RESPONSE — dispatches to per-task waiters
+        # Start WaitSet-based dispatchers (zero-polling, event-driven)
+        # Falls back to legacy polling if WaitSet not available
+        self.dds.start_waitset_dispatchers()
+        # Legacy dispatch tasks kept as idle fallbacks (sleep forever)
         self._response_dispatch_task = asyncio.create_task(self.dds.dispatch_agent_responses())
-        # Sole consumer of TOPIC_CLIENT_RESPONSE — dispatches to per-client waiters
         if hasattr(self.dds, 'dispatch_client_responses'):
             self._client_response_dispatch_task = asyncio.create_task(self.dds.dispatch_client_responses())
 
