@@ -19,6 +19,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # Virtual environments
 venv/
@@ -37,10 +38,9 @@ ENV/
 *.log
 logs/
 
-# Results and benchmarks
+# Backups
+*.bak
+
+# Results (tracked in benchmarks/results/ and benchmarks/plots/)
 results/
 benchmark_results/
-*.csv
-*.json
-benchmark_*.png
-benchmark_*.pdf
