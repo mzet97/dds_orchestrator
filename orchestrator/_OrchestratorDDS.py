@@ -68,6 +68,7 @@ class TaskRequest(idl.IdlStruct, typename="orchestrator.TaskRequest"):
     temperature: types.float32 = 0.7
     urgency: types.int32 = 5
     complexity: types.int32 = 5
+    target_agent_id: str = ""
 
 
 @dataclass

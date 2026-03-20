@@ -22,11 +22,11 @@ class OrchestratorConfig:
     dds_enabled: bool = True
 
     # Agent settings
-    max_agents: int = 10
+    max_agents: int = 1000
     agent_timeout_seconds: int = 300
 
     # Task settings
-    max_concurrent_tasks: int = 50
+    max_concurrent_tasks: int = 2000
     task_timeout_seconds: int = 120
 
     # gRPC settings
@@ -46,6 +46,23 @@ class OrchestratorConfig:
     default_max_tokens: int = 256
     default_temperature: float = 0.7
 
+    # Redis settings
+    redis_url: str = ""
+    redis_password: str = ""
+
+    # MongoDB settings
+    mongo_url: str = ""
+    mongo_db: str = "dds_orchestrator"
+
+    # Instance Pool / Routing
+    routing_algorithm: str = "least_loaded"
+    max_rps: int = 5000
+    instance_ports_gpu: str = ""
+    instance_ports_cpu: str = ""
+    instance_host: str = "192.168.1.61"
+    slots_per_gpu: int = 15
+    slots_per_cpu: int = 4
+
     # Expected types for each field, used for validation after loading
     _field_types = {
         "host": str,
@@ -62,6 +79,17 @@ class OrchestratorConfig:
         "default_temperature": float,
         "grpc_enabled": bool,
         "grpc_port": int,
+        "redis_url": str,
+        "redis_password": str,
+        "mongo_url": str,
+        "mongo_db": str,
+        "routing_algorithm": str,
+        "max_rps": int,
+        "instance_ports_gpu": str,
+        "instance_ports_cpu": str,
+        "instance_host": str,
+        "slots_per_gpu": int,
+        "slots_per_cpu": int,
     }
 
     def load_from_file(self, config_path: Path):
@@ -129,6 +157,15 @@ class OrchestratorConfig:
             "default_model": self.default_model,
             "default_max_tokens": self.default_max_tokens,
             "default_temperature": self.default_temperature,
+            "redis_url": self.redis_url,
+            "mongo_url": self.mongo_url,
+            "routing_algorithm": self.routing_algorithm,
+            "max_rps": self.max_rps,
+            "instance_ports_gpu": self.instance_ports_gpu,
+            "instance_ports_cpu": self.instance_ports_cpu,
+            "instance_host": self.instance_host,
+            "slots_per_gpu": self.slots_per_gpu,
+            "slots_per_cpu": self.slots_per_cpu,
         }
 
 
@@ -139,11 +176,22 @@ def load_config_from_env() -> OrchestratorConfig:
         port=int(os.environ.get("ORCH_PORT", "8080")),
         dds_domain=int(os.environ.get("DDS_DOMAIN", "0")),
         dds_enabled=os.environ.get("DDS_ENABLED", "true").lower() == "true",
-        max_agents=int(os.environ.get("MAX_AGENTS", "10")),
+        max_agents=int(os.environ.get("MAX_AGENTS", "1000")),
         agent_timeout_seconds=int(os.environ.get("AGENT_TIMEOUT_SECONDS", "300")),
-        max_concurrent_tasks=int(os.environ.get("MAX_CONCURRENT_TASKS", "50")),
+        max_concurrent_tasks=int(os.environ.get("MAX_CONCURRENT_TASKS", "2000")),
         task_timeout_seconds=int(os.environ.get("TASK_TIMEOUT_SECONDS", "120")),
         default_max_tokens=int(os.environ.get("DEFAULT_MAX_TOKENS", "256")),
         default_temperature=float(os.environ.get("DEFAULT_TEMPERATURE", "0.7")),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
+        redis_url=os.environ.get("REDIS_URL", ""),
+        redis_password=os.environ.get("REDIS_PASSWORD", ""),
+        mongo_url=os.environ.get("MONGO_URL", ""),
+        mongo_db=os.environ.get("MONGO_DB", "dds_orchestrator"),
+        routing_algorithm=os.environ.get("ROUTING_ALGORITHM", "least_loaded"),
+        max_rps=int(os.environ.get("MAX_RPS", "5000")),
+        instance_ports_gpu=os.environ.get("INSTANCE_PORTS_GPU", ""),
+        instance_ports_cpu=os.environ.get("INSTANCE_PORTS_CPU", ""),
+        instance_host=os.environ.get("INSTANCE_HOST", "192.168.1.61"),
+        slots_per_gpu=int(os.environ.get("SLOTS_PER_GPU", "15")),
+        slots_per_cpu=int(os.environ.get("SLOTS_PER_CPU", "4")),
     )

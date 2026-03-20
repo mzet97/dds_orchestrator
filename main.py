@@ -43,6 +43,19 @@ async def main():
                        help="gRPC listen port (default: 50052)")
     parser.add_argument("--fuzzy", action="store_true", default=None,
                        help="Enable fuzzy logic agent selection")
+    parser.add_argument("--redis-url", type=str, default=None,
+                       help="Redis URL (e.g. redis://redis.home.arpa:6379)")
+    parser.add_argument("--redis-password", type=str, default=None,
+                       help="Redis password")
+    parser.add_argument("--mongo-url", type=str, default=None,
+                       help="MongoDB URL")
+    parser.add_argument("--routing-algorithm", type=str, default=None,
+                       choices=["round_robin", "least_loaded", "weighted_score"],
+                       help="Routing algorithm for instance pool")
+    parser.add_argument("--instance-ports-gpu", type=str, default=None,
+                       help="Comma-separated GPU instance ports")
+    parser.add_argument("--instance-ports-cpu", type=str, default=None,
+                       help="Comma-separated CPU instance ports")
 
     args = parser.parse_args()
 
@@ -69,6 +82,18 @@ async def main():
             config.grpc_port = args.grpc_port
         if args.fuzzy is not None:
             config.fuzzy_enabled = args.fuzzy
+        if args.redis_url is not None:
+            config.redis_url = args.redis_url
+        if args.redis_password is not None:
+            config.redis_password = args.redis_password
+        if args.mongo_url is not None:
+            config.mongo_url = args.mongo_url
+        if args.routing_algorithm is not None:
+            config.routing_algorithm = args.routing_algorithm
+        if args.instance_ports_gpu is not None:
+            config.instance_ports_gpu = args.instance_ports_gpu
+        if args.instance_ports_cpu is not None:
+            config.instance_ports_cpu = args.instance_ports_cpu
     else:
         config = load_config_from_env()
         config.port = args.port if args.port is not None else config.port
@@ -81,6 +106,18 @@ async def main():
             config.grpc_port = args.grpc_port
         if args.fuzzy is not None:
             config.fuzzy_enabled = args.fuzzy
+        if args.redis_url is not None:
+            config.redis_url = args.redis_url
+        if args.redis_password is not None:
+            config.redis_password = args.redis_password
+        if args.mongo_url is not None:
+            config.mongo_url = args.mongo_url
+        if args.routing_algorithm is not None:
+            config.routing_algorithm = args.routing_algorithm
+        if args.instance_ports_gpu is not None:
+            config.instance_ports_gpu = args.instance_ports_gpu
+        if args.instance_ports_cpu is not None:
+            config.instance_ports_cpu = args.instance_ports_cpu
 
     logger.info("=" * 60)
     logger.info("DDS-LLM Orchestrator Starting")
@@ -93,6 +130,12 @@ async def main():
     if config.grpc_enabled:
         logger.info(f"gRPC Port: {config.grpc_port}")
     logger.info(f"Fuzzy Enabled: {config.fuzzy_enabled}")
+    if config.redis_url:
+        logger.info(f"Redis: {config.redis_url}")
+    if config.mongo_url:
+        logger.info(f"MongoDB: {config.mongo_url}")
+    if config.instance_ports_gpu or config.instance_ports_cpu:
+        logger.info(f"Routing: {config.routing_algorithm}")
     logger.info("=" * 60)
 
     # Initialize components
@@ -117,6 +160,64 @@ async def main():
         except ImportError as e:
             logger.warning(f"Fuzzy engine not available: {e}. Using baseline selector.")
 
+    # Initialize Redis + MongoDB + InstancePool (Phase 5)
+    redis_mgr = None
+    mongo_store = None
+    instance_pool = None
+    backpressure = None
+
+    if config.redis_url:
+        try:
+            from redis_layer import RedisStateManager
+            redis_mgr = RedisStateManager(config.redis_url, config.redis_password)
+            await redis_mgr.connect()
+            logger.info("Redis connected")
+        except Exception as e:
+            logger.warning(f"Redis not available: {e}")
+            redis_mgr = None
+
+    if config.mongo_url:
+        try:
+            from mongo_layer import MongoMetricsStore
+            mongo_store = MongoMetricsStore(config.mongo_url, config.mongo_db)
+            await mongo_store.connect()
+            await mongo_store.ensure_indexes()
+            logger.info("MongoDB connected")
+        except Exception as e:
+            logger.warning(f"MongoDB not available: {e}")
+            mongo_store = None
+
+    if redis_mgr and (config.instance_ports_gpu or config.instance_ports_cpu):
+        from instance_pool import InstancePool, InstanceInfo, RoutingAlgorithm
+        from backpressure import BackpressureManager
+
+        instance_pool = InstancePool(
+            redis_mgr, mongo_store,
+            algorithm=RoutingAlgorithm(config.routing_algorithm),
+        )
+        # Register GPU instances
+        if config.instance_ports_gpu:
+            for port_str in config.instance_ports_gpu.split(","):
+                port_str = port_str.strip()
+                if port_str:
+                    await instance_pool.register_instance(
+                        InstanceInfo(port=int(port_str), hostname=config.instance_host,
+                                     inst_type="gpu", slots_total=config.slots_per_gpu,
+                                     weight=1.0))
+        # Register CPU instances
+        if config.instance_ports_cpu:
+            for port_str in config.instance_ports_cpu.split(","):
+                port_str = port_str.strip()
+                if port_str:
+                    await instance_pool.register_instance(
+                        InstanceInfo(port=int(port_str), hostname=config.instance_host,
+                                     inst_type="cpu", slots_total=config.slots_per_cpu,
+                                     weight=0.3))
+
+        backpressure = BackpressureManager(redis_mgr, config.max_rps)
+        logger.info(f"InstancePool ready: {len(instance_pool._instances)} instances, "
+                     f"algorithm={config.routing_algorithm}")
+
     # Create server
     server = OrchestratorServer(
         config=config,
@@ -126,6 +227,10 @@ async def main():
         selector=selector,
         grpc_layer=grpc_layer,
         fuzzy_engine=fuzzy_engine,
+        instance_pool=instance_pool,
+        redis_mgr=redis_mgr,
+        mongo_store=mongo_store,
+        backpressure=backpressure,
     )
 
     # Start server
@@ -141,6 +246,10 @@ async def main():
         logger.info("Shutting down...")
     finally:
         await server.stop()
+        if redis_mgr:
+            await redis_mgr.close()
+        if mongo_store:
+            await mongo_store.close()
         logger.info("Orchestrator stopped.")
 
 

@@ -1,0 +1,135 @@
+{
+  "timestamp": "2026-03-13T23:09:27.402680",
+  "config": {
+    "n": 5,
+    "cenario": "all"
+  },
+  "DDS": {
+    "E1": [
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt short --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: short (12 chars)\nIterações: 5\n--------------------------------------------------\nIteração 1/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 2/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 3/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 4/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 5/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nNenhum resultado coletado.\n",
+        "stderr": ""
+      },
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt long --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: long (137 chars)\nIterações: 5\n--------------------------------------------------\nIteração 1/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 2/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 3/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 4/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteração 5/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nNenhum resultado coletado.\n",
+        "stderr": ""
+      }
+    ],
+    "E3": [
+      {
+        "script": "E3_priority_dds.py",
+        "args": "--url http://localhost:8080 --carga 2 --n 5 --duracao 60 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E3: Priorização - DDS TRANSPORT_PRIORITY (via orquestrador)\nURL: http://localhost:8080\nCarga NORMAL: 2 req/s\nDuração: 60s\nInjeções HIGH: 5\nIntervalo entre injeções: 12.0s\n--------------------------------------------------\nInjeção 1/5: latência=1.27ms (ERRO)\nInjeção 2/5: latência=2.63ms (ERRO)\nInjeção 3/5: latência=1.14ms (ERRO)\nInjeção 4/5: latência=1.04ms (ERRO)\nAviso: carga background terminou antes das 5 injeções\nERRO: dados insuficientes para análise\n",
+        "stderr": ""
+      }
+    ],
+    "E4": [
+      {
+        "script": "E4_scalability_dds.py",
+        "args": "--orchestrador http://localhost:8080 --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E4: Escalabilidade Multi-Agente - DDS\nOrquestrador: http://localhost:8080\nAgentes (1): ['http://localhost:8082']\nFase: A\nConfigurações de clientes: [1, 2, 4, 8]\nRequisições por cliente: 5\n============================================================\n\n--- Fase A: 1 agente(s), 1 cliente(s) ---\n  Throughput: 0.00 req/s\n  Latência p50: 0.00ms  p95: 0.00ms  p99: 0.00ms\n  Sucesso: 0/0\n\n--- Fase A: 1 agente(s), 2 cliente(s) ---\n  Throughput: 0.00 req/s\n  Latência p50: 0.00ms  p95: 0.00ms  p99: 0.00ms\n  Sucesso: 0/0\n\n--- Fase A: 1 agente(s), 4 cliente(s) ---\n  Throughput: 0.00 req/s\n  Latência p50: 0.00ms  p95: 0.00ms  p99: 0.00ms\n  Sucesso: 0/0\n\n--- Fase A: 1 agente(s), 8 cliente(s) ---\n  Throughput: 0.00 req/s\n  Latência p50: 0.00ms  p95: 0.00ms  p99: 0.00ms\n  Sucesso: 0/0\n\n============================================================\nResumo Fase A (1 agente(s)):\nClientes    p50(ms)    p95(ms)    req/s\n\nJSON: results/E4_DDS_faseA_1ag_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E5_orch": [
+      {
+        "script": "E5_streaming_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E5: Streaming Token-a-Token - DDS (via orquestrador)\nRota: Cliente -> Orquestrador HTTP -> DDS -> Agente -> DDS -> Orquestrador -> SSE -> Cliente\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nIteracoes: 5\n--------------------------------------------------\nIteracao 1/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteracao 2/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteracao 3/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteracao 4/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\nIteracao 5/5: ERRO - Cannot connect to host localhost:8080 ssl:default [Connect call failed ('127.0.0.1', 8080)]\n\nResultados:\nTTFT medio: 0.00ms\nITL medio: 0.00ms\nITL p99: 0.00ms\n\nCSV: results/E5_DDS_VIA_ORCH_streaming_Qwen3.5-9B.csv\nJSON: results/E5_DDS_VIA_ORCH_streaming_Qwen3.5-9B_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E2": [
+      {
+        "script": "E2_failure_detection_dds.py",
+        "args": "--periodo 1000 --lease 200 --n 5 --domain 0",
+        "exit_code": 0,
+        "stdout": "E2: Detecção de Falha - DDS (DEADLINE + LIVELINESS)\nPeríodo DEADLINE: 1000ms\nLease LIVELINESS: 200ms (0=disabled)\nTipo de falha: kill9\nIterações: 5\nDDS Domain: 0\n------------------------------------------------------------\nIteração 1/5: 199.82ms (LIVELINESS)\nIteração 2/5: 165.04ms (LIVELINESS)\nIteração 3/5: 158.30ms (LIVELINESS)\nIteração 4/5: 180.66ms (LIVELINESS)\nIteração 5/5: 168.61ms (LIVELINESS)\n\nResultados:\nTempo médio de detecção: 174.48ms\nMediana:                 168.61ms\np95:                     199.82ms\nDetecção por mecanismo:  {'LIVELINESS': 5}\nTimeouts:                0/5\n\nCSV: results/E2_DDS_kill9_1000ms_lease200ms.csv\nJSON: results/E2_DDS_kill9_1000ms_lease200ms_summary.json\n",
+        "stderr": ""
+      }
+    ]
+  },
+  "gRPC": {
+    "E1": [
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt short --n 5 --protocol-label gRPC",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: short (12 chars)\nIterações: 5\n--------------------------------------------------\n\nResultados:\nT_total médio:          2.45 ms\nT4 (inferência) médio:  0.00 ms\nOverhead transporte:    100.00%\n\nCSV: results/E1_gRPC_Qwen3.5-9B_short.csv\nJSON: results/E1_gRPC_Qwen3.5-9B_short_summary.json\n",
+        "stderr": ""
+      },
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt long --n 5 --protocol-label gRPC",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: long (137 chars)\nIterações: 5\n--------------------------------------------------\n\nResultados:\nT_total médio:          2.53 ms\nT4 (inferência) médio:  0.00 ms\nOverhead transporte:    100.00%\n\nCSV: results/E1_gRPC_Qwen3.5-9B_long.csv\nJSON: results/E1_gRPC_Qwen3.5-9B_long_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E3": [
+      {
+        "script": "E3_priority_dds.py",
+        "args": "--url http://localhost:8080 --carga 2 --n 5 --duracao 60 --protocol-label gRPC",
+        "exit_code": 0,
+        "stdout": "E3: Priorização - DDS TRANSPORT_PRIORITY (via orquestrador)\nURL: http://localhost:8080\nCarga NORMAL: 2 req/s\nDuração: 60s\nInjeções HIGH: 5\nIntervalo entre injeções: 12.0s\n--------------------------------------------------\nInjeção 1/5: latência=2.85ms (OK)\nInjeção 2/5: latência=1.47ms (OK)\nInjeção 3/5: latência=1.61ms (OK)\nInjeção 4/5: latência=1.52ms (OK)\nAviso: carga background terminou antes das 5 injeções\n\nResultados:\nNORMAL  (n=120): mediana=1.35ms, p95=2.35ms\nHIGH    (n=4): mediana=1.56ms\nVantagem HIGH sobre NORMAL: -0.21ms\n\nCSV: results/E3_gRPC_PRIORITY_carga2.csv\nJSON: results/E3_gRPC_PRIORITY_carga2_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E4": [
+      {
+        "script": "E4_scalability_dds.py",
+        "args": "--orchestrador http://localhost:8080 --n 5 --protocol-label gRPC",
+        "exit_code": 0,
+        "stdout": "E4: Escalabilidade Multi-Agente - DDS\nOrquestrador: http://localhost:8080\nAgentes (1): ['http://localhost:8082']\nFase: A\nConfigurações de clientes: [1, 2, 4, 8]\nRequisições por cliente: 5\n============================================================\n\n--- Fase A: 1 agente(s), 1 cliente(s) ---\n  Throughput: 12.15 req/s\n  Latência p50: 206.47ms  p95: 410.81ms  p99: 410.81ms\n  Sucesso: 5/5\n\n--- Fase A: 1 agente(s), 2 cliente(s) ---\n  Throughput: 12.30 req/s\n  Latência p50: 356.57ms  p95: 811.79ms  p99: 811.79ms\n  Sucesso: 10/10\n\n--- Fase A: 1 agente(s), 4 cliente(s) ---\n  Throughput: 12.33 req/s\n  Latência p50: 662.99ms  p95: 1620.63ms  p99: 1620.63ms\n  Sucesso: 20/20\n\n--- Fase A: 1 agente(s), 8 cliente(s) ---\n  Throughput: 16.43 req/s\n  Latência p50: 922.32ms  p95: 2329.22ms  p99: 2431.75ms\n  Sucesso: 40/40\n\n============================================================\nResumo Fase A (1 agente(s)):\nClientes    p50(ms)    p95(ms)    req/s\n       1      206.5      410.8    12.15\n       2      356.6      811.8    12.30\n       4      663.0     1620.6    12.33\n       8      922.3     2329.2    16.43\n\nJSON: results/E4_gRPC_faseA_1ag_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E5_orch": [
+      {
+        "script": "E5_streaming_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --n 5 --protocol-label gRPC",
+        "exit_code": 0,
+        "stdout": "E5: Streaming Token-a-Token - DDS (via orquestrador)\nRota: Cliente -> Orquestrador HTTP -> DDS -> Agente -> DDS -> Orquestrador -> SSE -> Cliente\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nIteracoes: 5\n--------------------------------------------------\nIteracao 1/5: TTFT=0.0ms, ITL=0.00ms, Tokens=0\nIteracao 2/5: TTFT=0.0ms, ITL=0.00ms, Tokens=0\nIteracao 3/5: TTFT=0.0ms, ITL=0.00ms, Tokens=0\nIteracao 4/5: TTFT=0.0ms, ITL=0.00ms, Tokens=0\nIteracao 5/5: TTFT=0.0ms, ITL=0.00ms, Tokens=0\n\nResultados:\nTTFT medio: 0.00ms\nITL medio: 0.00ms\nITL p99: 0.00ms\n\nCSV: results/E5_gRPC_VIA_ORCH_streaming_Qwen3.5-9B.csv\nJSON: results/E5_gRPC_VIA_ORCH_streaming_Qwen3.5-9B_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E5_direct": [
+      {
+        "script": "E5_streaming_grpc.py",
+        "args": "--endpoint 192.168.1.61:50051 --model Qwen3.5-9B --n 5",
+        "exit_code": 0,
+        "stdout": "E5: Streaming Token-a-Token - gRPC Nativo (StreamChat RPC)\nEndpoint: 192.168.1.61:50051\nModelo: Qwen3.5-9B\nIterações: 5\n--------------------------------------------------\nIteração 1/5: ERRO - gRPC StatusCode.UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:192.168.1.61:50051: Failed to connect to remote host: connect: Connection refused (111)\nIteração 2/5: ERRO - gRPC StatusCode.UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:192.168.1.61:50051: Failed to connect to remote host: connect: Connection refused (111)\nIteração 3/5: ERRO - gRPC StatusCode.UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:192.168.1.61:50051: Failed to connect to remote host: connect: Connection refused (111)\nIteração 4/5: ERRO - gRPC StatusCode.UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:192.168.1.61:50051: Failed to connect to remote host: connect: Connection refused (111)\nIteração 5/5: ERRO - gRPC StatusCode.UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:192.168.1.61:50051: Failed to connect to remote host: connect: Connection refused (111)\nNenhum resultado coletado. Verifique se llama-server com --enable-grpc está rodando.\n",
+        "stderr": ""
+      }
+    ],
+    "E2": [
+      {
+        "script": "E2_failure_detection_grpc.py",
+        "args": "--periodo 1000 --n 5 --port 50099",
+        "exit_code": 0,
+        "stdout": "E2: Detecção de Falha - gRPC Health Check (GetStatus RPC)\nPeríodo equivalente: 1000ms (poll a cada 100ms)\nTipo de falha: kill9\nIterações: 5\n--------------------------------------------------\nIteração 1/5: 2.62ms\nIteração 2/5: 2.31ms\nIteração 3/5: 3.20ms\nIteração 4/5: 2.76ms\nIteração 5/5: 2.72ms\n\nResultados:\nTempo médio de detecção: 2.72ms\nMediana:                 2.72ms\np95:                     3.20ms\nIntervalo de poll:       100ms\nTimeouts:                0/5\n\nCSV: results/E2_gRPC_HEALTH_kill9_1000ms.csv\nJSON: results/E2_gRPC_HEALTH_kill9_1000ms_summary.json\n",
+        "stderr": ""
+      }
+    ]
+  },
+  "result_files": {
+    "E1_gRPC_Qwen3.5-9B_long_summary.json": "{\n  \"protocol\": \"gRPC\",\n  \"model\": \"Qwen3.5-9B\",\n  \"prompt_type\": \"long\",\n  \"n\": 5,\n  \"T1_serialization_ms_mean\": 0.0163,\n  \"T1_serialization_ms_median\": 0.0153,\n  \"T1_serialization_ms_stdev\": 0.0048,\n  \"T1_serialization_ms_p95\": 0.024,\n  \"T1_serialization_ms_p99\": 0.024,\n  \"T1_serialization_ms_min\": 0.0122,\n  \"T1_serialization_ms_max\": 0.024,\n  \"T2_transport_send_ms_mean\": 1.2645,\n  \"T2_transport_send_ms_median\": 0.933,\n  \"T2_transport_send_ms_stdev\": 0.6847,\n  \"T2_transport_send_ms_p95\": 2.4814,\n  \"T2_transport_send_ms_p99\": 2.4814,\n  \"T2_transport_send_ms_min\": 0.901,\n  \"T2_transport_send_ms_max\": 2.4814,\n  \"T3_queue_ms_mean\": 0,\n  \"T3_queue_ms_median\": 0,\n  \"T3_queue_ms_stdev\": 0.0,\n  \"T3_queue_ms_p95\": 0,\n  \"T3_queue_ms_p99\": 0,\n  \"T3_queue_ms_min\": 0,\n  \"T3_queue_ms_max\": 0,\n  \"T4_inference_ms_mean\": 0,\n  \"T4_inference_ms_median\": 0,\n  \"T4_inference_ms_stdev\": 0.0,\n  \"T4_inference_ms_p95\": 0,\n  \"T4_inference_ms_p99\": 0,\n  \"T4_inference_ms_min\": 0,\n  \"T4_inference_ms_max\": 0,\n  \"T5_transport_return_ms_mean\": 1.2645,\n  \"T5_transport_return_ms_median\": 0.933,\n  \"T5_transport_return_ms_stdev\": 0.6847,\n  \"T5_transport_return_ms_p95\": 2.4814,\n  \"T5_transport_return_ms_p99\": 2.4814,\n  \"T5_transport_return_ms_min\": 0.901,\n  \"T5_transport_return_ms_max\": 2.4814,\n  \"T6_deserialization_ms_mean\": 0.0149,\n  \"T6_deserialization_ms_median\": 0.014,\n  \"T6_deserialization_ms_stdev\": 0.0016,\n  \"T6_deserialization_ms_p95\": 0.0172,\n  \"T6_deserialization_ms_p99\": 0.0172,\n  \"T6_deserialization_ms_min\": 0.0136,\n  \"T6_deserialization_ms_max\": 0.0172,\n  \"T_total_ms_mean\": 2.529,\n  \"T_total_ms_median\": 1.866,\n  \"T_total_ms_stdev\": 1.3694,\n  \"T_total_ms_p95\": 4.9627,\n  \"T_total_ms_p99\": 4.9627,\n  \"T_total_ms_min\": 1.8019,\n  \"T_total_ms_max\": 4.9627,\n  \"transport_overhead_pct_mean\": 100.0,\n  \"transport_overhead_pct_median\": 100.0,\n  \"transport_overhead_pct_stdev\": 0.0,\n  \"transport_overhead_pct_p95\": 100.0,\n  \"transport_overhead_pct_p99\": 100.0,\n  \"transport_overhead_pct_min\": 100.0,\n  \"transport_overhead_pct_max\": 100.0\n}",
+    "E1_gRPC_Qwen3.5-9B_short_summary.json": "{\n  \"protocol\": \"gRPC\",\n  \"model\": \"Qwen3.5-9B\",\n  \"prompt_type\": \"short\",\n  \"n\": 5,\n  \"T1_serialization_ms_mean\": 0.0148,\n  \"T1_serialization_ms_median\": 0.0136,\n  \"T1_serialization_ms_stdev\": 0.0019,\n  \"T1_serialization_ms_p95\": 0.0171,\n  \"T1_serialization_ms_p99\": 0.0171,\n  \"T1_serialization_ms_min\": 0.0131,\n  \"T1_serialization_ms_max\": 0.0171,\n  \"T2_transport_send_ms_mean\": 1.2261,\n  \"T2_transport_send_ms_median\": 0.9212,\n  \"T2_transport_send_ms_stdev\": 0.6819,\n  \"T2_transport_send_ms_p95\": 2.4416,\n  \"T2_transport_send_ms_p99\": 2.4416,\n  \"T2_transport_send_ms_min\": 0.8698,\n  \"T2_transport_send_ms_max\": 2.4416,\n  \"T3_queue_ms_mean\": 0,\n  \"T3_queue_ms_median\": 0,\n  \"T3_queue_ms_stdev\": 0.0,\n  \"T3_queue_ms_p95\": 0,\n  \"T3_queue_ms_p99\": 0,\n  \"T3_queue_ms_min\": 0,\n  \"T3_queue_ms_max\": 0,\n  \"T4_inference_ms_mean\": 0,\n  \"T4_inference_ms_median\": 0,\n  \"T4_inference_ms_stdev\": 0.0,\n  \"T4_inference_ms_p95\": 0,\n  \"T4_inference_ms_p99\": 0,\n  \"T4_inference_ms_min\": 0,\n  \"T4_inference_ms_max\": 0,\n  \"T5_transport_return_ms_mean\": 1.2261,\n  \"T5_transport_return_ms_median\": 0.9212,\n  \"T5_transport_return_ms_stdev\": 0.6819,\n  \"T5_transport_return_ms_p95\": 2.4416,\n  \"T5_transport_return_ms_p99\": 2.4416,\n  \"T5_transport_return_ms_min\": 0.8698,\n  \"T5_transport_return_ms_max\": 2.4416,\n  \"T6_deserialization_ms_mean\": 0.016,\n  \"T6_deserialization_ms_median\": 0.0153,\n  \"T6_deserialization_ms_stdev\": 0.0022,\n  \"T6_deserialization_ms_p95\": 0.0194,\n  \"T6_deserialization_ms_p99\": 0.0194,\n  \"T6_deserialization_ms_min\": 0.0138,\n  \"T6_deserialization_ms_max\": 0.0194,\n  \"T_total_ms_mean\": 2.4522,\n  \"T_total_ms_median\": 1.8423,\n  \"T_total_ms_stdev\": 1.3637,\n  \"T_total_ms_p95\": 4.8831,\n  \"T_total_ms_p99\": 4.8831,\n  \"T_total_ms_min\": 1.7396,\n  \"T_total_ms_max\": 4.8831,\n  \"transport_overhead_pct_mean\": 100.0,\n  \"transport_overhead_pct_median\": 100.0,\n  \"transport_overhead_pct_stdev\": 0.0,\n  \"transport_overhead_pct_p95\": 100.0,\n  \"transport_overhead_pct_p99\": 100.0,\n  \"transport_overhead_pct_min\": 100.0,\n  \"transport_overhead_pct_max\": 100.0\n}",
+    "E2_DDS_kill9_1000ms_lease200ms_summary.json": "{\n  \"protocol\": \"DDS_DEADLINE_LIVELINESS\",\n  \"periodo_ms\": 1000,\n  \"lease_ms\": 200,\n  \"tipo_falha\": \"kill9\",\n  \"n_total\": 5,\n  \"n_successful\": 5,\n  \"n_timeout\": 0,\n  \"detected_by_counts\": {\n    \"LIVELINESS\": 5\n  },\n  \"detection_mean_ms\": 174.48,\n  \"detection_median_ms\": 168.61,\n  \"detection_stdev_ms\": 16.32,\n  \"detection_p95_ms\": 199.82,\n  \"detection_min_ms\": 158.3,\n  \"detection_max_ms\": 199.82\n}",
+    "E2_gRPC_HEALTH_kill9_1000ms_summary.json": "{\n  \"protocol\": \"gRPC_HEALTH_CHECK\",\n  \"periodo_ms\": 1000,\n  \"poll_interval_ms\": 100.0,\n  \"tipo_falha\": \"kill9\",\n  \"n_total\": 5,\n  \"n_successful\": 5,\n  \"n_timeout\": 0,\n  \"detection_mean_ms\": 2.72,\n  \"detection_median_ms\": 2.72,\n  \"detection_stdev_ms\": 0.32,\n  \"detection_p95_ms\": 3.2,\n  \"detection_min_ms\": 2.31,\n  \"detection_max_ms\": 3.2\n}",
+    "E3_gRPC_PRIORITY_carga2_summary.json": "{\n  \"protocol\": \"gRPC_TRANSPORT_PRIORITY\",\n  \"url\": \"http://localhost:8080\",\n  \"carga_req_s\": 2,\n  \"duracao_s\": 60,\n  \"n_injections\": 4,\n  \"normal\": {\n    \"n\": 120,\n    \"mean_ms\": 1.5141,\n    \"median_ms\": 1.3468,\n    \"stdev_ms\": 0.4723,\n    \"p95_ms\": 2.3472,\n    \"p99_ms\": 3.3452\n  },\n  \"priority_high\": {\n    \"n\": 4,\n    \"mean_ms\": 1.8601,\n    \"median_ms\": 1.5605,\n    \"stdev_ms\": 0.6638,\n    \"p95_ms\": 2.8521\n  },\n  \"priority_advantage_ms\": -0.2137\n}",
+    "E4_DDS_faseA_1ag_summary.json": "[\n  {\n    \"error\": \"nenhuma requisi\\u00e7\\u00e3o bem-sucedida\"\n  },\n  {\n    \"error\": \"nenhuma requisi\\u00e7\\u00e3o bem-sucedida\"\n  },\n  {\n    \"error\": \"nenhuma requisi\\u00e7\\u00e3o bem-sucedida\"\n  },\n  {\n    \"error\": \"nenhuma requisi\\u00e7\\u00e3o bem-sucedida\"\n  }\n]",
+    "E4_gRPC_faseA_1ag_summary.json": "[\n  {\n    \"protocol\": \"gRPC\",\n    \"phase\": \"A\",\n    \"num_agentes\": 1,\n    \"num_clientes\": 1,\n    \"total_requests\": 5,\n    \"successful_requests\": 5,\n    \"throughput_req_s\": 12.149,\n    \"latency_p50_ms\": 206.47,\n    \"latency_p95_ms\": 410.81,\n    \"latency_p99_ms\": 410.81,\n    \"latency_mean_ms\": 207.5,\n    \"latency_stdev_ms\": 160.07,\n    \"cpu_orchestrador_pct\": 10.0,\n    \"mem_orchestrador_mb\": 57.86\n  },\n  {\n    \"protocol\": \"gRPC\",\n    \"phase\": \"A\",\n    \"num_agentes\": 1,\n    \"num_clientes\": 2,\n    \"total_requests\": 10,\n    \"successful_requests\": 10,\n    \"throughput_req_s\": 12.303,\n    \"latency_p50_ms\": 356.57,\n    \"latency_p95_ms\": 811.79,\n    \"latency_p99_ms\": 811.79,\n    \"latency_mean_ms\": 377.58,\n    \"latency_stdev_ms\": 277.01,\n    \"cpu_orchestrador_pct\": 0.0,\n    \"mem_orchestrador_mb\": 57.93\n  },\n  {\n    \"protocol\": \"gRPC\",\n    \"phase\": \"A\",\n    \"num_agentes\": 1,\n    \"num_clientes\": 4,\n    \"total_requests\": 20,\n    \"successful_requests\": 20,\n    \"throughput_req_s\": 12.331,\n    \"latency_p50_ms\": 662.99,\n    \"latency_p95_ms\": 1620.63,\n    \"latency_p99_ms\": 1620.63,\n    \"latency_mean_ms\": 713.12,\n    \"latency_stdev_ms\": 528.21,\n    \"cpu_orchestrador_pct\": 10.0,\n    \"mem_orchestrador_mb\": 58.06\n  },\n  {\n    \"protocol\": \"gRPC\",\n    \"phase\": \"A\",\n    \"num_agentes\": 1,\n    \"num_clientes\": 8,\n    \"total_requests\": 40,\n    \"successful_requests\": 40,\n    \"throughput_req_s\": 16.431,\n    \"latency_p50_ms\": 922.32,\n    \"latency_p95_ms\": 2329.22,\n    \"latency_p99_ms\": 2431.75,\n    \"latency_mean_ms\": 1001.39,\n    \"latency_stdev_ms\": 698.84,\n    \"cpu_orchestrador_pct\": 0.0,\n    \"mem_orchestrador_mb\": 58.35\n  }\n]",
+    "E5_DDS_VIA_ORCH_streaming_Qwen3.5-9B_summary.json": "{\n  \"protocol\": \"DDS_VIA_ORCHESTRADOR\",\n  \"model\": \"Qwen3.5-9B\",\n  \"n\": 0,\n  \"ttft\": {\n    \"mean_ms\": 0,\n    \"median_ms\": 0,\n    \"stdev_ms\": 0\n  },\n  \"itl_mean\": {\n    \"mean_ms\": 0,\n    \"median_ms\": 0,\n    \"stdev_ms\": 0\n  },\n  \"itl_p99\": {\n    \"mean_ms\": 0\n  },\n  \"tokens\": {\n    \"mean\": 0\n  }\n}",
+    "E5_gRPC_VIA_ORCH_streaming_Qwen3.5-9B_summary.json": "{\n  \"protocol\": \"gRPC_VIA_ORCHESTRADOR\",\n  \"model\": \"Qwen3.5-9B\",\n  \"n\": 5,\n  \"ttft\": {\n    \"mean_ms\": 0,\n    \"median_ms\": 0,\n    \"stdev_ms\": 0.0\n  },\n  \"itl_mean\": {\n    \"mean_ms\": 0,\n    \"median_ms\": 0,\n    \"stdev_ms\": 0.0\n  },\n  \"itl_p99\": {\n    \"mean_ms\": 0\n  },\n  \"tokens\": {\n    \"mean\": 0\n  }\n}"
+  }
+}

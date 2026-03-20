@@ -107,6 +107,7 @@ class AgentTaskRequest:
     temperature: float = 0.7
     urgency: int = 5
     complexity: int = 5
+    target_agent_id: str = ""
 
 
 @dataclass
@@ -680,6 +681,7 @@ class DDSLayer:
             "stream": request.stream,
             "max_tokens": getattr(request, "max_tokens", 50),
             "temperature": getattr(request, "temperature", 0.7),
+            "target_agent_id": getattr(request, "target_agent_id", ""),
         }
 
         if not self.dds_available:

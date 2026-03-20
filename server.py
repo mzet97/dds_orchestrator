@@ -30,7 +30,11 @@ class OrchestratorServer:
                  dds_layer: DDSLayer,
                  selector: AgentSelector = None,
                  grpc_layer=None,
-                 fuzzy_engine=None):
+                 fuzzy_engine=None,
+                 instance_pool=None,
+                 redis_mgr=None,
+                 mongo_store=None,
+                 backpressure=None):
         self.config = config
         self.registry = registry
         self.scheduler = scheduler
@@ -38,6 +42,10 @@ class OrchestratorServer:
         self.grpc = grpc_layer  # optional gRPC layer (mirrors DDS layer interface)
         self.selector = selector or AgentSelector()
         self.fuzzy = fuzzy_engine  # optional fuzzy decision engine
+        self.instance_pool = instance_pool
+        self.redis_mgr = redis_mgr
+        self.mongo_store = mongo_store
+        self.backpressure = backpressure
 
         self.app = None
         self.runner = None
@@ -52,9 +60,19 @@ class OrchestratorServer:
         self._client_response_dispatch_task = None
         self._cleanup_lock = asyncio.Lock()
         self._inflight_dds_tasks: set = set()
+        # Shared aiohttp session for pool HTTP calls (avoids per-request session overhead)
+        self._pool_session = None
 
     async def start(self):
         """Start the orchestrator server"""
+        # Create shared HTTP session for pool path
+        if self.instance_pool:
+            import aiohttp as _aiohttp
+            self._pool_session = _aiohttp.ClientSession(
+                connector=_aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+                timeout=_aiohttp.ClientTimeout(total=self.config.task_timeout_seconds),
+            )
+
         # Setup routes
         self.app = web.Application()
 
@@ -87,6 +105,11 @@ class OrchestratorServer:
         self.app.router.add_post('/v1/chat/completions', self.handle_chat)
         self.app.router.add_post('/v1/completions', self.handle_generate)
         self.app.router.add_post('/api/v1/chat/completions', self.handle_chat)
+
+        # Instance pool endpoints
+        self.app.router.add_put('/api/v1/routing/algorithm', self.handle_set_algorithm)
+        self.app.router.add_get('/api/v1/pool/status', self.handle_pool_status)
+        self.app.router.add_get('/api/v1/metrics/summary', self.handle_metrics_summary)
 
         # DDS topics (if enabled)
         if self.dds.is_available():
@@ -123,6 +146,11 @@ class OrchestratorServer:
 
     async def stop(self):
         """Stop the orchestrator server"""
+        # Close shared pool session
+        if self._pool_session:
+            await self._pool_session.close()
+            self._pool_session = None
+
         for task in (self._heartbeat_task, self._cleanup_task,
                      self._dds_client_task, self._response_dispatch_task,
                      self._grpc_dispatch_task, self._client_response_dispatch_task):
@@ -589,7 +617,17 @@ class OrchestratorServer:
         temperature = data.get("temperature", self.config.default_temperature)
         priority = data.get("priority", TaskPriority.NORMAL.value)
         task_type = data.get("task_type", "chat")
+        stream_requested = data.get("stream", False)
+        protocol = data.get("protocol")  # optional: "http", "grpc", "dds"
 
+        # === Instance Pool Path (when Redis + InstancePool configured) ===
+        if self.instance_pool:
+            return await self._handle_chat_pool(
+                request, data, messages, max_tokens, temperature,
+                priority, stream_requested, protocol,
+            )
+
+        # === Legacy Path (original agent registry) ===
         # Wait for an available agent (queue instead of 503 rejection)
         # Fuzzy engine selects best agent + QoS profile + strategy
         fuzzy_urgency = data.get("urgency")
@@ -910,6 +948,234 @@ class OrchestratorServer:
             "agent_id": agent.agent_id,
             "processing_time_ms": processing_time,
         })
+
+    async def _handle_chat_pool(self, request, data, messages, max_tokens,
+                                temperature, priority, stream_requested, protocol):
+        """Handle chat using InstancePool routing (38 instances)."""
+        import time as _time
+
+        # Backpressure check
+        if self.backpressure and not await self.backpressure.allow_request():
+            return web.json_response(
+                {"error": "Rate limit exceeded", "code": "RATE_LIMITED"},
+                status=429,
+            )
+
+        # Track active requests
+        if self.redis_mgr:
+            await self.redis_mgr.incr_active()
+
+        t_start = _time.time()
+        task_id = f"task-{str(uuid.uuid4())}"
+        instance = None
+
+        try:
+            # Select instance with retry + exponential backoff
+            # Wait up to 10s for a slot, then reject (avoids unbounded queue buildup)
+            queue_timeout = min(10, self.config.task_timeout_seconds)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + queue_timeout
+            delay = 0.005  # 5ms initial
+            while True:
+                instance = await self.instance_pool.select_instance()
+                if instance:
+                    break
+                if loop.time() >= deadline:
+                    return web.json_response(
+                        {"error": "All instances at capacity", "code": "NO_CAPACITY"},
+                        status=503,
+                    )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 0.1)  # cap at 100ms
+
+            # Check circuit breaker AFTER acquiring slot
+            if self.backpressure and await self.backpressure.is_circuit_open(instance.port):
+                await self.instance_pool.release_instance(instance.port, 0, False)
+                instance = None  # prevent double-release in except handler
+                return web.json_response(
+                    {"error": "Instance circuit breaker open", "code": "CIRCUIT_OPEN"},
+                    status=503,
+                )
+
+            # Dispatch to the instance's agent via DDS with target_agent_id
+            dds_request = AgentTaskRequest(
+                task_id=task_id,
+                requester_id="orchestrator",
+                task_type="chat",
+                messages=messages,
+                priority=priority,
+                timeout_ms=self.config.task_timeout_seconds * 1000,
+                requires_context=False,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=stream_requested,
+            )
+
+            # Map priority to DDS TRANSPORT_PRIORITY
+            priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
+            dds_priority = priority_map.get(priority, 0)
+
+            if stream_requested and self.dds.is_available():
+                # SSE streaming path
+                self.dds.prepare_stream_waiter(task_id)
+                await self.dds.publish_agent_request(dds_request, priority=dds_priority)
+
+                sse_response = web.StreamResponse(
+                    status=200, reason='OK',
+                    headers={
+                        'Content-Type': 'text/event-stream',
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive',
+                    }
+                )
+                await sse_response.prepare(request)
+
+                stream_ok = True
+                try:
+                    async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=120000):
+                        content = chunk.get("content", "")
+                        is_final = chunk.get("is_final", False)
+
+                        if is_final and not content:
+                            await sse_response.write(b"data: [DONE]\n\n")
+                            break
+
+                        sse_data = json.dumps({
+                            "id": task_id,
+                            "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": content},
+                                         "finish_reason": "stop" if is_final else None}],
+                        })
+                        await sse_response.write(f"data: {sse_data}\n\n".encode())
+
+                        if is_final:
+                            await sse_response.write(b"data: [DONE]\n\n")
+                            break
+                except Exception:
+                    stream_ok = False
+                    raise
+                finally:
+                    latency_ms = (_time.time() - t_start) * 1000
+                    inst_port = instance.port
+                    inst_type = instance.inst_type
+                    await self.instance_pool.release_instance(inst_port, latency_ms, stream_ok)
+                    instance = None  # prevent double-release in outer except
+                    if self.mongo_store:
+                        asyncio.create_task(self.mongo_store.log_request({
+                            "request_id": task_id, "instance_port": inst_port,
+                            "instance_type": inst_type, "protocol": "dds",
+                            "algorithm": self.instance_pool._algorithm.value,
+                            "latency_ms": latency_ms, "success": stream_ok,
+                            "scenario": data.get("scenario", ""),
+                        }))
+                return sse_response
+
+            else:
+                # Non-streaming: HTTP direct to llama-server instance
+                # Uses shared session for connection pooling
+                content = ""
+                success = False
+                agent_url = f"http://{instance.hostname}:{instance.port}"
+                try:
+                    async with self._pool_session.post(
+                        f"{agent_url}/v1/chat/completions",
+                        json={"messages": messages, "max_tokens": max_tokens,
+                              "temperature": temperature},
+                    ) as _resp:
+                        http_result = await _resp.json()
+                    content = http_result.get("content", "")
+                    if not content and "choices" in http_result:
+                        msg = http_result["choices"][0].get("message", {})
+                        content = msg.get("content", "") or msg.get("reasoning_content", "")
+                    success = bool(content)
+                except Exception as e:
+                    content = ""
+                    success = False
+                    logger.error(f"HTTP to instance :{instance.port} failed: {e}")
+
+                latency_ms = (_time.time() - t_start) * 1000
+                inst_port = instance.port
+                inst_type = instance.inst_type
+                await self.instance_pool.release_instance(inst_port, latency_ms, success)
+                instance = None  # prevent double-release in outer except
+
+                # Log metric (fire-and-forget)
+                if self.mongo_store:
+                    asyncio.create_task(self.mongo_store.log_request({
+                        "request_id": task_id, "instance_port": inst_port,
+                        "instance_type": inst_type,
+                        "protocol": "dds" if self.dds.is_available() else "http",
+                        "algorithm": self.instance_pool._algorithm.value,
+                        "latency_ms": latency_ms, "success": success,
+                        "scenario": data.get("scenario", ""),
+                    }))
+
+                return web.json_response({
+                    "id": task_id,
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop" if content else "error",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "instance_port": inst_port,
+                    "instance_type": inst_type,
+                    "processing_time_ms": int(latency_ms),
+                })
+        except Exception as e:
+            latency_ms = (_time.time() - t_start) * 1000
+            if instance:
+                await self.instance_pool.release_instance(instance.port, latency_ms, False)
+            # Cleanup orphaned DDS waiters
+            if self.dds.is_available():
+                self.dds._pending_agent_responses.pop(task_id, None)
+                self.dds._pending_agent_responses.pop(f"stream_{task_id}", None)
+            logger.error(f"Pool chat error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            # ALWAYS decrement active counter (streaming and non-streaming)
+            if self.redis_mgr:
+                await self.redis_mgr.decr_active()
+
+    async def handle_set_algorithm(self, request: web.Request) -> web.Response:
+        """PUT /api/v1/routing/algorithm — change routing algorithm at runtime."""
+        if not self.instance_pool:
+            return web.json_response({"error": "Instance pool not configured"}, status=404)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        algo_name = data.get("algorithm", "")
+        try:
+            from instance_pool import RoutingAlgorithm
+            algo = RoutingAlgorithm(algo_name)
+            self.instance_pool.set_algorithm(algo)
+            return web.json_response({"success": True, "algorithm": algo.value})
+        except ValueError:
+            return web.json_response(
+                {"error": f"Unknown algorithm: {algo_name}",
+                 "valid": ["round_robin", "least_loaded", "weighted_score"]},
+                status=400,
+            )
+
+    async def handle_pool_status(self, request: web.Request) -> web.Response:
+        """GET /api/v1/pool/status — snapshot of instance pool."""
+        if not self.instance_pool:
+            return web.json_response({"error": "Instance pool not configured"}, status=404)
+        status = await self.instance_pool.get_status()
+        if self.backpressure:
+            status["pressure_level"] = await self.backpressure.get_pressure_level()
+            status["open_circuits"] = self.backpressure.get_open_circuits()
+        return web.json_response(status)
+
+    async def handle_metrics_summary(self, request: web.Request) -> web.Response:
+        """GET /api/v1/metrics/summary — query MongoDB metrics."""
+        if not self.mongo_store:
+            return web.json_response({"error": "MongoDB not configured"}, status=404)
+        scenario = request.query.get("scenario")
+        summary = await self.mongo_store.get_metrics_summary(scenario)
+        return web.json_response(summary)
 
     def _select_with_fuzzy(self, agents: list, messages: list = None,
                            priority: int = 5, urgency: int = None,

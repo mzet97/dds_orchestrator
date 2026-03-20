@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-03-16T12:28:59.018123",
+  "config": {
+    "n": 1000,
+    "scenario": "all",
+    "phases": [
+      "http",
+      "grpc",
+      "dds"
+    ],
+    "model": "Qwen3.5-9B",
+    "agent": "192.168.1.61"
+  },
+  "HTTP": {
+    "exit_code": 0,
+    "status": "OK"
+  },
+  "GRPC": {
+    "exit_code": 0,
+    "status": "OK"
+  },
+  "DDS": {
+    "exit_code": 0,
+    "status": "OK"
+  },
+  "E2": {
+    "DDS": {
+      "exit_code": 0,
+      "stdout": "ão 996/1000: 161.39ms (LIVELINESS)\nIteração 997/1000: 195.09ms (LIVELINESS)\nIteração 998/1000: 171.46ms (LIVELINESS)\nIteração 999/1000: 155.31ms (LIVELINESS)\nIteração 1000/1000: 159.76ms (LIVELINESS)\n\nResultados:\nTempo médio de detecção: 177.78ms\nMediana:                 178.24ms\np95:                     195.22ms\nDetecção por mecanismo:  {'LIVELINESS': 1000}\nTimeouts:                0/1000\n\nCSV: results/E2_DDS_kill9_1000ms_lease200ms.csv\nJSON: results/E2_DDS_kill9_1000ms_lease200ms_summary.json\n",
+      "stderr": ""
+    },
+    "HTTP": {
+      "exit_code": 0,
+      "stdout": ")\nIteracao 993/1000: FALHA (detecao nao ocorreu)\nIteracao 994/1000: FALHA (detecao nao ocorreu)\nIteracao 995/1000: FALHA (detecao nao ocorreu)\nIteracao 996/1000: FALHA (detecao nao ocorreu)\nIteracao 997/1000: FALHA (detecao nao ocorreu)\nIteracao 998/1000: FALHA (detecao nao ocorreu)\nIteracao 999/1000: FALHA (detecao nao ocorreu)\nIteracao 1000/1000: FALHA (detecao nao ocorreu)\n\nResultados:\nTempo medio de detecao: 1985.71ms\nIteracoes validas: 2/1000\nCSV: results/E2_HTTP_HEARTBEAT_kill9_1000ms.csv\n",
+      "stderr": ""
+    },
+    "gRPC": {
+      "exit_code": -1,
+      "stdout": ".27ms\nIteração 634/1000: 3.15ms\nIteração 635/1000: 3.11ms\nIteração 636/1000: 2.82ms\nIteração 637/1000: 3.23ms\nIteração 638/1000: 3.11ms\nIteração 639/1000: 3.12ms\nIteração 640/1000: 3.41ms\nIteração 641/1000: 2.82ms\nIteração 642/1000: 3.03ms\nIteração 643/1000: 3.18ms\nIteração 644/1000: 2.91ms\nIteração 645/1000: 2.55ms\nIteração 646/1000: 2.68ms\nIteração 647/1000: 3.07ms\nIteração 648/1000: 2.85ms\nIteração 649/1000: 3.13ms\nIteração 650/1000: 2.71ms\nIteração 651/1000: 3.09ms\nIteração 652/1000: 3.25ms\n",
+      "stderr": ""
+    }
+  }
+}

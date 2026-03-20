@@ -1,0 +1,124 @@
+{
+  "timestamp": "2026-03-14T02:25:25.425956",
+  "config": {
+    "n": 5,
+    "cenario": "all"
+  },
+  "DDS": {
+    "E1": [
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt short --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: short (12 chars)\nIterações: 5\n--------------------------------------------------\n\nResultados:\nT_total médio:          120003.99 ms\nT4 (inferência) médio:  0.00 ms\nOverhead transporte:    100.00%\n\nCSV: results/E1_DDS_Qwen3.5-9B_short.csv\nJSON: results/E1_DDS_Qwen3.5-9B_short_summary.json\n",
+        "stderr": ""
+      },
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt long --n 5 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E1: Decomposição de Latência - DDS (via orquestrador)\nURL: http://localhost:8080\nModelo: Qwen3.5-9B\nPrompt: long (137 chars)\nIterações: 5\n--------------------------------------------------\n\nResultados:\nT_total médio:          120004.10 ms\nT4 (inferência) médio:  0.00 ms\nOverhead transporte:    100.00%\n\nCSV: results/E1_DDS_Qwen3.5-9B_long.csv\nJSON: results/E1_DDS_Qwen3.5-9B_long_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E3": [
+      {
+        "script": "E3_priority_dds.py",
+        "args": "--url http://localhost:8080 --carga 2 --n 5 --duracao 60 --protocol-label DDS",
+        "exit_code": 0,
+        "stdout": "E3: Priorização - DDS TRANSPORT_PRIORITY (via orquestrador)\nURL: http://localhost:8080\nCarga NORMAL: 2 req/s\nDuração: 60s\nInjeções HIGH: 5\nIntervalo entre injeções: 12.0s\n--------------------------------------------------\nInjeção 1/5: latência=120005.47ms (OK)\nAviso: carga background terminou antes das 5 injeções\n\nResultados:\nNORMAL  (n=1): mediana=120007.05ms, p95=120007.05ms\nHIGH    (n=1): mediana=120005.47ms\nVantagem HIGH sobre NORMAL: 1.58ms\n\nCSV: results/E3_DDS_PRIORITY_carga2.csv\nJSON: results/E3_DDS_PRIORITY_carga2_summary.json\n",
+        "stderr": ""
+      }
+    ],
+    "E4": [
+      {
+        "script": "E4_scalability_dds.py",
+        "args": "--orchestrador http://localhost:8080 --n 5 --protocol-label DDS",
+        "exit_code": -1,
+        "stdout": "E4: Escalabilidade Multi-Agente - DDS\nOrquestrador: http://localhost:8080\nAgentes (1): ['http://localhost:8082']\nFase: A\nConfigurações de clientes: [1, 2, 4, 8]\nRequisições por cliente: 5\n============================================================\n\n--- Fase A: 1 agente(s), 1 cliente(s) ---\n  Throughput: 0.04 req/s\n  Latência p50: 125934.07ms  p95: 135889.44ms  p99: 135889.44ms\n  Sucesso: 5/5\n\n--- Fase A: 1 agente(s), 2 cliente(s) ---\n  Throughput: 0.06 req/s\n  Latência p50: 140433.48ms  p95: 162978.32ms  p99: 162978.32ms\n  Sucesso: 10/10\n\n--- Fase A: 1 agente(s), 4 cliente(s) ---\n",
+        "stderr": ""
+      }
+    ],
+    "E5_orch": [
+      {
+        "script": "E5_streaming_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --n 5 --protocol-label DDS",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E2": [
+      {
+        "script": "E2_failure_detection_dds.py",
+        "args": "--periodo 1000 --lease 200 --n 5 --domain 0",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ]
+  },
+  "gRPC": {
+    "E1": [
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt short --n 5 --protocol-label gRPC",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      },
+      {
+        "script": "E1_decompose_latency_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --prompt long --n 5 --protocol-label gRPC",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E3": [
+      {
+        "script": "E3_priority_dds.py",
+        "args": "--url http://localhost:8080 --carga 2 --n 5 --duracao 60 --protocol-label gRPC",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E4": [
+      {
+        "script": "E4_scalability_dds.py",
+        "args": "--orchestrador http://localhost:8080 --n 5 --protocol-label gRPC",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E5_orch": [
+      {
+        "script": "E5_streaming_dds.py",
+        "args": "--url http://localhost:8080 --model Qwen3.5-9B --n 5 --protocol-label gRPC",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E5_direct": [
+      {
+        "script": "E5_streaming_grpc.py",
+        "args": "--endpoint 192.168.1.61:50051 --model Qwen3.5-9B --n 5",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ],
+    "E2": [
+      {
+        "script": "E2_failure_detection_grpc.py",
+        "args": "--periodo 1000 --n 5 --port 50099",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "SSH session not active"
+      }
+    ]
+  }
+}
