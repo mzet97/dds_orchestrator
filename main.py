@@ -195,24 +195,38 @@ async def main():
             redis_mgr, mongo_store,
             algorithm=RoutingAlgorithm(config.routing_algorithm),
         )
+
+        # Parse per-port hostname mapping: "host:port,host:port,..."
+        host_map: dict[int, str] = {}
+        if config.instance_host_map:
+            for entry in config.instance_host_map.split(","):
+                entry = entry.strip()
+                if ":" in entry:
+                    h, p = entry.rsplit(":", 1)
+                    host_map[int(p)] = h
+
         # Register GPU instances
         if config.instance_ports_gpu:
             for port_str in config.instance_ports_gpu.split(","):
                 port_str = port_str.strip()
                 if port_str:
+                    port = int(port_str)
+                    hostname = host_map.get(port, config.instance_host)
                     await instance_pool.register_instance(
-                        InstanceInfo(port=int(port_str), hostname=config.instance_host,
+                        InstanceInfo(port=port, hostname=hostname,
                                      inst_type="gpu", slots_total=config.slots_per_gpu,
-                                     weight=1.0))
+                                     weight=config.weight_gpu))
         # Register CPU instances
         if config.instance_ports_cpu:
             for port_str in config.instance_ports_cpu.split(","):
                 port_str = port_str.strip()
                 if port_str:
+                    port = int(port_str)
+                    hostname = host_map.get(port, config.instance_host)
                     await instance_pool.register_instance(
-                        InstanceInfo(port=int(port_str), hostname=config.instance_host,
+                        InstanceInfo(port=port, hostname=hostname,
                                      inst_type="cpu", slots_total=config.slots_per_cpu,
-                                     weight=0.3))
+                                     weight=config.weight_cpu))
 
         backpressure = BackpressureManager(redis_mgr, config.max_rps)
         logger.info(f"InstancePool ready: {len(instance_pool._instances)} instances, "

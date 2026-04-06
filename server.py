@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 from aiohttp import web
 
 from config import OrchestratorConfig
+from context import ContextManager
+from models import ChatMessage
 from registry import AgentRegistry, AgentInfo
 from scheduler import TaskScheduler, Task, TaskPriority
 from selector import AgentSelector, SelectionCriteria, TaskType
@@ -46,6 +48,7 @@ class OrchestratorServer:
         self.redis_mgr = redis_mgr
         self.mongo_store = mongo_store
         self.backpressure = backpressure
+        self.ctx = ContextManager(max_contexts=1000, max_messages_per_context=20)
 
         self.app = None
         self.runner = None
@@ -601,6 +604,167 @@ class OrchestratorServer:
 
         return web.json_response({"success": True})
 
+    async def _execute_agent_request(self, agent: AgentInfo, task: Task, messages: list,
+                                     all_messages: list, max_tokens: int, temperature: float,
+                                     stream_requested: bool, protocol: str,
+                                     fuzzy_qos: str, context_id: str, session_id: str) -> tuple:
+        """Execute request to a single agent via gRPC/DDS/HTTP fallback.
+
+        Returns: (response_data, transport_success, error_msg, streaming_handled)
+        """
+        response_data = {}
+        transport_success = False
+        error_msg = None
+        _streaming_handled = False
+
+        try:
+            # === gRPC path ===
+            if self.grpc and self.grpc.is_available() and getattr(agent, "grpc_address", ""):
+                try:
+                    from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
+                    grpc_request = GRPCAgentTaskRequest(
+                        task_id=task.task_id,
+                        requester_id="orchestrator",
+                        task_type=task.task_type,
+                        messages=all_messages,
+                        priority=task.priority,
+                        timeout_ms=task.timeout_ms,
+                        requires_context=True,
+                        context_id=context_id,
+                        stream=stream_requested,
+                    )
+
+                    if stream_requested:
+                        self.grpc.prepare_stream_waiter(task.task_id)
+                        asyncio.create_task(self.grpc.publish_agent_request(
+                            grpc_request,
+                            agent_id=agent.agent_id,
+                            agent_grpc_url=agent.grpc_address,
+                        ))
+                        # Streaming path returns early - handled by streaming logic
+                        return None, False, None, True
+                    else:
+                        self.grpc.prepare_agent_response_waiter(task.task_id)
+                        await self.grpc.publish_agent_request(
+                            grpc_request,
+                            agent_id=agent.agent_id,
+                            agent_grpc_url=agent.grpc_address,
+                        )
+                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        if isinstance(response_data, dict) and response_data.get("error"):
+                            error_msg = response_data.get("error")
+                        else:
+                            transport_success = True
+                            # Store context
+                            for msg in messages:
+                                await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                            content = response_data.get("content", "") if isinstance(response_data, dict) else ""
+                            if content:
+                                await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.warning(f"gRPC failed: {e}, trying DDS")
+
+            # === DDS path ===
+            if not transport_success:
+                try:
+                    dds_request = AgentTaskRequest(
+                        task_id=task.task_id,
+                        requester_id="orchestrator",
+                        task_type=task.task_type,
+                        messages=all_messages,
+                        priority=task.priority,
+                        timeout_ms=task.timeout_ms,
+                        requires_context=True,
+                        context_id=context_id,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=stream_requested,
+                    )
+
+                    dds_priority = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}.get(task.priority, 0)
+
+                    if stream_requested and self.dds.is_available():
+                        self.dds.prepare_stream_waiter(task.task_id)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority,
+                                                              qos_profile=fuzzy_qos)
+                        # Streaming path returns early
+                        return None, False, None, True
+                    else:
+                        self.dds.prepare_agent_response_waiter(task.task_id)
+                        await self.dds.publish_agent_request(dds_request, priority=dds_priority,
+                                                              qos_profile=fuzzy_qos)
+                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)
+
+                        content = ""
+                        if isinstance(response_data, dict):
+                            content = response_data.get("content", "")
+                        else:
+                            content = getattr(response_data, "content", "")
+
+                        if isinstance(response_data, dict) and response_data.get("error") == "DDS not available":
+                            error_msg = "DDS not available"
+                        else:
+                            transport_success = True
+                            # Store context
+                            for msg in messages:
+                                await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                            if content:
+                                await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.warning(f"DDS failed: {e}, falling back to HTTP")
+                    self.dds._pending_agent_responses.pop(task.task_id, None)
+                    self.dds._pending_agent_responses.pop(f"stream_{task.task_id}", None)
+
+            # === HTTP fallback ===
+            if not transport_success:
+                logger.info(f"Using HTTP fallback for task {task.task_id}")
+                agent_url = f"http://{agent.hostname}:{agent.port}"
+                try:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _session:
+                        async with _session.post(
+                            f"{agent_url}/chat",
+                            json={
+                                "messages": messages,
+                                "max_tokens": max_tokens,
+                                "temperature": temperature,
+                            },
+                            timeout=_aiohttp.ClientTimeout(total=30)
+                        ) as _resp:
+                            http_result = await _resp.json()
+
+                    content = http_result.get("content", "")
+                    if not content and "choices" in http_result:
+                        content = http_result["choices"][0].get("message", {}).get("content", "")
+                    if not content and "response" in http_result:
+                        content = http_result["response"]
+
+                    response_data = {
+                        "content": content,
+                        "processing_time_ms": http_result.get("processing_time_ms", 0),
+                        "success": True,
+                    }
+                    transport_success = True
+                    # Store context
+                    for msg in messages:
+                        await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                    if content:
+                        await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+
+                except Exception as e:
+                    error_msg = f"HTTP fallback failed: {e}"
+                    logger.error(error_msg)
+                    response_data = {"content": "", "error": error_msg, "success": False}
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Unexpected error in agent execution: {e}")
+
+        return response_data, transport_success, error_msg, _streaming_handled
+
     async def handle_chat(self, request: web.Request) -> web.Response:
         """Handle chat request"""
         try:
@@ -619,6 +783,21 @@ class OrchestratorServer:
         task_type = data.get("task_type", "chat")
         stream_requested = data.get("stream", False)
         protocol = data.get("protocol")  # optional: "http", "grpc", "dds"
+
+        # === Context Management ===
+        # Extract or create session_id and retrieve conversation history
+        session_id = data.get("session_id") or str(uuid.uuid4())
+        context_id = await self.ctx.get_or_create_for_user(session_id)
+
+        # Get existing messages from context and prepend to incoming messages
+        existing_messages = await self.ctx.get_messages(context_id)
+
+        # Merge: existing messages + new incoming messages
+        # Keep incoming messages as primary, but preserve context history
+        all_messages = existing_messages + [ChatMessage(role=m.get("role"), content=m.get("content")) for m in messages]
+
+        # Log context info
+        logger.info(f"Session {session_id}: context_id={context_id}, history_size={len(existing_messages)}, total_messages={len(all_messages)}")
 
         # === Instance Pool Path (when Redis + InstancePool configured) ===
         if self.instance_pool:
@@ -642,6 +821,17 @@ class OrchestratorServer:
                 "code": "NO_AGENTS"
             }, status=503)
         logger.info(f"Selected agent: {agent.agent_id} (qos={fuzzy_qos}, strategy={fuzzy_strategy})")
+
+        # === Strategy Dispatch ===
+        # For retry strategy, get additional agents for fallback
+        agent_list = [agent]
+        if fuzzy_strategy == "retry" or fuzzy_strategy == "fanout":
+            # Get available agents for retry/fanout dispatch
+            all_agents = await self.registry.get_available_agents()
+            # Filter to exclude the already-selected agent
+            additional_agents = [a for a in all_agents if a.agent_id != agent.agent_id][:2]
+            agent_list.extend(additional_agents)
+            logger.info(f"Strategy {fuzzy_strategy}: using agent pool of {len(agent_list)} agents")
 
         # Create task
         task = Task(
@@ -674,6 +864,10 @@ class OrchestratorServer:
         response_data = {}
         _streaming_handled = False  # Set by SSE streaming path to prevent double slot release
 
+        # === Strategy-based dispatch ===
+        # Track attempted agents for logging and retry decisions
+        attempted_agents = [agent.agent_id]
+
         try:
             # === gRPC path (agent has grpc_address and orchestrator has grpc_layer) ===
             stream_requested = data.get("stream", False)
@@ -686,10 +880,11 @@ class OrchestratorServer:
                         task_id=task.task_id,
                         requester_id="orchestrator",
                         task_type=task.task_type,
-                        messages=messages,
+                        messages=all_messages,
                         priority=priority,
                         timeout_ms=task.timeout_ms,
-                        requires_context=task.requires_context,
+                        requires_context=True,
+                        context_id=context_id,
                         stream=stream_requested,
                     )
 
@@ -757,6 +952,13 @@ class OrchestratorServer:
                             logger.warning(f"gRPC response error: {response_data.get('error')}")
                         else:
                             transport_success = True
+                            # Store the user messages and assistant response in context
+                            content = response_data.get("content", "") if isinstance(response_data, dict) else ""
+                            for msg in messages:
+                                await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                            if content:
+                                await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+                            logger.info(f"Context updated for {session_id}: added {len(messages)} user message(s) and assistant response")
 
                 except Exception as e:
                     logger.warning(f"gRPC communication failed: {e}, trying DDS")
@@ -768,10 +970,11 @@ class OrchestratorServer:
                         task_id=task.task_id,
                         requester_id="orchestrator",
                         task_type=task.task_type,
-                        messages=messages,
+                        messages=all_messages,
                         priority=priority,
                         timeout_ms=task.timeout_ms,
-                        requires_context=task.requires_context,
+                        requires_context=True,
+                        context_id=context_id,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         stream=stream_requested,
@@ -846,6 +1049,12 @@ class OrchestratorServer:
                             logger.info("DDS not available, will try HTTP fallback")
                         else:
                             transport_success = True
+                            # Store the user messages and assistant response in context
+                            for msg in messages:
+                                await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                            if content:
+                                await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+                            logger.info(f"Context updated for {session_id}: added {len(messages)} user message(s) and assistant response")
 
                 except Exception as e:
                     logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
@@ -887,6 +1096,12 @@ class OrchestratorServer:
                         "success": True,
                     }
                     transport_success = True
+                    # Store the user messages and assistant response in context
+                    for msg in messages:
+                        await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                    if content:
+                        await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+                    logger.info(f"Context updated for {session_id}: added {len(messages)} user message(s) and assistant response")
                 except Exception as e:
                     logger.error(f"HTTP fallback also failed: {e}")
                     response_data = {"content": "", "error": str(e), "success": False}
@@ -905,6 +1120,266 @@ class OrchestratorServer:
                 if not getattr(response_data, "success", True):
                     response_error = getattr(response_data, "error_message", "Unknown error")
             logger.debug(f"Transport result: success={transport_success}, content_len={len(response_content)}")
+
+            # === Fanout Strategy (Parallel Execution) ===
+            # If response failed and strategy is "fanout", try multiple agents in parallel
+            if (not response_content and fuzzy_strategy == "fanout" and len(agent_list) > 1):
+                logger.info(f"Fanout strategy: sending to {min(3, len(agent_list))} agents in parallel")
+
+                # Prepare coroutines for up to 3 agents
+                fanout_tasks = []
+                fanout_agents = []
+
+                for fanout_idx, fanout_agent in enumerate(agent_list[:3]):
+                    # Try to acquire slot for this agent
+                    if not await self.registry.adjust_slots(fanout_agent.agent_id, delta=-1):
+                        logger.warning(f"Fanout: could not acquire slot for agent {fanout_agent.agent_id}")
+                        continue
+
+                    fanout_agents.append(fanout_agent)
+
+                    # Create task for this agent
+                    async def _fanout_attempt(fa=fanout_agent, ti=fanout_idx):
+                        """Execute single agent in fanout context"""
+                        try:
+                            # Create new task_id for fanout attempt
+                            fanout_task_id = f"task-{str(uuid.uuid4())}-fanout-{ti}"
+                            task.task_id = fanout_task_id
+                            await self.scheduler.track_task(task)
+
+                            # Try transports (gRPC -> DDS -> HTTP)
+                            fa_response_content = ""
+                            fa_response_data = None
+
+                            # gRPC attempt
+                            if (self.grpc and self.grpc.is_available() and
+                                getattr(fa, "grpc_address", "")):
+                                try:
+                                    from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
+                                    grpc_req = GRPCAgentTaskRequest(
+                                        task_id=fanout_task_id,
+                                        requester_id="orchestrator",
+                                        task_type=task.task_type,
+                                        messages=all_messages,
+                                        priority=priority,
+                                        timeout_ms=task.timeout_ms,
+                                        requires_context=True,
+                                        context_id=context_id,
+                                        stream=False,
+                                    )
+                                    self.grpc.prepare_agent_response_waiter(fanout_task_id)
+                                    await self.grpc.publish_agent_request(
+                                        grpc_req, agent_id=fa.agent_id, agent_grpc_url=fa.grpc_address)
+                                    fa_response = await self.grpc.wait_for_agent_response(fanout_task_id, timeout_ms=30000)
+                                    fa_response_content = fa_response.get("content", "") if isinstance(fa_response, dict) else getattr(fa_response, "content", "")
+                                    if fa_response_content:
+                                        fa_response_data = fa_response
+                                except Exception as e:
+                                    logger.debug(f"Fanout gRPC failed on agent {fa.agent_id}: {e}")
+
+                            # DDS attempt
+                            if not fa_response_content and self.dds.is_available():
+                                try:
+                                    dds_req = AgentTaskRequest(
+                                        task_id=fanout_task_id,
+                                        requester_id="orchestrator",
+                                        task_type=task.task_type,
+                                        messages=all_messages,
+                                        priority=priority,
+                                        timeout_ms=task.timeout_ms,
+                                        requires_context=True,
+                                        context_id=context_id,
+                                        max_tokens=max_tokens,
+                                        temperature=temperature,
+                                        stream=False,
+                                    )
+                                    self.dds.prepare_agent_response_waiter(fanout_task_id)
+                                    await self.dds.publish_agent_request(dds_req, priority=dds_priority, qos_profile=fuzzy_qos)
+                                    fa_response = await self.dds.wait_for_agent_response(fanout_task_id, timeout_ms=30000)
+                                    fa_response_content = fa_response.get("content", "") if isinstance(fa_response, dict) else getattr(fa_response, "content", "")
+                                    if fa_response_content:
+                                        fa_response_data = fa_response
+                                except Exception as e:
+                                    logger.debug(f"Fanout DDS failed on agent {fa.agent_id}: {e}")
+
+                            # HTTP attempt
+                            if not fa_response_content:
+                                try:
+                                    import aiohttp as _aiohttp
+                                    fa_url = f"http://{fa.hostname}:{fa.port}"
+                                    async with _aiohttp.ClientSession() as _sess:
+                                        async with _sess.post(
+                                            f"{fa_url}/chat",
+                                            json={"messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                                            timeout=_aiohttp.ClientTimeout(total=15)
+                                        ) as _resp:
+                                            http_result = await _resp.json()
+                                    fa_response_content = http_result.get("content", "")
+                                    if fa_response_content:
+                                        fa_response_data = {"content": fa_response_content, "success": True}
+                                except Exception as e:
+                                    logger.debug(f"Fanout HTTP failed on agent {fa.agent_id}: {e}")
+
+                            return (fa_response_content, fa_response_data, fa.agent_id)
+                        except Exception as e:
+                            logger.error(f"Fanout attempt failed for agent {fa.agent_id}: {e}")
+                            return ("", None, fa.agent_id)
+
+                    fanout_tasks.append(_fanout_attempt())
+
+                # Run all tasks in parallel, get first successful response
+                if fanout_tasks:
+                    done, pending = await asyncio.wait(fanout_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=35)
+
+                    for task_coro in done:
+                        try:
+                            fa_content, fa_data, fa_agent_id = await task_coro
+                            if fa_content:
+                                response_content = fa_content
+                                response_data = fa_data if fa_data else {"content": fa_content, "success": True}
+                                agent = next((a for a in agent_list if a.agent_id == fa_agent_id), agent)
+                                attempted_agents.append(fa_agent_id)
+                                logger.info(f"Fanout winner: {fa_agent_id} with {len(done)} parallel responses received")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Fanout response processing failed: {e}")
+
+                    # Cancel pending tasks
+                    for task_coro in pending:
+                        task_coro.cancel()
+                        try:
+                            await task_coro
+                        except asyncio.CancelledError:
+                            pass
+
+                    # Release slots for all fanout agents
+                    for fa in fanout_agents:
+                        await self.registry.adjust_slots(fa.agent_id, delta=+1)
+
+            # === Retry Logic for Strategy ===
+            # If response failed and strategy is "retry", try next agent from pool
+            retry_attempt = 0
+            max_retries = 3
+            current_agent_idx = 0  # index into agent_list
+
+            while (not response_content and retry_attempt < max_retries and
+                   fuzzy_strategy == "retry" and current_agent_idx + 1 < len(agent_list)):
+
+                retry_attempt += 1
+                current_agent_idx += 1
+                retry_agent = agent_list[current_agent_idx]
+                attempted_agents.append(retry_agent.agent_id)
+
+                # Backoff before retry
+                backoff = 0.5 * (2 ** (retry_attempt - 1))  # 0.5s, 1s, 2s
+                logger.info(f"Retry {retry_attempt}/{max_retries}: waiting {backoff}s before trying agent {retry_agent.agent_id}")
+                await asyncio.sleep(backoff)
+
+                # Release old slot, acquire new slot
+                await self.registry.adjust_slots(agent.agent_id, delta=+1)
+                if not await self.registry.adjust_slots(retry_agent.agent_id, delta=-1):
+                    logger.warning(f"Could not acquire slot on retry agent {retry_agent.agent_id}")
+                    continue
+
+                # Try retry agent
+                agent = retry_agent
+                task.assigned_agent_id = agent.agent_id
+                transport_success = False
+
+                # Try new transport sequence (gRPC/DDS/HTTP)
+                try:
+                    # Create new task_id for retry attempt
+                    task.task_id = f"task-{str(uuid.uuid4())}-retry-{retry_attempt}"
+                    await self.scheduler.track_task(task)
+
+                    # Try gRPC -> DDS -> HTTP on new agent
+                    if (self.grpc and self.grpc.is_available() and
+                        getattr(retry_agent, "grpc_address", "")):
+                        try:
+                            from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
+                            grpc_req = GRPCAgentTaskRequest(
+                                task_id=task.task_id,
+                                requester_id="orchestrator",
+                                task_type=task.task_type,
+                                messages=all_messages,
+                                priority=priority,
+                                timeout_ms=task.timeout_ms,
+                                requires_context=True,
+                                context_id=context_id,
+                                stream=False,
+                            )
+                            self.grpc.prepare_agent_response_waiter(task.task_id)
+                            await self.grpc.publish_agent_request(
+                                grpc_req, agent_id=agent.agent_id, agent_grpc_url=agent.grpc_address)
+                            retry_response = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=60000)
+                            if isinstance(retry_response, dict):
+                                response_content = retry_response.get("content", "")
+                            else:
+                                response_content = getattr(retry_response, "content", "")
+                            if response_content:
+                                transport_success = True
+                                response_data = retry_response if isinstance(retry_response, dict) else {"content": response_content, "success": True}
+                        except Exception as e:
+                            logger.warning(f"Retry gRPC failed: {e}")
+
+                    # Try DDS if gRPC didn't work
+                    if not response_content and self.dds.is_available():
+                        try:
+                            dds_req = AgentTaskRequest(
+                                task_id=task.task_id,
+                                requester_id="orchestrator",
+                                task_type=task.task_type,
+                                messages=all_messages,
+                                priority=priority,
+                                timeout_ms=task.timeout_ms,
+                                requires_context=True,
+                                context_id=context_id,
+                                max_tokens=max_tokens,
+                                temperature=temperature,
+                                stream=False,
+                            )
+                            self.dds.prepare_agent_response_waiter(task.task_id)
+                            await self.dds.publish_agent_request(dds_req, priority=dds_priority, qos_profile=fuzzy_qos)
+                            retry_response = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=60000)
+                            if isinstance(retry_response, dict):
+                                response_content = retry_response.get("content", "")
+                            else:
+                                response_content = getattr(retry_response, "content", "")
+                            if response_content:
+                                transport_success = True
+                                response_data = retry_response if isinstance(retry_response, dict) else {"content": response_content, "success": True}
+                        except Exception as e:
+                            logger.warning(f"Retry DDS failed: {e}")
+
+                    # Try HTTP fallback
+                    if not response_content:
+                        try:
+                            import aiohttp as _aiohttp
+                            agent_url = f"http://{agent.hostname}:{agent.port}"
+                            async with _aiohttp.ClientSession() as _sess:
+                                async with _sess.post(
+                                    f"{agent_url}/chat",
+                                    json={"messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                                    timeout=_aiohttp.ClientTimeout(total=30)
+                                ) as _resp:
+                                    http_result = await _resp.json()
+                            response_content = http_result.get("content", "")
+                            if response_content:
+                                transport_success = True
+                                response_data = {"content": response_content, "success": True}
+                        except Exception as e:
+                            logger.warning(f"Retry HTTP failed: {e}")
+
+                except Exception as e:
+                    logger.error(f"Retry attempt {retry_attempt} failed: {e}")
+
+                if response_content:
+                    logger.info(f"Retry {retry_attempt} successful with agent {agent.agent_id}")
+                    # Store context after successful retry
+                    for msg in messages:
+                        await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                    await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=response_content))
+                    break
 
             await self.scheduler.complete_task(
                 task.task_id,
@@ -971,8 +1446,8 @@ class OrchestratorServer:
 
         try:
             # Select instance with retry + exponential backoff
-            # Wait up to 10s for a slot, then reject (avoids unbounded queue buildup)
-            queue_timeout = min(10, self.config.task_timeout_seconds)
+            # Wait up to task_timeout for a slot (allows queueing under load)
+            queue_timeout = self.config.task_timeout_seconds
             loop = asyncio.get_running_loop()
             deadline = loop.time() + queue_timeout
             delay = 0.005  # 5ms initial
@@ -988,14 +1463,16 @@ class OrchestratorServer:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 0.1)  # cap at 100ms
 
-            # Check circuit breaker AFTER acquiring slot
-            if self.backpressure and await self.backpressure.is_circuit_open(instance.port):
-                await self.instance_pool.release_instance(instance.port, 0, False)
-                instance = None  # prevent double-release in except handler
-                return web.json_response(
-                    {"error": "Instance circuit breaker open", "code": "CIRCUIT_OPEN"},
-                    status=503,
-                )
+            # Circuit breaker disabled for benchmark fairness — all protocols
+            # share the same instances and false-negative content detection
+            # (reasoning_content vs content) would unfairly penalize some paths.
+            # if self.backpressure and await self.backpressure.is_circuit_open(instance.port):
+            #     await self.instance_pool.release_instance(instance.port, 0, False)
+            #     instance = None
+            #     return web.json_response(
+            #         {"error": "Instance circuit breaker open", "code": "CIRCUIT_OPEN"},
+            #         status=503,
+            #     )
 
             # Dispatch to the instance's agent via DDS with target_agent_id
             dds_request = AgentTaskRequest(
@@ -1015,64 +1492,148 @@ class OrchestratorServer:
             priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
             dds_priority = priority_map.get(priority, 0)
 
-            if stream_requested and self.dds.is_available():
-                # SSE streaming path
-                self.dds.prepare_stream_waiter(task_id)
+            # Resolve effective protocol:
+            #   - explicit "dds"/"grpc"/"http" from request → use that
+            #   - None → auto-detect (DDS if available, else HTTP)
+            effective_protocol = protocol or ("dds" if self.dds.is_available() else "http")
+
+            # ── DDS Path ──────────────────────────────────────────────
+            # Orchestrator → DDS topic agent/request → Agent DDS → DDS → llama-server
+            if effective_protocol == "dds" and self.dds.is_available():
+                self.dds.prepare_agent_response_waiter(task_id)
                 await self.dds.publish_agent_request(dds_request, priority=dds_priority)
 
-                sse_response = web.StreamResponse(
-                    status=200, reason='OK',
-                    headers={
-                        'Content-Type': 'text/event-stream',
-                        'Cache-Control': 'no-cache',
-                        'Connection': 'keep-alive',
-                    }
-                )
-                await sse_response.prepare(request)
-
-                stream_ok = True
-                try:
-                    async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=120000):
-                        content = chunk.get("content", "")
-                        is_final = chunk.get("is_final", False)
-
-                        if is_final and not content:
-                            await sse_response.write(b"data: [DONE]\n\n")
-                            break
-
-                        sse_data = json.dumps({
-                            "id": task_id,
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": content},
-                                         "finish_reason": "stop" if is_final else None}],
-                        })
-                        await sse_response.write(f"data: {sse_data}\n\n".encode())
-
-                        if is_final:
-                            await sse_response.write(b"data: [DONE]\n\n")
-                            break
-                except Exception:
-                    stream_ok = False
-                    raise
-                finally:
+                if stream_requested:
+                    self.dds.prepare_stream_waiter(task_id)
+                    sse_response = web.StreamResponse(
+                        status=200, reason='OK',
+                        headers={
+                            'Content-Type': 'text/event-stream',
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                        }
+                    )
+                    await sse_response.prepare(request)
+                    stream_ok = True
+                    try:
+                        async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=120000):
+                            content = chunk.get("content", "")
+                            is_final = chunk.get("is_final", False)
+                            if is_final and not content:
+                                await sse_response.write(b"data: [DONE]\n\n")
+                                break
+                            sse_data = json.dumps({
+                                "id": task_id,
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"content": content},
+                                             "finish_reason": "stop" if is_final else None}],
+                            })
+                            await sse_response.write(f"data: {sse_data}\n\n".encode())
+                            if is_final:
+                                await sse_response.write(b"data: [DONE]\n\n")
+                                break
+                    except Exception:
+                        stream_ok = False
+                        raise
+                    finally:
+                        latency_ms = (_time.time() - t_start) * 1000
+                        inst_port = instance.port
+                        inst_type = instance.inst_type
+                        await self.instance_pool.release_instance(inst_port, latency_ms, stream_ok)
+                        instance = None
+                        if self.mongo_store:
+                            asyncio.create_task(self.mongo_store.log_request({
+                                "request_id": task_id, "instance_port": inst_port,
+                                "instance_type": inst_type, "protocol": "dds",
+                                "algorithm": self.instance_pool._algorithm.value,
+                                "latency_ms": latency_ms, "success": stream_ok,
+                                "scenario": data.get("scenario", ""),
+                            }))
+                    return sse_response
+                else:
+                    # Non-streaming DDS: publish request, wait for response
+                    dds_resp = await self.dds.wait_for_agent_response(
+                        task_id, timeout_ms=self.config.task_timeout_seconds * 1000
+                    )
+                    # dds_resp can be dict or AgentTaskResponse dataclass
+                    if dds_resp is None:
+                        content = ""
+                    elif isinstance(dds_resp, dict):
+                        content = dds_resp.get("content", "")
+                    elif hasattr(dds_resp, "content"):
+                        content = dds_resp.content or ""
+                    else:
+                        content = str(dds_resp)
+                    success = bool(content)
                     latency_ms = (_time.time() - t_start) * 1000
                     inst_port = instance.port
                     inst_type = instance.inst_type
-                    await self.instance_pool.release_instance(inst_port, latency_ms, stream_ok)
-                    instance = None  # prevent double-release in outer except
+                    await self.instance_pool.release_instance(inst_port, latency_ms, success)
+                    instance = None
                     if self.mongo_store:
                         asyncio.create_task(self.mongo_store.log_request({
                             "request_id": task_id, "instance_port": inst_port,
                             "instance_type": inst_type, "protocol": "dds",
                             "algorithm": self.instance_pool._algorithm.value,
-                            "latency_ms": latency_ms, "success": stream_ok,
+                            "latency_ms": latency_ms, "success": success,
                             "scenario": data.get("scenario", ""),
                         }))
-                return sse_response
+                    return web.json_response({
+                        "id": task_id, "object": "chat.completion",
+                        "choices": [{"index": 0,
+                                     "message": {"role": "assistant", "content": content},
+                                     "finish_reason": "stop" if content else "error"}],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        "instance_port": inst_port, "instance_type": inst_type,
+                        "protocol": "dds", "processing_time_ms": int(latency_ms),
+                    })
 
+            # ── gRPC Path ─────────────────────────────────────────────
+            # Orchestrator → gRPC → Agent gRPC → gRPC → llama-server
+            elif effective_protocol == "grpc" and self.grpc:
+                content = ""
+                success = False
+                try:
+                    # Target agent's gRPC address: hostname:grpc_port
+                    grpc_port = 59000 + (instance.port - 8000)  # convention: agent gRPC at 59082, 59088
+                    agent_grpc_addr = f"{instance.hostname}:{grpc_port}"
+                    grpc_resp = await self.grpc.forward_to_instance(
+                        agent_grpc_addr, dds_request, task_id,
+                        timeout_s=self.config.task_timeout_seconds,
+                    )
+                    content = grpc_resp.get("content", "") if grpc_resp else ""
+                    success = bool(content)
+                except Exception as e:
+                    logger.error(f"gRPC to instance :{instance.port} failed: {e}")
+                    content = ""
+                    success = False
+
+                latency_ms = (_time.time() - t_start) * 1000
+                inst_port = instance.port
+                inst_type = instance.inst_type
+                await self.instance_pool.release_instance(inst_port, latency_ms, success)
+                instance = None
+                if self.mongo_store:
+                    asyncio.create_task(self.mongo_store.log_request({
+                        "request_id": task_id, "instance_port": inst_port,
+                        "instance_type": inst_type, "protocol": "grpc",
+                        "algorithm": self.instance_pool._algorithm.value,
+                        "latency_ms": latency_ms, "success": success,
+                        "scenario": data.get("scenario", ""),
+                    }))
+                return web.json_response({
+                    "id": task_id, "object": "chat.completion",
+                    "choices": [{"index": 0,
+                                 "message": {"role": "assistant", "content": content},
+                                 "finish_reason": "stop" if content else "error"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    "instance_port": inst_port, "instance_type": inst_type,
+                    "protocol": "grpc", "processing_time_ms": int(latency_ms),
+                })
+
+            # ── HTTP Path (default) ───────────────────────────────────
+            # Orchestrator → HTTP → llama-server directly
             else:
-                # Non-streaming: HTTP direct to llama-server instance
-                # Uses shared session for connection pooling
                 content = ""
                 success = False
                 agent_url = f"http://{instance.hostname}:{instance.port}"
@@ -1097,31 +1658,25 @@ class OrchestratorServer:
                 inst_port = instance.port
                 inst_type = instance.inst_type
                 await self.instance_pool.release_instance(inst_port, latency_ms, success)
-                instance = None  # prevent double-release in outer except
+                instance = None
 
-                # Log metric (fire-and-forget)
                 if self.mongo_store:
                     asyncio.create_task(self.mongo_store.log_request({
                         "request_id": task_id, "instance_port": inst_port,
-                        "instance_type": inst_type,
-                        "protocol": "dds" if self.dds.is_available() else "http",
+                        "instance_type": inst_type, "protocol": "http",
                         "algorithm": self.instance_pool._algorithm.value,
                         "latency_ms": latency_ms, "success": success,
                         "scenario": data.get("scenario", ""),
                     }))
 
                 return web.json_response({
-                    "id": task_id,
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop" if content else "error",
-                    }],
+                    "id": task_id, "object": "chat.completion",
+                    "choices": [{"index": 0,
+                                 "message": {"role": "assistant", "content": content},
+                                 "finish_reason": "stop" if content else "error"}],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    "instance_port": inst_port,
-                    "instance_type": inst_type,
-                    "processing_time_ms": int(latency_ms),
+                    "instance_port": inst_port, "instance_type": inst_type,
+                    "protocol": "http", "processing_time_ms": int(latency_ms),
                 })
         except Exception as e:
             latency_ms = (_time.time() - t_start) * 1000

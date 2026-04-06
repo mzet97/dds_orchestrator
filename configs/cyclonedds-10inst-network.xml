@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CycloneDDS cross-machine configuration for 10-instance deployment.
+  Machines: .60 (RX 6600M), .61 (RTX 3080), .62 (Orchestrator)
+  Supports: 10 llama-servers + 10 DDS agents + 1 orchestrator + margin
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <!-- Multicast only for SPDP discovery; unicast for all data traffic -->
+      <AllowMulticast>spdp</AllowMulticast>
+      <!-- Avoid IP fragmentation for typical LLM responses -->
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+
+    <Discovery>
+      <!-- Static peer list eliminates multicast discovery overhead -->
+      <Peers>
+        <Peer address="192.168.1.60"/>
+        <Peer address="192.168.1.61"/>
+        <Peer address="192.168.1.62"/>
+      </Peers>
+      <!-- 10 servers + 10 agents + orchestrator + margin -->
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <!-- Moderate SPDP interval: fast enough for startup, low overhead at steady state -->
+      <SPDPInterval>100ms</SPDPInterval>
+      <!-- Aggressive lease for fast failure detection under load -->
+      <LeaseDuration>2s</LeaseDuration>
+    </Discovery>
+
+    <Internal>
+      <!-- Synchronous delivery for lower latency -->
+      <SynchronousDeliveryPriorityThreshold>0</SynchronousDeliveryPriorityThreshold>
+      <SynchronousDeliveryLatencyBound>inf</SynchronousDeliveryLatencyBound>
+      <!-- Fast RELIABLE acknowledgment for low-latency request/response -->
+      <HeartbeatInterval>20ms</HeartbeatInterval>
+      <!-- Zero linger: don't hold writer resources after send -->
+      <WriterLingerDuration>0ms</WriterLingerDuration>
+      <!-- Zero NACK delay: request retransmission immediately -->
+      <NackDelay>0ms</NackDelay>
+      <!-- Large buffers for burst handling (1000 agents, 10K clients) -->
+      <SocketReceiveBufferSize min="4MB"/>
+      <SocketSendBufferSize min="2MB"/>
+      <!-- Writer History Cache for burst absorption -->
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+    </Internal>
+
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

@@ -1,0 +1,119 @@
+# DDS-LLM Orchestrator - Redis Configuration
+# K3s Homelab Redis Master (Master-Replica setup)
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  log_level: "INFO"
+
+dds:
+  domain: 0
+  participant_name: "orchestrator"
+  enabled: true
+
+# Redis Configuration (K3s Homelab)
+redis:
+  # Connection settings
+  host: "192.168.1.51"
+  port: 6379
+  password: "Admin@123"
+  db: 0
+
+  # Connection pool
+  max_connections: 10
+  socket_timeout: 5
+  socket_connect_timeout: 5
+  decode_responses: true
+
+  # SSL/TLS settings
+  ssl: false
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_ca_certs: null
+
+  # Retry settings
+  retry_on_timeout: true
+  retry_max_attempts: 3
+  retry_backoff: 1.0  # seconds
+
+  # Key prefix for namespacing
+  key_prefix: "dds_orchestrator:"
+
+  # Expiration settings
+  default_ttl: 86400  # 1 day
+  context_ttl: 3600   # 1 hour
+
+  # Enabled features
+  enabled: true
+  cache_enabled: true
+  session_enabled: true
+  metrics_enabled: true
+
+# Instance Pool Configuration (uses Redis for routing)
+instance_pool:
+  enabled: false  # Set to true when Redis is available
+  num_instances: 38
+  strategy: "round_robin"  # round_robin, least_loaded, fuzzy_score
+  health_check_interval: 10
+  health_check_timeout: 5
+
+# Context Management
+context:
+  max_contexts: 1000
+  max_messages_per_context: 20
+  sliding_window_enabled: true
+
+  # Persist context to Redis
+  persist_to_redis: false  # Set to true when Redis is available
+  context_ttl: 3600
+
+# Fuzzy Logic Configuration
+fuzzy:
+  enabled: true
+  urgency_weight: 0.3
+  complexity_weight: 0.3
+  agent_load_weight: 0.2
+  agent_latency_weight: 0.2
+
+# Strategy Configuration
+strategy:
+  single_threshold_max: 3.0
+  retry_threshold_min: 3.0
+  retry_threshold_max: 7.0
+  fanout_threshold_min: 7.0
+
+  # Retry settings
+  retry_max_attempts: 3
+  retry_backoff_base: 0.5  # seconds
+  retry_backoff_multiplier: 2.0
+
+  # Fanout settings
+  fanout_max_agents: 3
+  fanout_timeout_multiplier: 1.5
+
+# Agent Configuration
+agents:
+  heartbeat_interval: 5
+  heartbeat_timeout: 30
+  max_slots_per_agent: 10
+
+  # Try protocols in order: grpc -> dds -> http
+  protocol_preference: ["grpc", "dds", "http"]
+
+  # Fallback settings
+  fallback_enabled: true
+  fallback_timeout: 30
+
+# Scheduler Configuration
+scheduler:
+  max_queue_size: 1000
+  priority_levels: 3
+  task_timeout_seconds: 300
+
+# Logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/orchestrator.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5

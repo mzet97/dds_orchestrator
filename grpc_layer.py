@@ -376,6 +376,61 @@ class GRPCLayer:
         finally:
             self._pending_agent_responses.pop(task_id, None)
 
+    async def forward_to_instance(self, agent_grpc_addr: str,
+                                   request: AgentTaskRequest, task_id: str,
+                                   timeout_s: int = 120) -> dict:
+        """Forward a request to an agent via gRPC (OrchestratorAgentService.SubmitTask).
+
+        Flow: Orchestrator → gRPC → Agent (agent_llm_grpc.py) → gRPC → llama-server
+        The agent acts as middleware, receiving via OrchestratorAgentService and
+        forwarding to llama-server via LlamaService.Chat.
+        """
+        try:
+            import grpc as _grpc
+
+            channel = _grpc.aio.insecure_channel(agent_grpc_addr)
+            stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
+
+            # Build AgentTaskRequest proto with ChatMessage repeated field
+            proto_req = _pb2.AgentTaskRequest(
+                task_id=task_id,
+                max_tokens=request.max_tokens if hasattr(request, 'max_tokens') else 20,
+                temperature=request.temperature if hasattr(request, 'temperature') else 0.7,
+                stream=False,
+            )
+            # Populate repeated ChatMessage field
+            msgs = request.messages if isinstance(request.messages, list) else json.loads(request.messages_json)
+            for msg in msgs:
+                chat_msg = proto_req.messages.add()
+                chat_msg.role = msg.get("role", "user")
+                chat_msg.content = msg.get("content", "")
+
+            proto_resp = await asyncio.wait_for(
+                stub.SubmitTask(proto_req),
+                timeout=timeout_s,
+            )
+
+            await channel.close()
+
+            content = proto_resp.content if proto_resp.content else ""
+            logger.info(f"gRPC forward response: task={task_id} content_len={len(content)} "
+                        f"success={proto_resp.success} error={proto_resp.error_message}")
+
+            return {
+                "task_id": proto_resp.task_id,
+                "content": content,
+                "is_final": True,
+                "prompt_tokens": proto_resp.prompt_tokens,
+                "completion_tokens": proto_resp.completion_tokens,
+                "success": proto_resp.success if hasattr(proto_resp, 'success') else bool(content),
+            }
+        except asyncio.TimeoutError:
+            logger.error(f"gRPC timeout for task {task_id} to {agent_grpc_addr}")
+            return {"content": "", "error": "gRPC timeout"}
+        except Exception as e:
+            logger.error(f"gRPC forward to {agent_grpc_addr} failed: {e}")
+            return {"content": "", "error": str(e)}
+
     async def dispatch_agent_responses(self):
         """Background loop — for gRPC this is a no-op since responses arrive
         via direct RPC calls (not pub/sub polling). Kept for interface compatibility.

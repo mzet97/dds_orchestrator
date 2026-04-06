@@ -1,0 +1,1 @@
+{"scenario": "S5_10000", "protocol": "http", "algorithm": "least_loaded", "stats": {"p50": 0, "p95": 0, "p99": 0, "mean": 0, "max": 0, "min": 0, "throughput_rps": 0, "total_requests": 96441, "error_count": 96441, "error_rate": 1.0, "actual_duration_s": 232.18852472305298}, "latencies": []}

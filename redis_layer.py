@@ -253,6 +253,42 @@ class RedisStateManager:
             results.append(json.loads(item[1]))
         return results
 
+    # === Agent-Instance Mapping ===
+
+    async def set_agent_instance(self, agent_id: str, host: str, port: int):
+        """Map an agent to its instance host:port."""
+        await self._redis.set(f"agent:{agent_id}:instance", f"{host}:{port}")
+
+    async def get_agent_instance(self, agent_id: str) -> tuple[str, int] | None:
+        """Get the instance host:port for an agent."""
+        val = await self._redis.get(f"agent:{agent_id}:instance")
+        if not val or ":" not in val:
+            return None
+        host, port = val.rsplit(":", 1)
+        return host, int(port)
+
+    async def register_agents_bulk(self, agents: list[dict]):
+        """Bulk-register agent-to-instance mappings."""
+        pipe = self._redis.pipeline()
+        for agent in agents:
+            host = agent.get("hostname", "127.0.0.1")
+            port = agent.get("instance_port", agent.get("port", 0))
+            pipe.set(f"agent:{agent['agent_id']}:instance", f"{host}:{port}")
+        await pipe.execute()
+
+    async def get_agent_count(self) -> int:
+        """Count registered agent mappings."""
+        count = 0
+        cursor = "0"
+        while True:
+            cursor, keys = await self._redis.scan(
+                cursor=cursor, match="agent:*:instance", count=500
+            )
+            count += len(keys)
+            if cursor == "0" or cursor == 0:
+                break
+        return count
+
     # === Circuit Breaker State ===
 
     async def record_error(self, port: int):

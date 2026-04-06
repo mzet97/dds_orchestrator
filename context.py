@@ -158,6 +158,37 @@ class ContextManager:
                     del self._contexts[context_id]
             self._user_contexts[user_id] = []
 
+    async def get_or_create_for_user(self, user_id: str) -> str:
+        """Get the most recent context for a user, or create a new one"""
+        async with self._lock:
+            # Check if user has existing contexts
+            if user_id in self._user_contexts and self._user_contexts[user_id]:
+                # Return most recent context
+                context_ids = self._user_contexts[user_id]
+                most_recent = max(
+                    context_ids,
+                    key=lambda cid: self._contexts[cid].last_updated if cid in self._contexts else 0
+                )
+                return most_recent
+
+            # Create new context for user
+            if len(self._contexts) >= self.max_contexts:
+                self._cleanup_oldest_no_lock()
+
+            context_id = str(uuid.uuid4())
+            context = ConversationContext(
+                context_id=context_id,
+                user_id=user_id,
+            )
+
+            self._contexts[context_id] = context
+
+            if user_id not in self._user_contexts:
+                self._user_contexts[user_id] = []
+            self._user_contexts[user_id].append(context_id)
+
+            return context_id
+
     async def get_stats(self) -> Dict:
         """Get context manager statistics"""
         async with self._lock:

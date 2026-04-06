@@ -60,8 +60,11 @@ class OrchestratorConfig:
     instance_ports_gpu: str = ""
     instance_ports_cpu: str = ""
     instance_host: str = "192.168.1.61"
+    instance_host_map: str = ""  # "host:port,host:port,..." per-instance hostname
     slots_per_gpu: int = 15
     slots_per_cpu: int = 4
+    weight_gpu: float = 1.0
+    weight_cpu: float = 0.3
 
     # Expected types for each field, used for validation after loading
     _field_types = {
@@ -88,8 +91,11 @@ class OrchestratorConfig:
         "instance_ports_gpu": str,
         "instance_ports_cpu": str,
         "instance_host": str,
+        "instance_host_map": str,
         "slots_per_gpu": int,
         "slots_per_cpu": int,
+        "weight_gpu": float,
+        "weight_cpu": float,
     }
 
     def load_from_file(self, config_path: Path):
@@ -164,8 +170,11 @@ class OrchestratorConfig:
             "instance_ports_gpu": self.instance_ports_gpu,
             "instance_ports_cpu": self.instance_ports_cpu,
             "instance_host": self.instance_host,
+            "instance_host_map": self.instance_host_map,
             "slots_per_gpu": self.slots_per_gpu,
             "slots_per_cpu": self.slots_per_cpu,
+            "weight_gpu": self.weight_gpu,
+            "weight_cpu": self.weight_cpu,
         }
 
 
@@ -192,6 +201,9 @@ def load_config_from_env() -> OrchestratorConfig:
         instance_ports_gpu=os.environ.get("INSTANCE_PORTS_GPU", ""),
         instance_ports_cpu=os.environ.get("INSTANCE_PORTS_CPU", ""),
         instance_host=os.environ.get("INSTANCE_HOST", "192.168.1.61"),
+        instance_host_map=os.environ.get("INSTANCE_HOST_MAP", ""),
         slots_per_gpu=int(os.environ.get("SLOTS_PER_GPU", "15")),
         slots_per_cpu=int(os.environ.get("SLOTS_PER_CPU", "4")),
+        weight_gpu=float(os.environ.get("WEIGHT_GPU", "1.0")),
+        weight_cpu=float(os.environ.get("WEIGHT_CPU", "0.3")),
     )

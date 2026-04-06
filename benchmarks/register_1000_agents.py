@@ -1,50 +1,81 @@
 #!/usr/bin/env python3
 """
-Register 1000 logical agents distributed across 38 instances.
-~26 agents per instance, named agent-{instance_idx:02d}-{agent_idx:03d}.
+Register 1000 logical agents distributed across 10 GPU instances.
+
+Topology:
+  .61 (RTX 3080): 6 instances, ports 8082-8087, parallel=15 → 600 agents
+  .60 (RX 6600M): 4 instances, ports 8088-8091, parallel=10 → 400 agents
+  Total: 1000 agents, 100 per instance
+
+Warmup strategy:
+  Phase 1: 5 requests/instance sequentially (cold → warm VRAM)
+  Phase 2: 50 requests/instance concurrent (warm KV cache + DDS topics)
+  Phase 3: 100 parallel requests across all instances (validate routing)
 """
 
 import argparse
 import asyncio
-import aiohttp
 import time
 
-
-GPU_PORTS = list(range(8082, 8092))   # 10 GPU instances
-CPU_PORTS = list(range(8092, 8120))   # 28 CPU instances
-ALL_PORTS = GPU_PORTS + CPU_PORTS     # 38 instances
+import aiohttp
 
 
-def generate_agents(total=1000):
-    """Generate agent definitions distributed across instances."""
+# ===== 10-Instance Topology =====
+
+INSTANCES = [
+    # .61 RTX 3080: 6 instances
+    {"host": "192.168.1.61", "port": 8082 + i, "type": "gpu",
+     "slots": 15, "gpu": "rtx3080", "vram_mb": 1500}
+    for i in range(6)
+] + [
+    # .60 RX 6600M: 4 instances
+    {"host": "192.168.1.60", "port": 8088 + i, "type": "gpu",
+     "slots": 10, "gpu": "rx6600m", "vram_mb": 1500}
+    for i in range(4)
+]
+
+ORCHESTRATOR_DEFAULT = "http://192.168.1.62:8080"
+
+
+def generate_agents(total: int = 1000) -> list[dict]:
+    """Generate agent definitions distributed across 10 instances.
+
+    Distributes proportionally: RTX instances get more agents (higher slots).
+    """
     agents = []
-    per_instance = total // len(ALL_PORTS)   # 26
-    remainder = total % len(ALL_PORTS)        # 12
+    # Weighted distribution: proportional to slots
+    total_slots = sum(inst["slots"] for inst in INSTANCES)
 
-    for idx, port in enumerate(ALL_PORTS):
-        count = per_instance + (1 if idx < remainder else 0)
-        inst_type = "gpu" if port < 8092 else "cpu"
-        slots = 15 if inst_type == "gpu" else 4
+    assigned = 0
+    for idx, inst in enumerate(INSTANCES):
+        # Proportional allocation, last instance gets remainder
+        if idx == len(INSTANCES) - 1:
+            count = total - assigned
+        else:
+            count = round(total * inst["slots"] / total_slots)
+            assigned += count
 
         for j in range(count):
             agents.append({
                 "agent_id": f"agent-{idx:02d}-{j:03d}",
-                "hostname": "192.168.1.61",
-                "port": port,
+                "hostname": inst["host"],
+                "port": inst["port"],
                 "model": "Qwen3.5-2B",
-                "slots_total": slots,
-                "slots_idle": slots,
-                "instance_type": inst_type,
-                "instance_port": port,
+                "slots_total": inst["slots"],
+                "slots_idle": inst["slots"],
+                "instance_type": inst["type"],
+                "instance_port": inst["port"],
+                "gpu_type": inst["gpu"],
                 "vision_enabled": False,
                 "reasoning_enabled": False,
-                "vram_available_mb": 1000 if inst_type == "gpu" else 0,
+                "vram_available_mb": inst["vram_mb"],
             })
 
     return agents
 
 
-async def register_bulk(orchestrator_url: str, agents: list, batch_size: int = 100):
+async def register_bulk(orchestrator_url: str, agents: list,
+                        batch_size: int = 100) -> tuple[int, int]:
     """Register agents in batches via HTTP POST."""
     registered = 0
     errors = 0
@@ -52,9 +83,7 @@ async def register_bulk(orchestrator_url: str, agents: list, batch_size: int = 1
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(agents), batch_size):
             batch = agents[i:i + batch_size]
-            tasks = []
-            for agent in batch:
-                tasks.append(_register_one(session, orchestrator_url, agent))
+            tasks = [_register_one(session, orchestrator_url, a) for a in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for r in results:
@@ -63,12 +92,13 @@ async def register_bulk(orchestrator_url: str, agents: list, batch_size: int = 1
                 else:
                     registered += 1
 
-            print(f"  Registered {registered}/{len(agents)} (errors: {errors})", flush=True)
+            print(f"  Registered {registered}/{len(agents)} "
+                  f"(errors: {errors})", flush=True)
 
     return registered, errors
 
 
-async def _register_one(session, url, agent):
+async def _register_one(session: aiohttp.ClientSession, url: str, agent: dict):
     """Register a single agent."""
     async with session.post(
         f"{url}/api/v1/agents/register",
@@ -80,31 +110,65 @@ async def _register_one(session, url, agent):
         return await resp.json()
 
 
-async def warmup(orchestrator_url: str, prompts_per_instance: int = 5):
-    """Send warmup requests to load models into memory/VRAM."""
-    print(f"\nWarming up {len(ALL_PORTS)} instances ({prompts_per_instance} requests each)...")
-    warmup_prompt = [{"role": "user", "content": "Say hello."}]
-
-    async with aiohttp.ClientSession() as session:
-        for port in ALL_PORTS:
-            tasks = []
-            for _ in range(prompts_per_instance):
-                tasks.append(_send_chat(session, orchestrator_url, warmup_prompt))
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            successes = sum(1 for r in results if not isinstance(r, Exception))
-            print(f"  Instance :{port} — {successes}/{prompts_per_instance} warmup OK")
-
-    print("Warmup complete")
-
-
-async def _send_chat(session, url, messages, max_tokens=10):
+async def _send_chat(session: aiohttp.ClientSession, url: str,
+                     messages: list, max_tokens: int = 10):
     """Send a single chat request."""
     async with session.post(
         f"{url}/api/v1/chat/completions",
-        json={"messages": messages, "max_tokens": max_tokens},
-        timeout=aiohttp.ClientTimeout(total=60),
+        json={"messages": messages, "max_tokens": max_tokens,
+              "model": "Qwen3.5-2B"},
+        timeout=aiohttp.ClientTimeout(total=120),
     ) as resp:
         return await resp.json()
+
+
+async def warmup_phased(orchestrator_url: str):
+    """3-phase warmup to progressively warm all instances.
+
+    Phase 1: Sequential warmup (5 req/instance) — loads model into VRAM
+    Phase 2: Concurrent warmup (50 req/instance) — warms KV cache, DDS topics
+    Phase 3: Routing validation (100 parallel) — tests orchestrator routing
+    """
+    prompt = [{"role": "user", "content": "Say hello."}]
+
+    # Phase 1: Sequential (cold start)
+    print("\n[Warmup Phase 1] Sequential cold-start (5 req/instance)...")
+    async with aiohttp.ClientSession() as session:
+        for inst in INSTANCES:
+            successes = 0
+            for _ in range(5):
+                try:
+                    await _send_chat(session, orchestrator_url, prompt)
+                    successes += 1
+                except Exception as e:
+                    print(f"  [{inst['host']}:{inst['port']}] warmup error: {e}")
+            print(f"  [{inst['host']}:{inst['port']}] {successes}/5 OK")
+
+    # Phase 2: Concurrent per-instance (warm caches)
+    print("\n[Warmup Phase 2] Concurrent warmup (50 req/instance)...")
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=100)
+    ) as session:
+        for inst in INSTANCES:
+            tasks = [_send_chat(session, orchestrator_url, prompt)
+                     for _ in range(50)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successes = sum(1 for r in results if not isinstance(r, Exception))
+            print(f"  [{inst['host']}:{inst['port']}] {successes}/50 OK")
+
+    # Phase 3: Routing validation (all instances at once)
+    print("\n[Warmup Phase 3] Routing validation (100 parallel)...")
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=200)
+    ) as session:
+        tasks = [_send_chat(session, orchestrator_url, prompt)
+                 for _ in range(100)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        successes = sum(1 for r in results if not isinstance(r, Exception))
+        errors = sum(1 for r in results if isinstance(r, Exception))
+        print(f"  {successes}/100 OK, {errors} errors")
+
+    print("\nWarmup complete!")
 
 
 async def save_to_mongo(mongo_url: str, agents: list):
@@ -117,8 +181,13 @@ async def save_to_mongo(mongo_url: str, agents: list):
         store = MongoMetricsStore(mongo_url)
         await store.connect()
         await store.ensure_indexes()
-        await store.register_agents_bulk(agents)
-        count = await store.get_agent_count()
+
+        # Bulk insert
+        col = store._db["agents"]
+        await col.delete_many({})  # Clean slate
+        if agents:
+            await col.insert_many(agents)
+        count = await col.count_documents({})
         print(f"MongoDB: {count} agents stored")
         await store.close()
     except Exception as e:
@@ -132,25 +201,32 @@ async def save_to_redis(redis_url: str, password: str, agents: list):
         sys.path.insert(0, "..")
         from redis_layer import RedisStateManager
 
-        redis = RedisStateManager(redis_url, password)
-        await redis.connect()
+        mgr = RedisStateManager(redis_url, password)
+        await mgr.connect()
 
         import redis.asyncio as aioredis
-        pipe = redis._redis.pipeline()
+        pipe = mgr._redis.pipeline()
         for agent in agents:
-            pipe.set(f"agent:{agent['agent_id']}:instance_port", agent["instance_port"])
+            key = f"agent:{agent['agent_id']}:instance"
+            value = f"{agent['hostname']}:{agent['instance_port']}"
+            pipe.set(key, value)
         await pipe.execute()
         print(f"Redis: {len(agents)} agent mappings stored")
-        await redis.close()
+        await mgr.close()
     except Exception as e:
         print(f"Redis save failed: {e}")
 
 
 async def main_async(args):
     agents = generate_agents(args.total)
-    print(f"Generated {len(agents)} agents across {len(ALL_PORTS)} instances")
-    print(f"Distribution: {args.total // len(ALL_PORTS)} per instance "
-          f"(+1 for first {args.total % len(ALL_PORTS)})")
+    print(f"Generated {len(agents)} agents across {len(INSTANCES)} instances")
+
+    # Print distribution
+    from collections import Counter
+    dist = Counter(a["instance_port"] for a in agents)
+    for inst in INSTANCES:
+        n = dist.get(inst["port"], 0)
+        print(f"  {inst['host']}:{inst['port']} ({inst['gpu']}): {n} agents")
 
     # Register via HTTP
     print(f"\nRegistering with orchestrator at {args.url}...")
@@ -167,7 +243,7 @@ async def main_async(args):
 
     # Warmup
     if args.warmup:
-        await warmup(args.url, args.warmup_per_instance)
+        await warmup_phased(args.url)
 
     # Verify
     if args.verify:
@@ -179,17 +255,17 @@ async def main_async(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Register 1000 logical agents")
-    parser.add_argument("--url", type=str, default="http://192.168.1.61:8080",
+    parser = argparse.ArgumentParser(
+        description="Register 1000 agents across 10 GPU instances"
+    )
+    parser.add_argument("--url", type=str, default=ORCHESTRATOR_DEFAULT,
                        help="Orchestrator URL")
     parser.add_argument("--total", type=int, default=1000,
                        help="Total agents to register")
     parser.add_argument("--batch-size", type=int, default=100,
                        help="Registration batch size")
     parser.add_argument("--warmup", action="store_true",
-                       help="Run warmup after registration")
-    parser.add_argument("--warmup-per-instance", type=int, default=5,
-                       help="Warmup requests per instance")
+                       help="Run 3-phase warmup after registration")
     parser.add_argument("--mongo-url", type=str, default="",
                        help="MongoDB URL for persistence")
     parser.add_argument("--redis-url", type=str, default="",
@@ -197,7 +273,7 @@ def main():
     parser.add_argument("--redis-password", type=str, default="Admin@123",
                        help="Redis password")
     parser.add_argument("--verify", action="store_true", default=True,
-                       help="Verify registration")
+                       help="Verify registration count")
 
     args = parser.parse_args()
     asyncio.run(main_async(args))

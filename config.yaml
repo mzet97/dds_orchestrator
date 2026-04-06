@@ -9,17 +9,17 @@ dds_domain: 0
 dds_enabled: true
 
 # Agent settings
-max_agents: 10
+max_agents: 1000
 agent_timeout_seconds: 300
 
 # Task settings
-max_concurrent_tasks: 50
+max_concurrent_tasks: 2000
 task_timeout_seconds: 120
 
 # Logging
 log_level: "INFO"
 
 # Model defaults
-default_model: "glm-4.6v-flash"
+default_model: "Qwen3.5-2B"
 default_max_tokens: 256
 default_temperature: 0.7
