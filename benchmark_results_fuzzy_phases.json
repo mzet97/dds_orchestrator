@@ -1,0 +1,87 @@
+{
+  "F0": {
+    "scenario": "F0",
+    "total_requests": 500,
+    "successful_requests": 479,
+    "success_rate": 0.958,
+    "latency_p50": 99.68738418201576,
+    "latency_p95": 154.60910627684456,
+    "latency_p99": 173.1031920265301,
+    "latency_max": 187.503363534904,
+    "latency_mean": 100.34739142309355,
+    "agent_distribution": {
+      "agent-1": 167,
+      "agent-2": 167,
+      "agent-3": 166
+    },
+    "fault_detection_time_ms": 0.0
+  },
+  "F1": {
+    "scenario": "F1",
+    "total_requests": 500,
+    "successful_requests": 490,
+    "success_rate": 0.98,
+    "latency_p50": 84.96640254355324,
+    "latency_p95": 128.25553342813436,
+    "latency_p99": 142.16026858013288,
+    "latency_max": 153.40454158955242,
+    "latency_mean": 85.49075421760853,
+    "agent_distribution": {
+      "agent-1": 365,
+      "agent-2": 72,
+      "agent-3": 63
+    },
+    "fault_detection_time_ms": 0.0
+  },
+  "F2": {
+    "scenario": "F2",
+    "total_requests": 500,
+    "successful_requests": 494,
+    "success_rate": 0.988,
+    "latency_p50": 75.90809759123675,
+    "latency_p95": 109.53330865172418,
+    "latency_p99": 131.36905222483375,
+    "latency_max": 161.4453361489497,
+    "latency_mean": 75.29123276623578,
+    "agent_distribution": {
+      "agent-1": 366,
+      "agent-2": 69,
+      "agent-3": 65
+    },
+    "fault_detection_time_ms": 0.0
+  },
+  "F3": {
+    "scenario": "F3",
+    "total_requests": 500,
+    "successful_requests": 494,
+    "success_rate": 0.988,
+    "latency_p50": 78.31226830103577,
+    "latency_p95": 118.04072508563794,
+    "latency_p99": 131.30653659879357,
+    "latency_max": 136.32781935982652,
+    "latency_mean": 78.8325763435485,
+    "agent_distribution": {
+      "agent-1": 342,
+      "agent-2": 81,
+      "agent-3": 77
+    },
+    "fault_detection_time_ms": 0.0
+  },
+  "F4": {
+    "scenario": "F4",
+    "total_requests": 500,
+    "successful_requests": 471,
+    "success_rate": 0.942,
+    "latency_p50": 105.86949926268458,
+    "latency_p95": 509.56271098847236,
+    "latency_p99": 629.0525132722748,
+    "latency_max": 701.0741818925292,
+    "latency_mean": 149.1877981318192,
+    "agent_distribution": {
+      "agent-2": 86,
+      "agent-1": 350,
+      "agent-3": 64
+    },
+    "fault_detection_time_ms": 500
+  }
+}

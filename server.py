@@ -251,6 +251,7 @@ class OrchestratorServer:
         request_id = getattr(req, "request_id", "unknown")
         client_id = getattr(req, "client_id", "unknown")
         messages_json = getattr(req, "messages_json", "[]")
+        priority = getattr(req, "priority", 5)
 
         try:
             messages = json.loads(messages_json)
@@ -258,7 +259,7 @@ class OrchestratorServer:
             logger.warning(f"Failed to parse messages_json, using raw content: {e}")
             messages = [{"role": "user", "content": messages_json}]
 
-        logger.info(f"Processing DDS client request: {request_id}")
+        logger.info(f"Processing DDS client request: {request_id} (priority={priority})")
 
         # Get available agent
         agents = await self.registry.get_available_agents()
@@ -268,8 +269,9 @@ class OrchestratorServer:
             return
 
         # Select agent: fuzzy if enabled, otherwise max idle slots
+        # Priority maps to urgency; complexity is auto-estimated from messages
         agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-            agents, messages=messages, priority=5)
+            agents, messages=messages, priority=priority)
         logger.info(f"Selected agent: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
         # Acquire agent slot (status auto-derived: idle if slots remain, busy if 0)
@@ -285,7 +287,7 @@ class OrchestratorServer:
                 requester_id="orchestrator",
                 task_type="chat",
                 messages=messages,
-                priority=5,
+                priority=priority,
                 timeout_ms=60000,
                 requires_context=False,
                 max_tokens=50,
@@ -765,6 +767,155 @@ class OrchestratorServer:
 
         return response_data, transport_success, error_msg, _streaming_handled
 
+    async def _execute_with_retry(self, primary_agent: AgentInfo, fallback_agents: list,
+                                   task: Task, messages: list, all_messages: list,
+                                   max_tokens: int, temperature: float, priority: int,
+                                   fuzzy_qos: str, context_id: str, session_id: str) -> tuple:
+        """Execute request with retry strategy: try primary, then fallback agents with exponential backoff.
+
+        Returns: (response_content, response_data, successful_agent_id)
+        """
+        response_content = ""
+        response_data = {}
+        current_agent = primary_agent
+        attempted_agents = [primary_agent.agent_id]
+        max_retries = min(3, len([primary_agent] + fallback_agents))
+
+        for retry_attempt in range(max_retries):
+            if retry_attempt > 0:
+                # Apply exponential backoff: 0.5s, 1s, 2s
+                backoff = min(0.5 * (2 ** (retry_attempt - 1)), 5.0)
+                logger.info(f"Retry {retry_attempt}/{max_retries}: waiting {backoff}s before trying agent {current_agent.agent_id}")
+                await asyncio.sleep(backoff)
+
+            # For retry attempts after first, update task to use next fallback agent
+            if retry_attempt > 0:
+                if retry_attempt <= len(fallback_agents):
+                    current_agent = fallback_agents[retry_attempt - 1]
+                    attempted_agents.append(current_agent.agent_id)
+
+                    # Update slot allocation: release previous, acquire new
+                    await self.registry.adjust_slots(attempted_agents[-2], delta=+1)
+                    if not await self.registry.adjust_slots(current_agent.agent_id, delta=-1):
+                        logger.warning(f"Could not acquire slot on retry agent {current_agent.agent_id}")
+                        continue
+
+                    task.assigned_agent_id = current_agent.agent_id
+                    task.task_id = f"task-{str(uuid.uuid4())}-retry-{retry_attempt}"
+                    await self.scheduler.track_task(task)
+
+            # Execute agent request via gRPC/DDS/HTTP
+            try:
+                response_data, transport_success, error_msg, _ = await self._execute_agent_request(
+                    current_agent, task, messages, all_messages, max_tokens, temperature,
+                    False, None, fuzzy_qos, context_id, session_id
+                )
+
+                if transport_success:
+                    response_content = response_data.get("content", "") if isinstance(response_data, dict) else getattr(response_data, "content", "")
+                    if response_content:
+                        logger.info(f"Retry attempt {retry_attempt} successful with agent {current_agent.agent_id}")
+                        return response_content, response_data, current_agent.agent_id
+            except Exception as e:
+                logger.warning(f"Retry attempt {retry_attempt} failed: {e}")
+
+        return response_content, response_data, current_agent.agent_id
+
+    async def _execute_fanout(self, agents: list, task: Task, messages: list, all_messages: list,
+                              max_tokens: int, temperature: float, priority: int,
+                              fuzzy_qos: str, context_id: str, session_id: str, dds_priority: int = 0) -> tuple:
+        """Execute request with fanout strategy: send to multiple agents in parallel, return first success.
+
+        Returns: (response_content, response_data, successful_agent_id)
+        """
+        if not agents or len(agents) < 2:
+            return "", {}, ""
+
+        logger.info(f"Fanout strategy: sending to up to {min(3, len(agents))} agents in parallel")
+
+        fanout_tasks = []
+        fanout_agents = []
+        fanout_task_ids = []
+
+        for fanout_idx, fanout_agent in enumerate(agents[:3]):
+            # Try to acquire slot for this agent
+            if not await self.registry.adjust_slots(fanout_agent.agent_id, delta=-1):
+                logger.warning(f"Fanout: could not acquire slot for agent {fanout_agent.agent_id}")
+                continue
+
+            fanout_agents.append(fanout_agent)
+            fanout_task_id = f"task-{str(uuid.uuid4())}-fanout-{fanout_idx}"
+            fanout_task_ids.append(fanout_task_id)
+
+            # Create task for parallel execution
+            async def _fanout_attempt(fa=fanout_agent, ti=fanout_idx, task_id=fanout_task_id):
+                """Execute single agent in fanout context"""
+                try:
+                    # Track fanout task
+                    fanout_task = Task(
+                        task_id=task_id,
+                        task_type=task.task_type,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        priority=task.priority,
+                        assigned_agent_id=fa.agent_id,
+                    )
+                    await self.scheduler.track_task(fanout_task)
+
+                    # Execute agent request
+                    response_data, transport_success, error_msg, _ = await self._execute_agent_request(
+                        fa, fanout_task, messages, all_messages, max_tokens, temperature,
+                        False, None, fuzzy_qos, context_id, session_id
+                    )
+
+                    if transport_success:
+                        fa_content = response_data.get("content", "") if isinstance(response_data, dict) else getattr(response_data, "content", "")
+                        return (fa_content, response_data, fa.agent_id)
+
+                    return ("", {}, fa.agent_id)
+                except Exception as e:
+                    logger.error(f"Fanout attempt on agent {fa.agent_id} failed: {e}")
+                    return ("", {}, fa.agent_id)
+
+            # Create explicit tasks (required for asyncio.wait in Python 3.10+)
+            fanout_tasks.append(asyncio.create_task(_fanout_attempt()))
+
+        # Run all tasks in parallel, get first successful response
+        response_content = ""
+        response_data = {}
+        successful_agent_id = ""
+
+        if fanout_tasks:
+            try:
+                done, pending = await asyncio.wait(fanout_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=35)
+
+                for task_coro in done:
+                    try:
+                        fa_content, fa_data, fa_agent_id = await task_coro
+                        if fa_content:
+                            response_content = fa_content
+                            response_data = fa_data if fa_data else {"content": fa_content, "success": True}
+                            successful_agent_id = fa_agent_id
+                            logger.info(f"Fanout winner: {fa_agent_id}")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Fanout response processing failed: {e}")
+
+                # Cancel pending tasks
+                for task_coro in pending:
+                    task_coro.cancel()
+                    try:
+                        await task_coro
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                # Release slots for all fanout agents
+                for fa in fanout_agents:
+                    await self.registry.adjust_slots(fa.agent_id, delta=+1)
+
+        return response_content, response_data, successful_agent_id
+
     async def handle_chat(self, request: web.Request) -> web.Response:
         """Handle chat request"""
         try:
@@ -1124,262 +1275,39 @@ class OrchestratorServer:
             # === Fanout Strategy (Parallel Execution) ===
             # If response failed and strategy is "fanout", try multiple agents in parallel
             if (not response_content and fuzzy_strategy == "fanout" and len(agent_list) > 1):
-                logger.info(f"Fanout strategy: sending to {min(3, len(agent_list))} agents in parallel")
-
-                # Prepare coroutines for up to 3 agents
-                fanout_tasks = []
-                fanout_agents = []
-
-                for fanout_idx, fanout_agent in enumerate(agent_list[:3]):
-                    # Try to acquire slot for this agent
-                    if not await self.registry.adjust_slots(fanout_agent.agent_id, delta=-1):
-                        logger.warning(f"Fanout: could not acquire slot for agent {fanout_agent.agent_id}")
-                        continue
-
-                    fanout_agents.append(fanout_agent)
-
-                    # Create task for this agent
-                    async def _fanout_attempt(fa=fanout_agent, ti=fanout_idx):
-                        """Execute single agent in fanout context"""
-                        try:
-                            # Create new task_id for fanout attempt
-                            fanout_task_id = f"task-{str(uuid.uuid4())}-fanout-{ti}"
-                            task.task_id = fanout_task_id
-                            await self.scheduler.track_task(task)
-
-                            # Try transports (gRPC -> DDS -> HTTP)
-                            fa_response_content = ""
-                            fa_response_data = None
-
-                            # gRPC attempt
-                            if (self.grpc and self.grpc.is_available() and
-                                getattr(fa, "grpc_address", "")):
-                                try:
-                                    from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
-                                    grpc_req = GRPCAgentTaskRequest(
-                                        task_id=fanout_task_id,
-                                        requester_id="orchestrator",
-                                        task_type=task.task_type,
-                                        messages=all_messages,
-                                        priority=priority,
-                                        timeout_ms=task.timeout_ms,
-                                        requires_context=True,
-                                        context_id=context_id,
-                                        stream=False,
-                                    )
-                                    self.grpc.prepare_agent_response_waiter(fanout_task_id)
-                                    await self.grpc.publish_agent_request(
-                                        grpc_req, agent_id=fa.agent_id, agent_grpc_url=fa.grpc_address)
-                                    fa_response = await self.grpc.wait_for_agent_response(fanout_task_id, timeout_ms=30000)
-                                    fa_response_content = fa_response.get("content", "") if isinstance(fa_response, dict) else getattr(fa_response, "content", "")
-                                    if fa_response_content:
-                                        fa_response_data = fa_response
-                                except Exception as e:
-                                    logger.debug(f"Fanout gRPC failed on agent {fa.agent_id}: {e}")
-
-                            # DDS attempt
-                            if not fa_response_content and self.dds.is_available():
-                                try:
-                                    dds_req = AgentTaskRequest(
-                                        task_id=fanout_task_id,
-                                        requester_id="orchestrator",
-                                        task_type=task.task_type,
-                                        messages=all_messages,
-                                        priority=priority,
-                                        timeout_ms=task.timeout_ms,
-                                        requires_context=True,
-                                        context_id=context_id,
-                                        max_tokens=max_tokens,
-                                        temperature=temperature,
-                                        stream=False,
-                                    )
-                                    self.dds.prepare_agent_response_waiter(fanout_task_id)
-                                    await self.dds.publish_agent_request(dds_req, priority=dds_priority, qos_profile=fuzzy_qos)
-                                    fa_response = await self.dds.wait_for_agent_response(fanout_task_id, timeout_ms=30000)
-                                    fa_response_content = fa_response.get("content", "") if isinstance(fa_response, dict) else getattr(fa_response, "content", "")
-                                    if fa_response_content:
-                                        fa_response_data = fa_response
-                                except Exception as e:
-                                    logger.debug(f"Fanout DDS failed on agent {fa.agent_id}: {e}")
-
-                            # HTTP attempt
-                            if not fa_response_content:
-                                try:
-                                    import aiohttp as _aiohttp
-                                    fa_url = f"http://{fa.hostname}:{fa.port}"
-                                    async with _aiohttp.ClientSession() as _sess:
-                                        async with _sess.post(
-                                            f"{fa_url}/chat",
-                                            json={"messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                                            timeout=_aiohttp.ClientTimeout(total=15)
-                                        ) as _resp:
-                                            http_result = await _resp.json()
-                                    fa_response_content = http_result.get("content", "")
-                                    if fa_response_content:
-                                        fa_response_data = {"content": fa_response_content, "success": True}
-                                except Exception as e:
-                                    logger.debug(f"Fanout HTTP failed on agent {fa.agent_id}: {e}")
-
-                            return (fa_response_content, fa_response_data, fa.agent_id)
-                        except Exception as e:
-                            logger.error(f"Fanout attempt failed for agent {fa.agent_id}: {e}")
-                            return ("", None, fa.agent_id)
-
-                    fanout_tasks.append(_fanout_attempt())
-
-                # Run all tasks in parallel, get first successful response
-                if fanout_tasks:
-                    done, pending = await asyncio.wait(fanout_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=35)
-
-                    for task_coro in done:
-                        try:
-                            fa_content, fa_data, fa_agent_id = await task_coro
-                            if fa_content:
-                                response_content = fa_content
-                                response_data = fa_data if fa_data else {"content": fa_content, "success": True}
-                                agent = next((a for a in agent_list if a.agent_id == fa_agent_id), agent)
-                                attempted_agents.append(fa_agent_id)
-                                logger.info(f"Fanout winner: {fa_agent_id} with {len(done)} parallel responses received")
-                                break
-                        except Exception as e:
-                            logger.warning(f"Fanout response processing failed: {e}")
-
-                    # Cancel pending tasks
-                    for task_coro in pending:
-                        task_coro.cancel()
-                        try:
-                            await task_coro
-                        except asyncio.CancelledError:
-                            pass
-
-                    # Release slots for all fanout agents
-                    for fa in fanout_agents:
-                        await self.registry.adjust_slots(fa.agent_id, delta=+1)
+                fa_content, fa_data, fa_agent_id = await self._execute_fanout(
+                    agent_list, task, messages, all_messages,
+                    max_tokens, temperature, priority,
+                    fuzzy_qos, context_id, session_id, dds_priority
+                )
+                if fa_content:
+                    response_content = fa_content
+                    response_data = fa_data if fa_data else {"content": fa_content, "success": True}
+                    agent = next((a for a in agent_list if a.agent_id == fa_agent_id), agent)
+                    attempted_agents.append(fa_agent_id)
+                    logger.info(f"Fanout winner: {fa_agent_id}")
 
             # === Retry Logic for Strategy ===
             # If response failed and strategy is "retry", try next agent from pool
-            retry_attempt = 0
-            max_retries = 3
-            current_agent_idx = 0  # index into agent_list
+            if (not response_content and fuzzy_strategy == "retry" and len(agent_list) > 1):
+                # Get fallback agents (all except primary)
+                fallback_agents = agent_list[1:]
 
-            while (not response_content and retry_attempt < max_retries and
-                   fuzzy_strategy == "retry" and current_agent_idx + 1 < len(agent_list)):
+                retry_content, retry_data, retry_agent_id = await self._execute_with_retry(
+                    agent, fallback_agents, task, messages, all_messages,
+                    max_tokens, temperature, priority,
+                    fuzzy_qos, context_id, session_id
+                )
 
-                retry_attempt += 1
-                current_agent_idx += 1
-                retry_agent = agent_list[current_agent_idx]
-                attempted_agents.append(retry_agent.agent_id)
-
-                # Backoff before retry
-                backoff = 0.5 * (2 ** (retry_attempt - 1))  # 0.5s, 1s, 2s
-                logger.info(f"Retry {retry_attempt}/{max_retries}: waiting {backoff}s before trying agent {retry_agent.agent_id}")
-                await asyncio.sleep(backoff)
-
-                # Release old slot, acquire new slot
-                await self.registry.adjust_slots(agent.agent_id, delta=+1)
-                if not await self.registry.adjust_slots(retry_agent.agent_id, delta=-1):
-                    logger.warning(f"Could not acquire slot on retry agent {retry_agent.agent_id}")
-                    continue
-
-                # Try retry agent
-                agent = retry_agent
-                task.assigned_agent_id = agent.agent_id
-                transport_success = False
-
-                # Try new transport sequence (gRPC/DDS/HTTP)
-                try:
-                    # Create new task_id for retry attempt
-                    task.task_id = f"task-{str(uuid.uuid4())}-retry-{retry_attempt}"
-                    await self.scheduler.track_task(task)
-
-                    # Try gRPC -> DDS -> HTTP on new agent
-                    if (self.grpc and self.grpc.is_available() and
-                        getattr(retry_agent, "grpc_address", "")):
-                        try:
-                            from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
-                            grpc_req = GRPCAgentTaskRequest(
-                                task_id=task.task_id,
-                                requester_id="orchestrator",
-                                task_type=task.task_type,
-                                messages=all_messages,
-                                priority=priority,
-                                timeout_ms=task.timeout_ms,
-                                requires_context=True,
-                                context_id=context_id,
-                                stream=False,
-                            )
-                            self.grpc.prepare_agent_response_waiter(task.task_id)
-                            await self.grpc.publish_agent_request(
-                                grpc_req, agent_id=agent.agent_id, agent_grpc_url=agent.grpc_address)
-                            retry_response = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=60000)
-                            if isinstance(retry_response, dict):
-                                response_content = retry_response.get("content", "")
-                            else:
-                                response_content = getattr(retry_response, "content", "")
-                            if response_content:
-                                transport_success = True
-                                response_data = retry_response if isinstance(retry_response, dict) else {"content": response_content, "success": True}
-                        except Exception as e:
-                            logger.warning(f"Retry gRPC failed: {e}")
-
-                    # Try DDS if gRPC didn't work
-                    if not response_content and self.dds.is_available():
-                        try:
-                            dds_req = AgentTaskRequest(
-                                task_id=task.task_id,
-                                requester_id="orchestrator",
-                                task_type=task.task_type,
-                                messages=all_messages,
-                                priority=priority,
-                                timeout_ms=task.timeout_ms,
-                                requires_context=True,
-                                context_id=context_id,
-                                max_tokens=max_tokens,
-                                temperature=temperature,
-                                stream=False,
-                            )
-                            self.dds.prepare_agent_response_waiter(task.task_id)
-                            await self.dds.publish_agent_request(dds_req, priority=dds_priority, qos_profile=fuzzy_qos)
-                            retry_response = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=60000)
-                            if isinstance(retry_response, dict):
-                                response_content = retry_response.get("content", "")
-                            else:
-                                response_content = getattr(retry_response, "content", "")
-                            if response_content:
-                                transport_success = True
-                                response_data = retry_response if isinstance(retry_response, dict) else {"content": response_content, "success": True}
-                        except Exception as e:
-                            logger.warning(f"Retry DDS failed: {e}")
-
-                    # Try HTTP fallback
-                    if not response_content:
-                        try:
-                            import aiohttp as _aiohttp
-                            agent_url = f"http://{agent.hostname}:{agent.port}"
-                            async with _aiohttp.ClientSession() as _sess:
-                                async with _sess.post(
-                                    f"{agent_url}/chat",
-                                    json={"messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                                    timeout=_aiohttp.ClientTimeout(total=30)
-                                ) as _resp:
-                                    http_result = await _resp.json()
-                            response_content = http_result.get("content", "")
-                            if response_content:
-                                transport_success = True
-                                response_data = {"content": response_content, "success": True}
-                        except Exception as e:
-                            logger.warning(f"Retry HTTP failed: {e}")
-
-                except Exception as e:
-                    logger.error(f"Retry attempt {retry_attempt} failed: {e}")
-
-                if response_content:
-                    logger.info(f"Retry {retry_attempt} successful with agent {agent.agent_id}")
+                if retry_content:
+                    response_content = retry_content
+                    response_data = retry_data if retry_data else {"content": retry_content, "success": True}
+                    agent = next((a for a in agent_list if a.agent_id == retry_agent_id), agent)
+                    attempted_agents.append(retry_agent_id)
                     # Store context after successful retry
                     for msg in messages:
                         await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
                     await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=response_content))
-                    break
 
             await self.scheduler.complete_task(
                 task.task_id,
@@ -1750,10 +1678,22 @@ class OrchestratorServer:
             }
             decision = self.fuzzy.select(task_input, agents)
             agent = next((a for a in agents if a.agent_id == decision.agent_id), agents[0])
+
+            # Log detailed fuzzy decision with agent metrics
+            logger.debug(
+                f"Fuzzy selection - input: urgency={decision.inputs.get('urgency', '?'):.0f}, "
+                f"complexity={decision.inputs.get('complexity', '?'):.0f} | "
+                f"selected {decision.agent_id}: score={decision.agent_score:.1f}, "
+                f"qos={decision.qos_profile}, strategy={decision.strategy} | "
+                f"agent: load={(100-agent.slots_idle/max(agent.slots_total,1)*100):.0f}%, "
+                f"latency={agent.avg_latency_ms:.0f}ms, profile={agent.agent_profile} | "
+                f"all_scores={decision.all_scores} | inference={decision.inference_time_ms:.1f}ms"
+            )
             return agent, decision.qos_profile, decision.strategy
 
         # Fallback: baseline selection
         agent = max(agents, key=lambda a: a.slots_idle)
+        logger.debug(f"Using fallback selection (fuzzy disabled) - selected {agent.agent_id}")
         return agent, None, "single"
 
     async def _wait_for_available_agent(self, timeout_s=300, messages=None,
@@ -1803,7 +1743,7 @@ class OrchestratorServer:
         if not available:
             return web.json_response({"error": "No agents available"}, status=503)
 
-        agent = max(available, key=lambda a: a.slots_idle)
+        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(available, messages=messages)
         agent_url = f"http://{agent.hostname}:{agent.port}"
 
         if not await self.registry.adjust_slots(agent.agent_id, delta=-1):

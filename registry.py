@@ -84,6 +84,34 @@ class AgentRegistry:
         filtered = {k: v for k, v in data.items() if k in known_fields}
         return AgentInfo(**filtered)
 
+    def _infer_agent_profile(self, agent: AgentInfo) -> str:
+        """
+        Infer agent profile automatically based on metrics.
+
+        Profiles:
+        - "fast": latency < 200ms OR GPU type is high-end (M3, M2, A100)
+        - "quality": latency > 800ms (slower but more capable models)
+        - "backup": error_rate > 20% (fallback agent)
+        - "balanced": default
+        """
+        if agent.error_rate > 0.2:
+            return "backup"
+
+        # Check GPU type for fast classification
+        if agent.gpu_type:
+            fast_gpus = ["M3", "M2", "M1", "A100", "A40", "A6000", "H100"]
+            for gpu in fast_gpus:
+                if gpu in agent.gpu_type:
+                    return "fast"
+
+        # Check latency-based classification
+        if agent.avg_latency_ms > 0 and agent.avg_latency_ms < 200:
+            return "fast"
+        elif agent.avg_latency_ms > 800:
+            return "quality"
+
+        return "balanced"
+
     async def unregister_agent(self, agent_id: str) -> bool:
         """Unregister an agent"""
         async with self._lock:
@@ -149,6 +177,7 @@ class AgentRegistry:
         """Update running metrics after a response is received.
 
         Uses exponential moving average (alpha=0.1, ~50-sample window) for latency.
+        Automatically infers and updates agent_profile based on metrics.
         """
         async with self._lock:
             agent = self.agents.get(agent_id)
@@ -164,6 +193,13 @@ class AgentRegistry:
                 agent.avg_latency_ms = self._EMA_ALPHA * latency_ms + self._EMA_COMPLEMENT * agent.avg_latency_ms
             # Error rate from accumulated counts
             agent.error_rate = 1.0 - (agent.success_count / max(1, agent.total_count))
+
+            # Auto-infer agent profile based on current metrics
+            old_profile = agent.agent_profile
+            agent.agent_profile = self._infer_agent_profile(agent)
+            if old_profile != agent.agent_profile:
+                logger.debug(f"Agent {agent_id} profile changed: {old_profile} → {agent.agent_profile} "
+                           f"(latency={agent.avg_latency_ms:.1f}ms, error_rate={agent.error_rate:.2%})")
 
     async def remove_stale_agents(self, timeout_seconds: int = None) -> List[str]:
         """Remove agents that haven't sent heartbeat"""
