@@ -568,8 +568,96 @@ def _make_client_servicer_class_sync():
                 )
 
         def StreamChat(self, request, context):
-            """Handle streaming chat (returns single response for now)."""
-            resp = self.Chat(request, context)
-            yield resp
+            """Handle streaming chat by forwarding to agent's StreamTask."""
+            import grpc as _grpc
+            import os as _os
+            import sys as _sys
+
+            # Find an agent
+            layer = self._layer
+            registry = layer._orchestrator_server.registry if hasattr(layer, "_orchestrator_server") else None
+            if registry is None:
+                # fallback: try via global handler context — get from server
+                yield _pb2.ClientChatResponse(
+                    request_id=request.request_id, content="",
+                    is_final=True, success=False,
+                    error_message="No registry on grpc layer",
+                )
+                return
+
+            with registry._thread_lock:
+                agents = [a for a in registry.agents.values()
+                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
+                if not agents:
+                    yield _pb2.ClientChatResponse(
+                        request_id=request.request_id, content="",
+                        is_final=True, success=False,
+                        error_message="No agents available",
+                    )
+                    return
+                agent = agents[0]
+                agent.slots_idle = max(0, agent.slots_idle - 1)
+                if agent.slots_idle == 0:
+                    agent.status = "busy"
+
+            agent_url = getattr(agent, "grpc_address", None) or f"{agent.hostname}:50053"
+
+            try:
+                # Build agent task request
+                _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
+                if _proto_dir not in _sys.path:
+                    _sys.path.insert(0, _proto_dir)
+                from proto import orchestrator_pb2 as _opb2
+                from proto import orchestrator_pb2_grpc as _opb2_grpc
+
+                proto_req = _opb2.AgentTaskRequest(
+                    task_id=request.request_id,
+                    requester_id="orchestrator",
+                    task_type="chat",
+                    priority=request.priority or 5,
+                    timeout_ms=request.timeout_ms or 120000,
+                    requires_context=False,
+                    stream=True,
+                    max_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                )
+                for msg in request.messages:
+                    pm = proto_req.messages.add()
+                    pm.role = msg.role
+                    pm.content = msg.content
+
+                channel = _grpc.insecure_channel(agent_url)
+                stub = _opb2_grpc.OrchestratorAgentServiceStub(channel)
+                try:
+                    for agent_resp in stub.StreamTask(proto_req, timeout=120):
+                        yield _pb2.ClientChatResponse(
+                            request_id=request.request_id,
+                            content=agent_resp.content,
+                            is_final=bool(agent_resp.is_final),
+                            prompt_tokens=agent_resp.prompt_tokens,
+                            completion_tokens=agent_resp.completion_tokens,
+                            processing_time_ms=agent_resp.processing_time_ms,
+                            success=bool(agent_resp.success),
+                            error_message=agent_resp.error_message or "",
+                            model=request.model,
+                        )
+                        if agent_resp.is_final:
+                            break
+                finally:
+                    channel.close()
+            except Exception as e:
+                logger.error(f"StreamChat agent forward failed: {e}", exc_info=True)
+                yield _pb2.ClientChatResponse(
+                    request_id=request.request_id, content="",
+                    is_final=True, success=False,
+                    error_message=str(e),
+                )
+            finally:
+                with registry._thread_lock:
+                    a = registry.agents.get(agent.agent_id)
+                    if a:
+                        a.slots_idle = min(a.slots_idle + 1, getattr(a, "slots_total", 1))
+                        if a.slots_idle > 0:
+                            a.status = "idle"
 
     return _ClientServicerSync

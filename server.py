@@ -42,6 +42,13 @@ class OrchestratorServer:
         self.scheduler = scheduler
         self.dds = dds_layer
         self.grpc = grpc_layer  # optional gRPC layer (mirrors DDS layer interface)
+        if self.grpc is not None:
+            # Allow grpc_layer servicers to call back into the orchestrator
+            # (used by StreamChat for agent selection / slot bookkeeping)
+            try:
+                self.grpc._orchestrator_server = self
+            except Exception:
+                pass
         self.selector = selector or AgentSelector()
         self.fuzzy = fuzzy_engine  # optional fuzzy decision engine
         self.instance_pool = instance_pool
@@ -199,17 +206,63 @@ class OrchestratorServer:
                 logger.error(f"Error in heartbeat loop: {e}")
 
     async def _dds_client_loop(self):
-        """Background task to process DDS client requests"""
+        """Background task to process DDS client requests.
+
+        Event-driven via listener when possible; falls back to 1ms polling
+        if listener attach fails. The listener pushes samples into an
+        asyncio.Queue and this loop awaits the queue.
+        """
         logger.info("DDS client loop started")
+        if not hasattr(self, "_dds_client_req_queue"):
+            self._dds_client_req_queue: asyncio.Queue = asyncio.Queue()
+            # Try to attach a listener on the client/request reader
+            try:
+                if self.dds.is_available():
+                    from dds import TOPIC_CLIENT_REQUEST
+                    from cyclonedds.core import Listener as _Listener
+                    reader = self.dds.subscribers.get(TOPIC_CLIENT_REQUEST)
+                    if reader is not None:
+                        loop = asyncio.get_running_loop()
+                        queue_ref = self._dds_client_req_queue
+                        def _on_client_request(_reader, _q=queue_ref, _l=loop, _r=reader):
+                            try:
+                                for s in _r.take():
+                                    if s and not _l.is_closed():
+                                        _l.call_soon_threadsafe(_q.put_nowait, s)
+                            except Exception:
+                                pass
+                        lst = _Listener(on_data_available=_on_client_request)
+                        reader.set_listener(lst)
+                        if not hasattr(self.dds, "_dds_listeners"):
+                            self.dds._dds_listeners = []
+                        self.dds._dds_listeners.append(lst)
+                        logger.info("Attached event-driven listener for client/request")
+                        self._dds_client_event_driven = True
+            except Exception as e:
+                logger.warning(f"client/request listener attach failed: {e}; falling back to polling")
+
+        event_driven = getattr(self, "_dds_client_event_driven", False)
+
         while True:
             try:
-                await asyncio.sleep(0.001)  # Poll every 1ms
-
-                if not self.dds.is_available():
-                    continue
-
-                # Read client requests from DDS
-                client_requests = await self.dds.read_client_requests(timeout_ms=100)
+                if event_driven:
+                    try:
+                        first = await asyncio.wait_for(
+                            self._dds_client_req_queue.get(), timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    client_requests = [first]
+                    while True:
+                        try:
+                            client_requests.append(self._dds_client_req_queue.get_nowait())
+                        except asyncio.QueueEmpty:
+                            break
+                else:
+                    await asyncio.sleep(0.001)  # Poll every 1ms
+                    if not self.dds.is_available():
+                        continue
+                    client_requests = await self.dds.read_client_requests(timeout_ms=100)
 
                 if client_requests:
                     logger.debug(f"Received {len(client_requests)} client requests via DDS")
@@ -281,7 +334,15 @@ class OrchestratorServer:
             return
 
         try:
-            # Send task to agent via DDS
+            # Send task to agent via DDS — honor fields from the DDS client
+            # request when provided; fall back to BENCH env then defaults.
+            import os as _os
+            _bench_mt = int(_os.environ.get("BENCH_DEFAULT_MAX_TOKENS", "50"))
+            _bench_temp = float(_os.environ.get("BENCH_DEFAULT_TEMPERATURE", "0.7"))
+            req_max_tokens = getattr(req, "max_tokens", 0) or _bench_mt
+            req_temp_raw = getattr(req, "temperature", -1.0)
+            req_temperature = req_temp_raw if req_temp_raw is not None and req_temp_raw >= 0 else _bench_temp
+            req_stream = bool(getattr(req, "stream", False))
             dds_request = AgentTaskRequest(
                 task_id=request_id,
                 requester_id="orchestrator",
@@ -290,18 +351,43 @@ class OrchestratorServer:
                 priority=priority,
                 timeout_ms=60000,
                 requires_context=False,
-                max_tokens=50,
-                temperature=0.7,
+                max_tokens=req_max_tokens,
+                temperature=req_temperature,
+                stream=req_stream,
             )
-            # Register waiter BEFORE publishing to avoid race where response arrives first
+            # Streaming path: forward each agent chunk to the DDS client.
+            if req_stream:
+                self.dds.prepare_stream_waiter(request_id)
+                try:
+                    await self.dds.publish_agent_request(dds_request, qos_profile=fuzzy_qos)
+                    last_prompt = 0
+                    last_completion = 0
+                    async for chunk in self.dds.stream_agent_response(request_id, timeout_ms=120000):
+                        c_content = chunk.get("content", "") or ""
+                        c_final = bool(chunk.get("is_final", False))
+                        last_prompt = chunk.get("prompt_tokens", last_prompt)
+                        last_completion = chunk.get("completion_tokens", last_completion)
+                        await self._send_dds_client_response(
+                            request_id, client_id, c_content,
+                            success=1 if not chunk.get("error") else 0,
+                            error=chunk.get("error", ""),
+                            prompt_tokens=last_prompt,
+                            completion_tokens=last_completion,
+                            processing_time_ms=chunk.get("processing_time_ms", 0),
+                            is_final=c_final,
+                        )
+                        if c_final:
+                            break
+                finally:
+                    await self.registry.adjust_slots(agent.agent_id, delta=+1)
+                return  # streaming path is fully handled
+
+            # Non-streaming path
             self.dds.prepare_agent_response_waiter(request_id)
             try:
                 await self.dds.publish_agent_request(dds_request, qos_profile=fuzzy_qos)
-
-                # Wait for agent response
                 agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
             except Exception:
-                # Clean up waiter on failure
                 self.dds._pending_agent_responses.pop(request_id, None)
                 raise
 
@@ -340,19 +426,23 @@ class OrchestratorServer:
             # Always release agent slot
             await self.registry.adjust_slots(agent.agent_id, delta=+1)
 
-    async def _send_dds_client_response(self, request_id, client_id, content, success=True, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0):
-        """Send response to client via DDS using IDL-generated ClientResponse type"""
+    async def _send_dds_client_response(self, request_id, client_id, content, success=True, error="", prompt_tokens=0, completion_tokens=0, processing_time_ms=0, is_final=True):
+        """Send response to client via DDS using IDL-generated ClientResponse type.
+
+        is_final=False is used by the streaming path to forward intermediate chunks;
+        the last chunk must be sent with is_final=True so the client stops listening.
+        """
         from orchestrator import ClientResponse
 
         response = ClientResponse(
             request_id=request_id,
             client_id=client_id,
             content=content,
-            is_final=True,
+            is_final=is_final,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             processing_time_ms=processing_time_ms,
-            success=success,
+            success=bool(success),
             error_message=error,
         )
 
@@ -927,9 +1017,19 @@ class OrchestratorServer:
         if not messages:
             return web.json_response({"error": "No messages provided"}, status=400)
 
-        # Get parameters
-        max_tokens = data.get("max_tokens", self.config.default_max_tokens)
-        temperature = data.get("temperature", self.config.default_temperature)
+        # Get parameters — BENCH_DEFAULT_* env vars FORCE-override client values
+        # when set. Used to isolate transport latency during benchmarks.
+        import os as _os_bench
+        _bench_mt_env = _os_bench.environ.get("BENCH_DEFAULT_MAX_TOKENS")
+        _bench_temp_env = _os_bench.environ.get("BENCH_DEFAULT_TEMPERATURE")
+        if _bench_mt_env is not None:
+            max_tokens = int(_bench_mt_env)  # force override
+        else:
+            max_tokens = data.get("max_tokens", self.config.default_max_tokens)
+        if _bench_temp_env is not None:
+            temperature = float(_bench_temp_env)
+        else:
+            temperature = data.get("temperature", self.config.default_temperature)
         priority = data.get("priority", TaskPriority.NORMAL.value)
         task_type = data.get("task_type", "chat")
         stream_requested = data.get("stream", False)

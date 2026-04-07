@@ -99,6 +99,9 @@ class ClientRequest(idl.IdlStruct, typename="orchestrator.ClientRequest"):
     timeout_ms: types.int32
     requires_context: bool
     created_at: types.int64 = 0
+    stream: bool = False
+    max_tokens: types.int32 = 0
+    temperature: types.float32 = -1.0
 
 
 @dataclass

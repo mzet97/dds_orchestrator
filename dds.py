@@ -108,6 +108,7 @@ class AgentTaskRequest:
     urgency: int = 5
     complexity: int = 5
     target_agent_id: str = ""
+    context_id: str = ""
 
 
 @dataclass
@@ -522,7 +523,46 @@ class DDSLayer:
             logger.warning("No running event loop for dispatch threads")
             return
 
-        # Agent response dispatcher thread
+        # Try event-driven listeners first; fall back to dispatch threads if unavailable.
+        try:
+            from cyclonedds.core import Listener
+            self._dds_listeners = []  # keep refs alive
+
+            if TOPIC_AGENT_RESPONSE in self.subscribers:
+                reader = self.subscribers[TOPIC_AGENT_RESPONSE]
+                dispatch_fn = self._dispatch_agent_response_sample
+                def _on_agent_resp(_reader, _df=dispatch_fn, _r=reader):
+                    try:
+                        for s in _r.take():
+                            if s and self._event_loop and not self._event_loop.is_closed():
+                                self._event_loop.call_soon_threadsafe(_df, s)
+                    except Exception:
+                        pass
+                lst = Listener(on_data_available=_on_agent_resp)
+                reader.set_listener(lst)
+                self._dds_listeners.append(lst)
+                logger.info("Attached event-driven listener for agent responses")
+
+            if TOPIC_CLIENT_RESPONSE in self.subscribers:
+                reader = self.subscribers[TOPIC_CLIENT_RESPONSE]
+                dispatch_fn = self._dispatch_client_response_sample
+                def _on_client_resp(_reader, _df=dispatch_fn, _r=reader):
+                    try:
+                        for s in _r.take():
+                            if s and self._event_loop and not self._event_loop.is_closed():
+                                self._event_loop.call_soon_threadsafe(_df, s)
+                    except Exception:
+                        pass
+                lst = Listener(on_data_available=_on_client_resp)
+                reader.set_listener(lst)
+                self._dds_listeners.append(lst)
+                logger.info("Attached event-driven listener for client responses")
+
+            return  # Listeners attached, skip thread fallback
+        except Exception as e:
+            logger.warning(f"Listener attach failed ({e}); falling back to dispatch threads")
+
+        # Fallback: dispatch threads with tight take() loop
         if TOPIC_AGENT_RESPONSE in self.subscribers:
             reader = self.subscribers[TOPIC_AGENT_RESPONSE]
             t = threading.Thread(
@@ -532,7 +572,6 @@ class DDSLayer:
             t.start()
             logger.info("Started dispatch thread for agent responses")
 
-        # Client response dispatcher thread
         if TOPIC_CLIENT_RESPONSE in self.subscribers:
             reader = self.subscribers[TOPIC_CLIENT_RESPONSE]
             t = threading.Thread(
@@ -668,15 +707,23 @@ class DDSLayer:
                          If specified, overrides the priority-based writer.
         """
         # Convert to DDS format - messages need to be JSON string
+        # Normalize messages: Pydantic ChatMessage / dataclass / dict → dict
+        def _msg_to_dict(m):
+            if isinstance(m, dict):
+                return m
+            if hasattr(m, "model_dump"):
+                return m.model_dump()
+            return {"role": getattr(m, "role", ""), "content": getattr(m, "content", "")}
+        _messages_serialized = [_msg_to_dict(m) for m in request.messages]
         data = {
             "task_id": request.task_id,
             "requester_id": request.requester_id,
             "task_type": request.task_type,
-            "messages_json": _json_dumps(request.messages),
+            "messages_json": _json_dumps(_messages_serialized),
             "priority": request.priority,
             "timeout_ms": request.timeout_ms,
             "requires_context": bool(request.requires_context),
-            "context_id": "",
+            "context_id": getattr(request, "context_id", "") or "",
             "created_at": int(time.time() * 1000),
             "stream": request.stream,
             "max_tokens": getattr(request, "max_tokens", 50),
