@@ -25,6 +25,14 @@ except ImportError:
     FUZZY_AVAILABLE = False
     logger.warning("scikit-fuzzy not installed. Run: pip install scikit-fuzzy")
 
+# Top-level import (was previously inside select() — move out of hot path
+# and avoid silent ImportError on first request).
+try:
+    from qos_profiles import profile_from_score
+except ImportError:
+    profile_from_score = None
+    logger.warning("qos_profiles module not available; QoS mapping will use 'balanced' fallback")
+
 
 @dataclass
 class FuzzyInput:
@@ -236,8 +244,10 @@ class FuzzyDecisionEngine:
         t_end = time.perf_counter_ns()
 
         # Map output scores to discrete values
-        from qos_profiles import profile_from_score
-        qos_profile = profile_from_score(best_output.qos_score).value
+        if profile_from_score is not None:
+            qos_profile = profile_from_score(best_output.qos_score).value
+        else:
+            qos_profile = "balanced"
         strategy = self._strategy_from_score(best_output.strategy_score)
 
         agent_id = getattr(best_agent, "agent_id", str(best_agent))
@@ -287,11 +297,17 @@ class FuzzyDecisionEngine:
         """Estimate task complexity from message content.
 
         Heuristic based on total character count and message count.
+        Accepts both dict messages and Pydantic ChatMessage objects.
         """
         if not messages:
             return 5.0
 
-        total_chars = sum(len(m.get("content", "")) for m in messages)
+        def _content(m):
+            if isinstance(m, dict):
+                return m.get("content", "")
+            return getattr(m, "content", "") or ""
+
+        total_chars = sum(len(_content(m)) for m in messages)
         num_messages = len(messages)
 
         if total_chars < 50 and num_messages <= 1:

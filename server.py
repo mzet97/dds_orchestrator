@@ -446,6 +446,8 @@ class OrchestratorServer:
             error_message=error,
         )
 
+        logger.info(f"[DDS_CLI_RESP] rid={request_id} client={client_id} success={success} "
+                    f"error={error!r} content_len={len(content)}")
         await self.dds.publish_client_response(response)
 
     def _process_grpc_client_request_sync(self, request_id, messages, model="",
@@ -510,13 +512,23 @@ class OrchestratorServer:
         try:
             import grpc as _grpc
 
-            # Direct sync gRPC call — works because we're in a ThreadPoolExecutor
-            # thread from the sync grpc.server (not grpc.aio)
-            channel = _grpc.insecure_channel(agent_grpc_url)
+            # Connection pooling: reuse channels per agent_grpc_url.
+            # Creating a new channel per request adds ~50-200ms TCP handshake.
+            if not hasattr(self, '_grpc_channel_pool'):
+                self._grpc_channel_pool = {}
+            if agent_grpc_url not in self._grpc_channel_pool:
+                self._grpc_channel_pool[agent_grpc_url] = _grpc.insecure_channel(
+                    agent_grpc_url,
+                    options=[
+                        ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                        ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                        ("grpc.keepalive_time_ms", 30000),
+                    ],
+                )
+            channel = self._grpc_channel_pool[agent_grpc_url]
             stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
 
             resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
-            channel.close()
 
             logger.info(f"gRPC response: success={resp.success}, len={len(resp.content)}")
             return {
@@ -700,18 +712,69 @@ class OrchestratorServer:
                                      all_messages: list, max_tokens: int, temperature: float,
                                      stream_requested: bool, protocol: str,
                                      fuzzy_qos: str, context_id: str, session_id: str) -> tuple:
-        """Execute request to a single agent via gRPC/DDS/HTTP fallback.
+        """Execute request to a single agent with an optional forced protocol.
 
         Returns: (response_data, transport_success, error_msg, streaming_handled)
+
+        Protocol consistency:
+        - When `protocol` is explicitly provided ("http"/"grpc"/"dds"), this method MUST
+          not silently fall back to a different protocol.
+        - The HTTP entrypoint passes protocol="http" to guarantee end-to-end HTTP.
         """
         response_data = {}
         transport_success = False
         error_msg = None
         _streaming_handled = False
 
+        forced = (protocol or "").strip().lower() or None
+        if forced not in (None, "http", "grpc", "dds"):
+            forced = None  # legacy callers may still pass weird values; treat as auto
+
         try:
+            # ============================================================
+            # Forced HTTP (no gRPC/DDS attempts)
+            # ============================================================
+            if forced == "http":
+                agent_url = f"http://{agent.hostname}:{agent.port}"
+                try:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as _session:
+                        async with _session.post(
+                            f"{agent_url}/chat",
+                            json={
+                                "messages": messages,
+                                "max_tokens": max_tokens,
+                                "temperature": temperature,
+                            },
+                            timeout=_aiohttp.ClientTimeout(total=30)
+                        ) as _resp:
+                            http_result = await _resp.json()
+
+                    content = http_result.get("content", "")
+                    if not content and "choices" in http_result:
+                        content = http_result["choices"][0].get("message", {}).get("content", "")
+                    if not content and "response" in http_result:
+                        content = http_result["response"]
+
+                    response_data = {
+                        "content": content,
+                        "processing_time_ms": http_result.get("processing_time_ms", 0),
+                        "success": True,
+                    }
+                    transport_success = True
+                    for msg in messages:
+                        await self.ctx.add_message(context_id, ChatMessage(role=msg.get("role"), content=msg.get("content")))
+                    if content:
+                        await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
+                except Exception as e:
+                    error_msg = f"HTTP request failed: {e}"
+                    logger.error(error_msg)
+                    response_data = {"content": "", "error": error_msg, "success": False}
+
+                return response_data, transport_success, error_msg, _streaming_handled
+
             # === gRPC path ===
-            if self.grpc and self.grpc.is_available() and getattr(agent, "grpc_address", ""):
+            if forced in (None, "grpc") and self.grpc and self.grpc.is_available() and getattr(agent, "grpc_address", ""):
                 try:
                     from grpc_layer import AgentTaskRequest as GRPCAgentTaskRequest
                     grpc_request = GRPCAgentTaskRequest(
@@ -755,10 +818,13 @@ class OrchestratorServer:
                                 await self.ctx.add_message(context_id, ChatMessage(role="assistant", content=content))
                 except Exception as e:
                     error_msg = str(e)
+                    if forced == "grpc":
+                        # Forced protocol: do not fall back.
+                        return {"content": "", "error": error_msg, "success": False}, False, error_msg, _streaming_handled
                     logger.warning(f"gRPC failed: {e}, trying DDS")
 
             # === DDS path ===
-            if not transport_success:
+            if (forced in (None, "dds")) and not transport_success:
                 try:
                     dds_request = AgentTaskRequest(
                         task_id=task.task_id,
@@ -806,12 +872,14 @@ class OrchestratorServer:
 
                 except Exception as e:
                     error_msg = str(e)
+                    if forced == "dds":
+                        return {"content": "", "error": error_msg, "success": False}, False, error_msg, _streaming_handled
                     logger.warning(f"DDS failed: {e}, falling back to HTTP")
                     self.dds._pending_agent_responses.pop(task.task_id, None)
                     self.dds._pending_agent_responses.pop(f"stream_{task.task_id}", None)
 
             # === HTTP fallback ===
-            if not transport_success:
+            if forced is None and not transport_success:
                 logger.info(f"Using HTTP fallback for task {task.task_id}")
                 agent_url = f"http://{agent.hostname}:{agent.port}"
                 try:
@@ -860,7 +928,8 @@ class OrchestratorServer:
     async def _execute_with_retry(self, primary_agent: AgentInfo, fallback_agents: list,
                                    task: Task, messages: list, all_messages: list,
                                    max_tokens: int, temperature: float, priority: int,
-                                   fuzzy_qos: str, context_id: str, session_id: str) -> tuple:
+                                   fuzzy_qos: str, context_id: str, session_id: str,
+                                   protocol: str) -> tuple:
         """Execute request with retry strategy: try primary, then fallback agents with exponential backoff.
 
         Returns: (response_content, response_data, successful_agent_id)
@@ -894,11 +963,11 @@ class OrchestratorServer:
                     task.task_id = f"task-{str(uuid.uuid4())}-retry-{retry_attempt}"
                     await self.scheduler.track_task(task)
 
-            # Execute agent request via gRPC/DDS/HTTP
+            # Execute agent request (protocol forced by entrypoint)
             try:
                 response_data, transport_success, error_msg, _ = await self._execute_agent_request(
                     current_agent, task, messages, all_messages, max_tokens, temperature,
-                    False, None, fuzzy_qos, context_id, session_id
+                    False, protocol, fuzzy_qos, context_id, session_id
                 )
 
                 if transport_success:
@@ -913,7 +982,8 @@ class OrchestratorServer:
 
     async def _execute_fanout(self, agents: list, task: Task, messages: list, all_messages: list,
                               max_tokens: int, temperature: float, priority: int,
-                              fuzzy_qos: str, context_id: str, session_id: str, dds_priority: int = 0) -> tuple:
+                              fuzzy_qos: str, context_id: str, session_id: str,
+                              protocol: str, dds_priority: int = 0) -> tuple:
         """Execute request with fanout strategy: send to multiple agents in parallel, return first success.
 
         Returns: (response_content, response_data, successful_agent_id)
@@ -956,7 +1026,7 @@ class OrchestratorServer:
                     # Execute agent request
                     response_data, transport_success, error_msg, _ = await self._execute_agent_request(
                         fa, fanout_task, messages, all_messages, max_tokens, temperature,
-                        False, None, fuzzy_qos, context_id, session_id
+                        False, protocol, fuzzy_qos, context_id, session_id
                     )
 
                     if transport_success:
@@ -1034,6 +1104,27 @@ class OrchestratorServer:
         task_type = data.get("task_type", "chat")
         stream_requested = data.get("stream", False)
         protocol = data.get("protocol")  # optional: "http", "grpc", "dds"
+
+        # ============================================================
+        # PROTOCOL CONSISTENCY (MANDATORY)
+        # ============================================================
+        # HTTP entrypoint MUST stay HTTP end-to-end.
+        # gRPC/DDS paths are reached via their native entrypoints:
+        #   - gRPC: GRPCLayer ClientOrchestratorService
+        #   - DDS:  client/request topic
+        from dds_orchestrator_protocol_consistency import enforce_entry_protocol
+        try:
+            protocol = enforce_entry_protocol("http", protocol)
+        except ValueError as e:
+            return web.json_response(
+                {
+                    "error": str(e),
+                    "code": "PROTOCOL_MISMATCH",
+                    "entry_protocol": "http",
+                    "requested_protocol": protocol,
+                },
+                status=400,
+            )
 
         # === Context Management ===
         # Extract or create session_id and retrieve conversation history
@@ -1120,9 +1211,10 @@ class OrchestratorServer:
         attempted_agents = [agent.agent_id]
 
         try:
-            # === gRPC path (agent has grpc_address and orchestrator has grpc_layer) ===
+            # === gRPC path (ONLY when entry protocol is gRPC) ===
             stream_requested = data.get("stream", False)
-            if (not transport_success
+            if (protocol == "grpc"
+                    and not transport_success
                     and self.grpc and self.grpc.is_available()
                     and getattr(agent, "grpc_address", "")):
                 try:
@@ -1212,10 +1304,10 @@ class OrchestratorServer:
                             logger.info(f"Context updated for {session_id}: added {len(messages)} user message(s) and assistant response")
 
                 except Exception as e:
-                    logger.warning(f"gRPC communication failed: {e}, trying DDS")
+                    logger.warning(f"gRPC communication failed: {e}")
 
-            # === DDS path ===
-            if not transport_success:
+            # === DDS path (ONLY when entry protocol is DDS) ===
+            if protocol == "dds" and not transport_success:
                 try:
                     dds_request = AgentTaskRequest(
                         task_id=task.task_id,
@@ -1308,12 +1400,12 @@ class OrchestratorServer:
                             logger.info(f"Context updated for {session_id}: added {len(messages)} user message(s) and assistant response")
 
                 except Exception as e:
-                    logger.warning(f"DDS communication failed: {e}, falling back to HTTP")
+                    logger.warning(f"DDS communication failed: {e}")
                     self.dds._pending_agent_responses.pop(task.task_id, None)
                     self.dds._pending_agent_responses.pop(f"stream_{task.task_id}", None)
 
-            # If transport failed, use HTTP fallback
-            if not transport_success:
+            # If transport failed, use HTTP fallback (ONLY when entry protocol is HTTP)
+            if protocol == "http" and not transport_success:
                 logger.info(f"Using HTTP fallback for task {task.task_id}")
                 agent_url = f"http://{agent.hostname}:{agent.port}"
                 logger.info(f"HTTP fallback calling agent at {agent_url}/chat")
@@ -1378,7 +1470,7 @@ class OrchestratorServer:
                 fa_content, fa_data, fa_agent_id = await self._execute_fanout(
                     agent_list, task, messages, all_messages,
                     max_tokens, temperature, priority,
-                    fuzzy_qos, context_id, session_id, dds_priority
+                    fuzzy_qos, context_id, session_id, protocol, dds_priority
                 )
                 if fa_content:
                     response_content = fa_content
@@ -1396,7 +1488,7 @@ class OrchestratorServer:
                 retry_content, retry_data, retry_agent_id = await self._execute_with_retry(
                     agent, fallback_agents, task, messages, all_messages,
                     max_tokens, temperature, priority,
-                    fuzzy_qos, context_id, session_id
+                    fuzzy_qos, context_id, session_id, protocol
                 )
 
                 if retry_content:
@@ -1457,6 +1549,10 @@ class OrchestratorServer:
         """Handle chat using InstancePool routing (38 instances)."""
         import time as _time
 
+        # This endpoint is HTTP-native; protocol must be HTTP by invariant.
+        if protocol != "http":
+            raise ValueError(f"HTTP entrypoint cannot run protocol={protocol!r}")
+
         # Backpressure check
         if self.backpressure and not await self.backpressure.allow_request():
             return web.json_response(
@@ -1502,7 +1598,16 @@ class OrchestratorServer:
             #         status=503,
             #     )
 
-            # Dispatch to the instance's agent via DDS with target_agent_id
+            # Dispatch to the instance's agent via DDS with target_agent_id.
+            # Resolve agent_id from instance hostname so the DDS agent can
+            # filter and only process requests meant for it (avoids broadcast
+            # overhead where all agents deserialize every request).
+            _target_agent_id = ""
+            for _a in (await self.registry.get_all_agents()):
+                if _a.hostname == instance.hostname:
+                    _target_agent_id = _a.agent_id
+                    break
+
             dds_request = AgentTaskRequest(
                 task_id=task_id,
                 requester_id="orchestrator",
@@ -1514,19 +1619,17 @@ class OrchestratorServer:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=stream_requested,
+                target_agent_id=_target_agent_id,
             )
 
             # Map priority to DDS TRANSPORT_PRIORITY
             priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
             dds_priority = priority_map.get(priority, 0)
 
-            # Resolve effective protocol:
-            #   - explicit "dds"/"grpc"/"http" from request → use that
-            #   - None → auto-detect (DDS if available, else HTTP)
-            effective_protocol = protocol or ("dds" if self.dds.is_available() else "http")
+            # Protocol consistency: HTTP entry always runs HTTP end-to-end.
+            effective_protocol = "http"
 
-            # ── DDS Path ──────────────────────────────────────────────
-            # Orchestrator → DDS topic agent/request → Agent DDS → DDS → llama-server
+            # ── DDS Path (DISABLED FOR HTTP ENTRYPOINT) ───────────────
             if effective_protocol == "dds" and self.dds.is_available():
                 self.dds.prepare_agent_response_waiter(task_id)
                 await self.dds.publish_agent_request(dds_request, priority=dds_priority)
@@ -1616,8 +1719,7 @@ class OrchestratorServer:
                         "protocol": "dds", "processing_time_ms": int(latency_ms),
                     })
 
-            # ── gRPC Path ─────────────────────────────────────────────
-            # Orchestrator → gRPC → Agent gRPC → gRPC → llama-server
+            # ── gRPC Path (DISABLED FOR HTTP ENTRYPOINT) ──────────────
             elif effective_protocol == "grpc" and self.grpc:
                 content = ""
                 success = False

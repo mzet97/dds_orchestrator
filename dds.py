@@ -280,13 +280,15 @@ class DDSLayer:
         from cyclonedds.util import duration
 
         # QoS for reliable communication (requests, responses).
-        # KeepLast(8): buffer up to 8 undelivered messages so that rapid
-        # back-to-back writes under multi-client load are not silently dropped.
+        # Reliable timeout 120s: long LLM inferences (S3 prompts ~15-20s)
+        #   need much more than 2s for the reliable_ack window.
+        # KeepLast(32): buffer up to 32 undelivered messages so that rapid
+        #   back-to-back writes under multi-client load are not silently dropped.
         # TRANSPORT_PRIORITY(0): default priority; overridden per-request via priority writers.
         self.qos_reliable = Qos(
-            Policy.Reliability.Reliable(duration(seconds=2)),
+            Policy.Reliability.Reliable(duration(seconds=120)),
             Policy.Durability.Volatile,
-            Policy.History.KeepLast(1),
+            Policy.History.KeepLast(128),
             Policy.TransportPriority(0),
             Policy.LatencyBudget(duration(microseconds=0)),
         )

@@ -58,6 +58,7 @@ class AgentTaskRequest:
     priority: int
     timeout_ms: int
     requires_context: bool
+    context_id: str = ""
     stream: bool = False
     max_tokens: int = 50
     temperature: float = 0.7
@@ -132,7 +133,9 @@ class GRPCLayer:
         import asyncio
 
         self._event_loop = asyncio.get_running_loop()
-        self._server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=10))
+        # Raised from 10→50 to avoid thread starvation under multi-agent load.
+        # Each worker handles one sync gRPC call to an agent (~0.5-2s blocking).
+        self._server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=50))
 
         # Agent-facing service
         agent_servicer_cls = _make_servicer_class()
@@ -257,8 +260,12 @@ class GRPCLayer:
         )
         for msg in request.messages:
             proto_msg = proto_req.messages.add()
-            proto_msg.role = msg.get("role", "user")
-            proto_msg.content = msg.get("content", "")
+            if isinstance(msg, dict):
+                proto_msg.role = msg.get("role", "user")
+                proto_msg.content = msg.get("content", "")
+            else:
+                proto_msg.role = getattr(msg, "role", "user")
+                proto_msg.content = getattr(msg, "content", "")
 
         try:
             if request.stream:
@@ -402,8 +409,13 @@ class GRPCLayer:
             msgs = request.messages if isinstance(request.messages, list) else json.loads(request.messages_json)
             for msg in msgs:
                 chat_msg = proto_req.messages.add()
-                chat_msg.role = msg.get("role", "user")
-                chat_msg.content = msg.get("content", "")
+                # Accept dict, Pydantic ChatMessage, or any obj with role/content attrs
+                if isinstance(msg, dict):
+                    chat_msg.role = msg.get("role", "user")
+                    chat_msg.content = msg.get("content", "")
+                else:
+                    chat_msg.role = getattr(msg, "role", "user")
+                    chat_msg.content = getattr(msg, "content", "")
 
             proto_resp = await asyncio.wait_for(
                 stub.SubmitTask(proto_req),
