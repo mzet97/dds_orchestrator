@@ -61,6 +61,11 @@ class OrchestratorServer:
         self.runner = None
         self.site = None
 
+        # gRPC channel pool (thread-safe, initialized eagerly to avoid TOCTOU race)
+        import threading as _threading
+        self._grpc_channel_pool: dict = {}
+        self._grpc_pool_lock = _threading.Lock()
+
         # Background tasks
         self._heartbeat_task = None
         self._cleanup_task = None
@@ -533,11 +538,7 @@ class OrchestratorServer:
             import grpc as _grpc
 
             # Connection pooling: reuse channels per agent_grpc_url.
-            # Thread-safe: pool + lock created once, accessed from ThreadPoolExecutor.
-            import threading as _threading
-            if not hasattr(self, '_grpc_pool_lock'):
-                self._grpc_channel_pool = {}
-                self._grpc_pool_lock = _threading.Lock()
+            # Pool + lock initialized in __init__ to avoid TOCTOU race.
             with self._grpc_pool_lock:
                 if agent_grpc_url not in self._grpc_channel_pool:
                     self._grpc_channel_pool[agent_grpc_url] = _grpc.insecure_channel(
