@@ -52,6 +52,7 @@ class AgentRegistry:
         self.config = config
         self.agents: Dict[str, AgentInfo] = {}
         self._lock = asyncio.Lock()
+        self.agent_available_condition = asyncio.Condition(self._lock)
         import threading
         self._thread_lock = threading.Lock()
 
@@ -71,10 +72,12 @@ class AgentRegistry:
                 else agent_info.__dict__
             )
 
-        async with self._lock:
+        async with self.agent_available_condition:
             action = "Updating" if agent_info.agent_id in self.agents else "Registering new"
             logger.info(f"{action} agent {agent_info.agent_id}")
             self.agents[agent_info.agent_id] = agent_info
+            if agent_info.slots_idle > 0:
+                self.agent_available_condition.notify(1)
 
             return agent_info.agent_id
 
@@ -142,7 +145,7 @@ class AgentRegistry:
     async def update_heartbeat(self, agent_id: str, status: str = None,
                                slots_idle: int = None, memory_usage_mb: int = None) -> bool:
         """Update agent heartbeat"""
-        async with self._lock:
+        async with self.agent_available_condition:
             agent = self.agents.get(agent_id)
             if not agent:
                 return False
@@ -156,12 +159,15 @@ class AgentRegistry:
             if memory_usage_mb is not None:
                 agent.vram_available_mb = memory_usage_mb
 
+            if agent.slots_idle > 0 and agent.status == "idle":
+                self.agent_available_condition.notify(1)
+
             return True
 
     async def adjust_slots(self, agent_id: str, delta: int, status: str = None) -> bool:
         """Atomically adjust slots_idle by delta (positive = release, negative = acquire).
         If status is not provided, auto-derives: 'idle' when slots_idle > 0, 'busy' when 0."""
-        async with self._lock:
+        async with self.agent_available_condition:
             agent = self.agents.get(agent_id)
             if not agent:
                 return False
@@ -171,6 +177,8 @@ class AgentRegistry:
             else:
                 agent.status = "idle" if agent.slots_idle > 0 else "busy"
             agent.last_heartbeat = time.time()
+            if agent.slots_idle > 0:
+                self.agent_available_condition.notify(1)
             return True
 
     async def update_response_metrics(self, agent_id: str, latency_ms: float, success: bool):
@@ -210,6 +218,7 @@ class AgentRegistry:
         async with self._lock:
             for agent_id, agent in list(self.agents.items()):
                 if current_time - agent.last_heartbeat > timeout:
+                    logger.warning(f"Agent {agent_id} stale. Last heartbeat: {current_time - agent.last_heartbeat:.1f}s ago")
                     stale_ids.append(agent_id)
                     self.agents.pop(agent_id, None)
 

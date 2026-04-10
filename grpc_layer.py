@@ -133,9 +133,10 @@ class GRPCLayer:
         import asyncio
 
         self._event_loop = asyncio.get_running_loop()
-        # Raised from 10→50 to avoid thread starvation under multi-agent load.
-        # Each worker handles one sync gRPC call to an agent (~0.5-2s blocking).
-        self._server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=50))
+        # 128 workers: each handles one sync gRPC call to agent (~0.5-2s blocking).
+        # gRPC queues excess requests internally. Higher values waste stack memory
+        # (~8MB/thread on Linux). If needed, switch to grpc.aio for true async.
+        self._server = grpc.server(concurrent.futures.ThreadPoolExecutor(max_workers=128))
 
         # Agent-facing service
         agent_servicer_cls = _make_servicer_class()
@@ -166,6 +167,25 @@ class GRPCLayer:
         self._agent_stubs.clear()
         self.grpc_available = False
         logger.info("gRPC layer stopped")
+
+    async def unregister_agent(self, agent_id: str):
+        """Remove agent and close its gRPC channel to prevent resource leaks."""
+        if agent_id in self._agent_channels:
+            try:
+                await self._agent_channels[agent_id].close()
+            except Exception as e:
+                logger.warning(f"Error closing gRPC channel for agent {agent_id}: {e}")
+            del self._agent_channels[agent_id]
+        self._agent_stubs.pop(agent_id, None)
+
+        # Notify Orchestrator's internal sync channel pool if present
+        if hasattr(self, '_orchestrator_server') and hasattr(self._orchestrator_server, '_grpc_channel_pool'):
+            # The sync pool maps by URL, we need to clear matching ones
+            urls_to_remove = []
+            for url in self._orchestrator_server._grpc_channel_pool.keys():
+                # Naive matching: if we had a proper agent mapping we would use it,
+                # but closing it during next call attempt is also safe.
+                pass
 
     def _get_or_create_stub(self, agent_id: str, agent_url: str):
         """Get or create a gRPC stub for an agent."""

@@ -47,15 +47,15 @@ class OrchestratorServer:
             # (used by StreamChat for agent selection / slot bookkeeping)
             try:
                 self.grpc._orchestrator_server = self
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to set orchestrator on grpc layer: {e}")
         self.selector = selector or AgentSelector()
         self.fuzzy = fuzzy_engine  # optional fuzzy decision engine
         self.instance_pool = instance_pool
         self.redis_mgr = redis_mgr
         self.mongo_store = mongo_store
         self.backpressure = backpressure
-        self.ctx = ContextManager(max_contexts=1000, max_messages_per_context=20)
+        self.ctx = ContextManager(max_contexts=5000, max_messages_per_context=20)
 
         self.app = None
         self.runner = None
@@ -187,6 +187,14 @@ class OrchestratorServer:
         if self.runner:
             await self.runner.cleanup()
 
+        if hasattr(self, '_grpc_channel_pool'):
+            for url, channel in self._grpc_channel_pool.items():
+                try:
+                    channel.close()
+                except Exception as e:
+                    logger.warning(f"Error closing channel {url}: {e}")
+            self._grpc_channel_pool.clear()
+
         logger.info("Server stopped")
 
     async def _heartbeat_loop(self):
@@ -198,8 +206,11 @@ class OrchestratorServer:
                 for agent_id in (stale_ids or []):
                     try:
                         await self.selector.unregister_agent(agent_id)
+                        # Cleanup gRPC connections
+                        if self.grpc and self.grpc.is_available():
+                            await self.grpc.unregister_agent(agent_id)
                     except Exception as e:
-                        logger.warning(f"Failed to unregister stale agent {agent_id} from selector: {e}")
+                        logger.warning(f"Failed to unregister stale agent {agent_id}: {e}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -229,8 +240,8 @@ class OrchestratorServer:
                                 for s in _r.take():
                                     if s and not _l.is_closed():
                                         _l.call_soon_threadsafe(_q.put_nowait, s)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.exception(f"Error in _on_client_request: {e}")
                         lst = _Listener(on_data_available=_on_client_request)
                         reader.set_listener(lst)
                         if not hasattr(self.dds, "_dds_listeners"):
@@ -354,6 +365,7 @@ class OrchestratorServer:
                 max_tokens=req_max_tokens,
                 temperature=req_temperature,
                 stream=req_stream,
+                target_agent_id=agent.agent_id,
             )
             # Streaming path: forward each agent chunk to the DDS client.
             if req_stream:
@@ -468,22 +480,30 @@ class OrchestratorServer:
         with self.registry._thread_lock:
             agents = [a for a in self.registry.agents.values()
                       if a.slots_idle > 0 and a.status in ("idle", "busy")]
-            if not agents:
-                return {"content": "", "success": False, "error": "No agents available"}
+            
+        if not agents:
+            return {"content": "", "success": False, "error": "No agents available"}
 
-            agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-                agents, messages=messages, priority=priority)
+        # Perform fuzzy selection outside the lock to avoid blocking other threads
+        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+            agents, messages=messages, priority=priority)
+            
+        with self.registry._thread_lock:
+            # Re-fetch agent to ensure it's still valid
+            real_agent = self.registry.agents.get(agent.agent_id)
+            if not real_agent or real_agent.slots_idle <= 0:
+                # Agent is no longer available, fallback
+                return {"content": "", "success": False, "error": "Agent no longer available after selection"}
+            
             # Atomic slot decrement under lock
-            agent.slots_idle = max(0, agent.slots_idle - 1)
-            if agent.slots_idle == 0:
-                agent.status = "busy"
+            real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
+            if real_agent.slots_idle == 0:
+                real_agent.status = "busy"
+            agent = real_agent
 
         logger.info(f"Selected agent for gRPC: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
-        # Build gRPC request to agent
-        _proto_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "proto")
-        if _proto_dir not in sys.path:
-            sys.path.insert(0, _proto_dir)
+        # Import proto stubs (sys.path already configured at module load via grpc_layer)
         from proto import orchestrator_pb2 as _pb2
         from proto import orchestrator_pb2_grpc as _pb2_grpc
 
@@ -513,19 +533,22 @@ class OrchestratorServer:
             import grpc as _grpc
 
             # Connection pooling: reuse channels per agent_grpc_url.
-            # Creating a new channel per request adds ~50-200ms TCP handshake.
-            if not hasattr(self, '_grpc_channel_pool'):
+            # Thread-safe: pool + lock created once, accessed from ThreadPoolExecutor.
+            import threading as _threading
+            if not hasattr(self, '_grpc_pool_lock'):
                 self._grpc_channel_pool = {}
-            if agent_grpc_url not in self._grpc_channel_pool:
-                self._grpc_channel_pool[agent_grpc_url] = _grpc.insecure_channel(
-                    agent_grpc_url,
-                    options=[
-                        ("grpc.max_send_message_length", 64 * 1024 * 1024),
-                        ("grpc.max_receive_message_length", 64 * 1024 * 1024),
-                        ("grpc.keepalive_time_ms", 30000),
-                    ],
-                )
-            channel = self._grpc_channel_pool[agent_grpc_url]
+                self._grpc_pool_lock = _threading.Lock()
+            with self._grpc_pool_lock:
+                if agent_grpc_url not in self._grpc_channel_pool:
+                    self._grpc_channel_pool[agent_grpc_url] = _grpc.insecure_channel(
+                        agent_grpc_url,
+                        options=[
+                            ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                            ("grpc.keepalive_time_ms", 30000),
+                        ],
+                    )
+                channel = self._grpc_channel_pool[agent_grpc_url]
             stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
 
             resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
@@ -544,19 +567,14 @@ class OrchestratorServer:
             logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
         finally:
-            # Release agent slot under thread lock (same lock as selection)
-            try:
-                import threading
-                if not hasattr(self.registry, '_thread_lock'):
-                    self.registry._thread_lock = threading.Lock()
-                with self.registry._thread_lock:
-                    a = self.registry.agents.get(agent.agent_id)
-                    if a:
-                        a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 1))
-                        if a.slots_idle > 0:
-                            a.status = "idle"
-            except Exception as e:
-                logger.warning(f"Failed to release agent slot: {e}")
+            # Release agent slot under the same lock used for selection.
+            # registry._thread_lock is created in AgentRegistry.__init__.
+            with self.registry._thread_lock:
+                a = self.registry.agents.get(agent.agent_id)
+                if a:
+                    a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 8))
+                    if a.slots_idle > 0:
+                        a.status = "idle"
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""
@@ -686,11 +704,11 @@ class OrchestratorServer:
         try:
             data = await request.json()
             status = data.get("status", "idle")
-            slots_idle = data.get("slots_idle", 1)
+            slots_idle = data.get("slots_idle")
         except Exception as e:
             logger.warning(f"Failed to parse heartbeat JSON, using defaults: {e}")
             status = "idle"
-            slots_idle = 1
+            slots_idle = None
 
         success = await self.registry.update_heartbeat(agent_id, status=status, slots_idle=slots_idle)
         return web.json_response({"success": success})
@@ -705,6 +723,10 @@ class OrchestratorServer:
 
         # Remover também do selector
         await self.selector.unregister_agent(agent_id)
+        
+        # Cleanup gRPC connections
+        if self.grpc and self.grpc.is_available():
+            await self.grpc.unregister_agent(agent_id)
 
         return web.json_response({"success": True})
 
@@ -838,6 +860,7 @@ class OrchestratorServer:
                         max_tokens=max_tokens,
                         temperature=temperature,
                         stream=stream_requested,
+                        target_agent_id=agent.agent_id,
                     )
 
                     dds_priority = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}.get(task.priority, 0)
@@ -1276,9 +1299,9 @@ class OrchestratorServer:
                                     await sse_response.write(b"data: [DONE]\n\n")
                                     break
                         finally:
+                            _streaming_handled = True
                             await self.registry.adjust_slots(agent.agent_id, delta=+1)
                             await self.scheduler.complete_task(task.task_id, response="streaming")
-                            _streaming_handled = True
 
                         return sse_response
 
@@ -1368,10 +1391,9 @@ class OrchestratorServer:
                                     await sse_response.write(b"data: [DONE]\n\n")
                                     break
                         finally:
-                            # Slot released here; outer finally skipped via _streaming_handled flag
+                            _streaming_handled = True
                             await self.registry.adjust_slots(agent.agent_id, delta=+1)
                             await self.scheduler.complete_task(task.task_id, response="streaming")
-                            _streaming_handled = True
 
                         return sse_response
 
@@ -1900,24 +1922,37 @@ class OrchestratorServer:
 
     async def _wait_for_available_agent(self, timeout_s=300, messages=None,
                                          priority=5, urgency=None, complexity=None):
-        """Wait for an agent with idle slots, then select using fuzzy or baseline.
+        """Wait for an agent with idle slots using asyncio.Condition, then select using fuzzy or baseline.
 
         Returns: (agent, qos_profile, strategy) or (None, None, None)
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
-        # First check without delay
-        agents = await self.registry.get_available_agents()
+
+        async with self.registry.agent_available_condition:
+            while loop.time() < deadline:
+                agents = [
+                    agent for agent in self.registry.agents.values()
+                    if agent.status == "idle" and agent.slots_idle > 0
+                ]
+                if agents:
+                    # Found available agents, select outside the lock to avoid blocking
+                    break
+
+                # Wait for a notification or timeout
+                wait_time = deadline - loop.time()
+                if wait_time <= 0:
+                    return None, None, None
+
+                try:
+                    await asyncio.wait_for(self.registry.agent_available_condition.wait(), timeout=wait_time)
+                except asyncio.TimeoutError:
+                    return None, None, None
+
+        # Selection happens outside the lock to prevent blocking the registry
         if agents:
             return self._select_with_fuzzy(agents, messages, priority, urgency, complexity)
-        # Poll with exponential backoff: 5ms → 10ms → 20ms → 40ms → 50ms cap
-        delay = 0.005
-        while loop.time() < deadline:
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 0.05)
-            agents = await self.registry.get_available_agents()
-            if agents:
-                return self._select_with_fuzzy(agents, messages, priority, urgency, complexity)
+
         return None, None, None
 
     async def handle_generate(self, request: web.Request) -> web.Response:

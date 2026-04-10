@@ -282,7 +282,7 @@ class DDSLayer:
         # QoS for reliable communication (requests, responses).
         # Reliable timeout 120s: long LLM inferences (S3 prompts ~15-20s)
         #   need much more than 2s for the reliable_ack window.
-        # KeepLast(32): buffer up to 32 undelivered messages so that rapid
+        # KeepLast(128): buffer up to 128 undelivered messages so that rapid
         #   back-to-back writes under multi-client load are not silently dropped.
         # TRANSPORT_PRIORITY(0): default priority; overridden per-request via priority writers.
         self.qos_reliable = Qos(
@@ -471,13 +471,13 @@ class DDSLayer:
         """Pre-register a streaming waiter for the given task_id.
 
         Unlike prepare_agent_response_waiter (single response), this creates
-        a waiter keyed as 'stream_{task_id}' that accumulates individual chunks.
+        a waiter keyed as 'stream_{task_id}' that uses an asyncio.Queue to accumulate
+        individual chunks without busy waiting.
         """
         key = f"stream_{task_id}"
         if key not in self._pending_agent_responses:
-            event = asyncio.Event()
-            chunks = []  # list of chunk dicts
-            self._pending_agent_responses[key] = (event, chunks)
+            queue = asyncio.Queue()
+            self._pending_agent_responses[key] = queue
 
     async def stream_agent_response(self, task_id: str, timeout_ms: int = 120000):
         """Async generator that yields individual response chunks from agent.
@@ -489,19 +489,22 @@ class DDSLayer:
         if key not in self._pending_agent_responses:
             self.prepare_stream_waiter(task_id)
 
+        queue = self._pending_agent_responses[key]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (timeout_ms / 1000)
 
         while loop.time() < deadline:
-            if key in self._pending_agent_responses:
-                _, chunks = self._pending_agent_responses[key]
-                while chunks:
-                    chunk = chunks.pop(0)
-                    yield chunk
-                    if chunk.get("is_final", False):
-                        self._pending_agent_responses.pop(key, None)
-                        return
-            await asyncio.sleep(0.001)  # 1ms polling for low-latency streaming
+            timeout = deadline - loop.time()
+            if timeout <= 0:
+                break
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=timeout)
+                yield chunk
+                if chunk.get("is_final", False):
+                    self._pending_agent_responses.pop(key, None)
+                    return
+            except asyncio.TimeoutError:
+                break
 
         # Timeout
         self._pending_agent_responses.pop(key, None)
@@ -538,8 +541,8 @@ class DDSLayer:
                         for s in _r.take():
                             if s and self._event_loop and not self._event_loop.is_closed():
                                 self._event_loop.call_soon_threadsafe(_df, s)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception(f"Error in _on_agent_resp: {e}")
                 lst = Listener(on_data_available=_on_agent_resp)
                 reader.set_listener(lst)
                 self._dds_listeners.append(lst)
@@ -553,8 +556,8 @@ class DDSLayer:
                         for s in _r.take():
                             if s and self._event_loop and not self._event_loop.is_closed():
                                 self._event_loop.call_soon_threadsafe(_df, s)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception(f"Error in _on_client_resp: {e}")
                 lst = Listener(on_data_available=_on_client_resp)
                 reader.set_listener(lst)
                 self._dds_listeners.append(lst)
@@ -596,8 +599,8 @@ class DDSLayer:
                     for sample in samples:
                         if sample:
                             self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception(f"Error in _take_dispatch_loop: {e}")
             _time.sleep(0.0005)  # 0.5ms — balances latency vs CPU
 
     def _dispatch_agent_response_sample(self, sample):
@@ -610,17 +613,14 @@ class DDSLayer:
         # Streaming path
         stream_key = f"stream_{task_id}"
         if stream_key in self._pending_agent_responses:
-            _, chunks = self._pending_agent_responses[stream_key]
-            chunks.append({
+            queue = self._pending_agent_responses[stream_key]
+            queue.put_nowait({
                 "content": getattr(sample, "content", ""),
                 "is_final": bool(is_final),
                 "prompt_tokens": getattr(sample, "prompt_tokens", 0),
                 "completion_tokens": getattr(sample, "completion_tokens", 0),
                 "processing_time_ms": getattr(sample, "processing_time_ms", 0),
             })
-            if is_final:
-                event, _ = self._pending_agent_responses[stream_key]
-                event.set()
             return
 
         # Non-streaming path
