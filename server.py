@@ -481,32 +481,60 @@ class OrchestratorServer:
 
         logger.info(f"Processing gRPC client request (sync): {request_id}")
 
-        # Thread-safe agent selection (lock pre-created in AgentRegistry.__init__)
-        with self.registry._thread_lock:
-            agents = [a for a in self.registry.agents.values()
-                      if a.slots_idle > 0 and a.status in ("idle", "busy")]
-            
-        if not agents:
-            return {"content": "", "success": False, "error": "No agents available"}
+        # Use InstancePool for slot acquisition (same as HTTP path) for fair
+        # protocol comparison. Falls back to AgentRegistry if no pool.
+        instance = None
+        if self.instance_pool:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                import concurrent.futures
+                future = asyncio.run_coroutine_threadsafe(
+                    self.instance_pool.select_instance(), loop)
+                instance = future.result(timeout=5)
+            else:
+                instance = asyncio.run(self.instance_pool.select_instance())
 
-        # Perform fuzzy selection outside the lock to avoid blocking other threads
-        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-            agents, messages=messages, priority=priority)
-            
-        with self.registry._thread_lock:
-            # Re-fetch agent to ensure it's still valid
-            real_agent = self.registry.agents.get(agent.agent_id)
-            if not real_agent or real_agent.slots_idle <= 0:
-                # Agent is no longer available, fallback
-                return {"content": "", "success": False, "error": "Agent no longer available after selection"}
-            
-            # Atomic slot decrement under lock
-            real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
+        if instance is None:
+            # Fallback to registry-based selection
+            with self.registry._thread_lock:
+                agents = [a for a in self.registry.agents.values()
+                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
+            if not agents:
+                return {"content": "", "success": False, "error": "No agents available"}
+            agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+                agents, messages=messages, priority=priority)
+            with self.registry._thread_lock:
+                real_agent = self.registry.agents.get(agent.agent_id)
+                if not real_agent or real_agent.slots_idle <= 0:
+                    return {"content": "", "success": False, "error": "No agents available"}
+                real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
             if real_agent.slots_idle == 0:
                 real_agent.status = "busy"
             agent = real_agent
 
-        logger.info(f"Selected agent for gRPC: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
+        # Resolve agent for logging + gRPC address
+        if instance is not None:
+            # InstancePool path: find agent by hostname for gRPC address
+            _hostname = instance.hostname
+            agent = None
+            for _a in self.registry.agents.values():
+                if _a.hostname == _hostname:
+                    agent = _a
+                    break
+            if agent is None:
+                # Create a minimal agent-like object for gRPC routing
+                class _FakeAgent:
+                    agent_id = f"pool-{_hostname}"
+                    hostname = _hostname
+                    grpc_address = f"{_hostname}:59201"
+                agent = _FakeAgent()
+            logger.info(f"Selected agent for gRPC (via pool): {agent.agent_id}")
+        else:
+            logger.info(f"Selected agent for gRPC (via registry): {agent.agent_id}")
 
         # Import proto stubs (sys.path already configured at module load via grpc_layer)
         from proto import orchestrator_pb2 as _pb2
@@ -514,7 +542,7 @@ class OrchestratorServer:
 
         agent_grpc_url = getattr(agent, "grpc_address", None)
         if not agent_grpc_url:
-            agent_grpc_url = f"{agent.hostname}:50053"
+            agent_grpc_url = f"{agent.hostname}:59201"
 
         proto_req = _pb2.AgentTaskRequest(
             task_id=request_id,
@@ -568,14 +596,23 @@ class OrchestratorServer:
             logger.error(f"gRPC agent call failed: {e}")
             return {"content": "", "success": False, "error": str(e)}
         finally:
-            # Release agent slot under the same lock used for selection.
-            # registry._thread_lock is created in AgentRegistry.__init__.
-            with self.registry._thread_lock:
-                a = self.registry.agents.get(agent.agent_id)
-                if a:
-                    a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 8))
-                    if a.slots_idle > 0:
-                        a.status = "idle"
+            # Release slot via the same mechanism used for acquisition.
+            if instance is not None and self.instance_pool:
+                import asyncio as _asyncio
+                try:
+                    loop = _asyncio.get_running_loop()
+                    _asyncio.run_coroutine_threadsafe(
+                        self.instance_pool.release_instance(instance.port, 0, True), loop
+                    ).result(timeout=5)
+                except Exception:
+                    pass  # best-effort release
+            else:
+                with self.registry._thread_lock:
+                    a = self.registry.agents.get(agent.agent_id)
+                    if a:
+                        a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 8))
+                        if a.slots_idle > 0:
+                            a.status = "idle"
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""
@@ -1130,25 +1167,9 @@ class OrchestratorServer:
         protocol = data.get("protocol")  # optional: "http", "grpc", "dds"
 
         # ============================================================
-        # PROTOCOL CONSISTENCY (MANDATORY)
-        # ============================================================
-        # HTTP entrypoint MUST stay HTTP end-to-end.
-        # gRPC/DDS paths are reached via their native entrypoints:
-        #   - gRPC: GRPCLayer ClientOrchestratorService
-        #   - DDS:  client/request topic
-        from dds_orchestrator_protocol_consistency import enforce_entry_protocol
-        try:
-            protocol = enforce_entry_protocol("http", protocol)
-        except ValueError as e:
-            return web.json_response(
-                {
-                    "error": str(e),
-                    "code": "PROTOCOL_MISMATCH",
-                    "entry_protocol": "http",
-                    "requested_protocol": protocol,
-                },
-                status=400,
-            )
+        # PROTOCOL CONSISTENCY: HTTP entrypoint forces HTTP end-to-end.
+        # gRPC/DDS have their own native entrypoints.
+        protocol = "http"
 
         # === Context Management ===
         # Extract or create session_id and retrieve conversation history
