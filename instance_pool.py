@@ -77,15 +77,24 @@ class InstancePool:
         return None
 
     async def release_instance(self, port: int, latency_ms: float, success: bool):
-        """Release a slot and update metrics."""
-        await self._redis.release_slot(port)
-        await self._redis.update_latency(port, latency_ms)
-        await self._redis.update_health(port)
+        """Release a slot and update metrics in a single pipelined call (Fix 4B).
 
-        if success:
-            await self._redis.record_success(port)
+        Uses release_all() which batches slot release + health refresh + stat
+        counter + EMA latency into 2 Redis round-trips instead of 4-5.
+        Also pushes a slot:available notification (Fix 4A) so BLPOP waiters
+        wake up immediately without spinning.
+        """
+        if hasattr(self._redis, "release_all"):
+            await self._redis.release_all(port, latency_ms, success, notify=True)
         else:
-            await self._redis.record_error(port)
+            # Fallback for RedisStateManager instances without release_all
+            await self._redis.release_slot(port)
+            await self._redis.update_latency(port, latency_ms)
+            await self._redis.update_health(port)
+            if success:
+                await self._redis.record_success(port)
+            else:
+                await self._redis.record_error(port)
 
     async def get_status(self) -> dict:
         """Get current status of all instances."""

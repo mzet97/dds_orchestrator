@@ -43,6 +43,28 @@ end
 return 0
 """
 
+# Lua script: release slot + refresh health + record stat + optional slot notification.
+# Combines 4-5 Redis calls from release_instance into a single round-trip.
+# KEYS[1]=slots_used, KEYS[2]=health, KEYS[3]=stat_key ('' to skip)
+# ARGV[1]=health_ttl_seconds, ARGV[2]='1' to RPUSH slot:available notification
+_LUA_RELEASE_ALL = """
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+if used > 0 then
+    redis.call('DECR', KEYS[1])
+end
+redis.call('SET', KEYS[2], 'alive')
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
+if KEYS[3] ~= '' then
+    redis.call('INCR', KEYS[3])
+    redis.call('EXPIRE', KEYS[3], 10)
+end
+if ARGV[2] == '1' then
+    redis.call('RPUSH', 'slot:available', '1')
+    redis.call('EXPIRE', 'slot:available', 5)
+end
+return used - 1
+"""
+
 
 class RedisStateManager:
     """Atomic state management via Redis for instance routing."""
@@ -73,6 +95,7 @@ class RedisStateManager:
         self._acquire_sha = await self._redis.script_load(_LUA_ACQUIRE_SLOT)
         self._ema_sha = await self._redis.script_load(_LUA_EMA_UPDATE)
         self._release_sha = await self._redis.script_load(_LUA_RELEASE_SLOT)
+        self._release_all_sha = await self._redis.script_load(_LUA_RELEASE_ALL)
         logger.info("Lua scripts registered")
 
     async def close(self):
@@ -110,6 +133,49 @@ class RedisStateManager:
             self._release_sha, 1,
             f"inst:{port}:slots_used",
         )
+
+    async def release_all(self, port: int, latency_ms: float, success: bool,
+                          notify: bool = True):
+        """Release slot + refresh health + record stat + EMA latency in 2 Redis calls.
+
+        Fix 4B: replaces 4-5 sequential awaits in release_instance with a
+        single pipelined evalsha pair — one for the release/health/stat
+        combination and one for the EMA update (which needs a read-modify-write).
+
+        Fix 4A: when notify=True, pushes to 'slot:available' so BLPOP waiters
+        in _handle_chat_pool wake up immediately instead of spinning.
+        """
+        stat_key = f"inst:{port}:{'successes' if success else 'errors'}"
+        pipe = self._redis.pipeline()
+        pipe.evalsha(
+            self._release_all_sha, 3,
+            f"inst:{port}:slots_used",
+            f"inst:{port}:health",
+            stat_key,
+            "30",                    # ARGV[1]: health TTL seconds
+            "1" if notify else "0",  # ARGV[2]: push slot:available
+        )
+        if latency_ms > 0:
+            pipe.evalsha(
+                self._ema_sha, 1,
+                f"inst:{port}:avg_latency",
+                str(latency_ms), "0.1",
+            )
+        await pipe.execute()
+
+    async def wait_slot_available(self, timeout_s: float = 0.1) -> bool:
+        """Block until any slot becomes available, or timeout expires.
+
+        Fix 4A: replaces asyncio.sleep(delay) spin-wait in _handle_chat_pool.
+        Returns True if a slot-available notification was received, False on timeout.
+        The caller still calls select_instance() after waking — the notification
+        only means *a* slot was released, not that it's still free.
+        """
+        try:
+            result = await self._redis.blpop("slot:available", timeout=timeout_s)
+            return result is not None
+        except Exception:
+            return False
 
     async def get_slots(self, port: int) -> tuple[int, int]:
         """Get (slots_used, slots_total) for an instance."""

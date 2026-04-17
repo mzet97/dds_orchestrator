@@ -309,6 +309,12 @@ class DDSLayer:
         self._priority_writers: Dict[int, Any] = {}
         # QoS profile writers: keyed by profile name (low_cost, balanced, critical)
         self._qos_profile_writers: Dict[str, Any] = {}
+        # Fix 2A — per-agent partition writers for agent/request.
+        # Each writer uses a DDS Partition matching the agent_id so that only
+        # the targeted agent receives (and deserializes) the request.
+        # Eliminates the broadcast overhead where all agents process all messages.
+        self._partition_writers: Dict[str, Any] = {}
+        self._partition_publishers: Dict[str, Any] = {}  # keep Publisher refs alive
 
         # Create publishers (orchestrator sends to agents and clients)
         self.publishers = {
@@ -737,6 +743,23 @@ class DDSLayer:
             logger.debug("DDS unavailable, skipping publish_agent_request")
             return
 
+        # Fix 2A: use per-agent partition writer when target_agent_id is set.
+        # The partitioned DataWriter delivers only to the matching agent's reader,
+        # eliminating broadcast overhead (all agents deserializing all requests).
+        target = data.get("target_agent_id", "")
+        if target:
+            pw = self._get_partition_writer(target)
+            if pw is not None:
+                try:
+                    topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
+                    if topic_type:
+                        msg = topic_type(**data)
+                        pw.write(msg)
+                        logger.debug(f"Published to {TOPIC_AGENT_REQUEST} via partition '{target}'")
+                        return
+                except Exception as e:
+                    logger.warning(f"Partition write for '{target}' failed: {e}; falling back")
+
         # Use QoS profile writer if specified (from fuzzy decision)
         if qos_profile:
             writer = self._get_qos_profile_writer(qos_profile)
@@ -821,6 +844,35 @@ class DDSLayer:
             return writer
         except Exception as e:
             logger.error(f"Failed to create QoS profile writer '{profile_name}': {e}")
+            return None
+
+    def _get_partition_writer(self, agent_id: str):
+        """Get or create a DataWriter for agent/request restricted to agent_id partition.
+
+        Fix 2A: with a partitioned writer the DDS middleware delivers the message
+        only to the DataReader that subscribed with matching partition, eliminating
+        the per-agent Python-level filtering and broadcast deserialization overhead.
+        Falls back to None so the caller can use the default broadcast writer.
+        """
+        if agent_id in self._partition_writers:
+            return self._partition_writers[agent_id]
+
+        try:
+            from cyclonedds.pub import Publisher, DataWriter
+            from cyclonedds.core import Policy
+            from cyclonedds.qos import Qos
+            from cyclonedds.util import duration
+
+            pub_qos = Qos(Policy.Partition([agent_id]))
+            pub = Publisher(self.participant, pub_qos)
+            writer = DataWriter(pub, self.topics[TOPIC_AGENT_REQUEST], self.qos_reliable)
+            self._partition_publishers[agent_id] = pub   # keep Publisher alive
+            self._partition_writers[agent_id] = writer
+            logger.info(f"Created partition writer for agent '{agent_id}'")
+            return writer
+        except Exception as e:
+            logger.warning(f"Failed to create partition writer for '{agent_id}': {e}; "
+                           "falling back to broadcast")
             return None
 
     async def publish_orchestrator_command(self, command_id: str,
@@ -920,6 +972,10 @@ class DDSLayer:
         self.publishers.clear()
         self.subscribers.clear()
         self.topics.clear()
+        self._partition_writers.clear()
+        self._partition_publishers.clear()
+        self._priority_writers.clear()
+        self._qos_profile_writers.clear()
 
         if self.participant:
             try:

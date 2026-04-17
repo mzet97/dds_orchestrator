@@ -61,10 +61,13 @@ class OrchestratorServer:
         self.runner = None
         self.site = None
 
-        # gRPC channel pool (thread-safe, initialized eagerly to avoid TOCTOU race)
+        # gRPC channel pool: N channels per agent to mitigate HTTP/2 HOL blocking.
+        # Thread-safe, initialized eagerly to avoid TOCTOU race.
         import threading as _threading
-        self._grpc_channel_pool: dict = {}
+        self._grpc_channel_pool: dict[str, list] = {}  # url -> [ch1, ch2, ...]
         self._grpc_pool_lock = _threading.Lock()
+        self._grpc_rr_idx: dict[str, int] = {}  # round-robin index per url
+        self._GRPC_CHANNELS_PER_AGENT = 4
 
         # Background tasks
         self._heartbeat_task = None
@@ -330,10 +333,20 @@ class OrchestratorServer:
 
         logger.info(f"Processing DDS client request: {request_id} (priority={priority})")
 
-        # Get available agent
-        agents = await self.registry.get_available_agents()
+        # Get available agent with retry+backoff (aligns with gRPC/HTTP behavior).
+        # Without retry, DDS rejects instantly under load, mismatching HTTP's
+        # queuing behavior and making the comparison unfair.
+        import asyncio as _asyncio
+        agents = None
+        deadline = asyncio.get_event_loop().time() + 10.0  # 10s max wait
+        delay = 0.005
+        while asyncio.get_event_loop().time() < deadline:
+            agents = await self.registry.get_available_agents()
+            if agents:
+                break
+            await _asyncio.sleep(delay)
+            delay = min(delay * 2, 0.1)
         if not agents:
-            # Send error response
             await self._send_dds_client_response(request_id, client_id, "", success=0, error="No agents available")
             return
 
@@ -484,26 +497,48 @@ class OrchestratorServer:
         # Use InstancePool for slot acquisition (same as HTTP path) for fair
         # protocol comparison. Falls back to AgentRegistry if no pool.
         instance = None
+        # Try InstancePool with retry+backoff (same strategy as HTTP path).
+        # Without retry, gRPC rejects instantly ("No agents available") when
+        # all slots are momentarily busy, causing 89%+ error rates under load.
+        import asyncio as _asyncio
+        import time as _time
+
         if self.instance_pool:
-            import asyncio
             try:
-                loop = asyncio.get_running_loop()
+                loop = _asyncio.get_running_loop()
             except RuntimeError:
                 loop = None
-            if loop and loop.is_running():
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(
-                    self.instance_pool.select_instance(), loop)
-                instance = future.result(timeout=5)
-            else:
-                instance = asyncio.run(self.instance_pool.select_instance())
+
+            deadline = _time.time() + min(timeout_ms / 1000, 10.0)
+            delay = 0.005
+            while instance is None and _time.time() < deadline:
+                try:
+                    if loop and loop.is_running():
+                        future = _asyncio.run_coroutine_threadsafe(
+                            self.instance_pool.select_instance(), loop)
+                        instance = future.result(timeout=2)
+                    else:
+                        instance = _asyncio.run(self.instance_pool.select_instance())
+                except Exception:
+                    pass
+                if instance is not None:
+                    break
+                _time.sleep(delay)
+                delay = min(delay * 2, 0.1)
 
         if instance is None:
-            # Fallback to registry-based selection
-            with self.registry._thread_lock:
-                agents = [a for a in self.registry.agents.values()
-                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
-            if not agents:
+            # Fallback to registry-based selection (same retry)
+            deadline_reg = _time.time() + min(timeout_ms / 1000, 5.0)
+            delay_reg = 0.005
+            while _time.time() < deadline_reg:
+                with self.registry._thread_lock:
+                    agents = [a for a in self.registry.agents.values()
+                              if a.slots_idle > 0 and a.status in ("idle", "busy")]
+                if agents:
+                    break
+                _time.sleep(delay_reg)
+                delay_reg = min(delay_reg * 2, 0.1)
+            else:
                 return {"content": "", "success": False, "error": "No agents available"}
             agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
                 agents, messages=messages, priority=priority)
@@ -565,19 +600,24 @@ class OrchestratorServer:
         try:
             import grpc as _grpc
 
-            # Connection pooling: reuse channels per agent_grpc_url.
-            # Pool + lock initialized in __init__ to avoid TOCTOU race.
+            # Connection pooling: N channels per agent to mitigate HTTP/2 HOL blocking.
+            # Round-robin across channels reduces stream contention on a single TCP conn.
             with self._grpc_pool_lock:
                 if agent_grpc_url not in self._grpc_channel_pool:
-                    self._grpc_channel_pool[agent_grpc_url] = _grpc.insecure_channel(
-                        agent_grpc_url,
-                        options=[
-                            ("grpc.max_send_message_length", 64 * 1024 * 1024),
-                            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
-                            ("grpc.keepalive_time_ms", 30000),
-                        ],
-                    )
-                channel = self._grpc_channel_pool[agent_grpc_url]
+                    opts = [
+                        ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                        ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                        ("grpc.keepalive_time_ms", 30000),
+                    ]
+                    self._grpc_channel_pool[agent_grpc_url] = [
+                        _grpc.insecure_channel(agent_grpc_url, options=opts)
+                        for _ in range(self._GRPC_CHANNELS_PER_AGENT)
+                    ]
+                    self._grpc_rr_idx[agent_grpc_url] = 0
+                channels = self._grpc_channel_pool[agent_grpc_url]
+                idx = self._grpc_rr_idx[agent_grpc_url]
+                channel = channels[idx % len(channels)]
+                self._grpc_rr_idx[agent_grpc_url] = idx + 1
             stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
 
             resp = stub.SubmitTask(proto_req, timeout=timeout_ms / 1000)
@@ -1598,11 +1638,14 @@ class OrchestratorServer:
             raise ValueError(f"HTTP entrypoint cannot run protocol={protocol!r}")
 
         # Backpressure check
-        if self.backpressure and not await self.backpressure.allow_request():
-            return web.json_response(
-                {"error": "Rate limit exceeded", "code": "RATE_LIMITED"},
-                status=429,
-            )
+        try:
+            if self.backpressure and not await self.backpressure.allow_request():
+                return web.json_response(
+                    {"error": "Rate limit exceeded", "code": "RATE_LIMITED"},
+                    status=429,
+                )
+        except Exception as _bp_err:
+            logger.warning("backpressure check failed (ignored): %s", _bp_err)
 
         # Track active requests
         if self.redis_mgr:
@@ -1613,22 +1656,29 @@ class OrchestratorServer:
         instance = None
 
         try:
-            # Select instance with retry + exponential backoff
-            # Wait up to task_timeout for a slot (allows queueing under load)
+            # Select instance with retry + event-driven wait (Fix 4A).
+            # When all slots are busy, wait for a slot:available BLPOP notification
+            # instead of spinning with asyncio.sleep — reduces CPU and improves
+            # responsiveness (wakes up as soon as any slot is released).
             queue_timeout = self.config.task_timeout_seconds
             loop = asyncio.get_running_loop()
             deadline = loop.time() + queue_timeout
-            delay = 0.005  # 5ms initial
+            delay = 0.005  # 5ms initial (used only when redis_mgr is absent)
             while True:
                 instance = await self.instance_pool.select_instance()
                 if instance:
                     break
-                if loop.time() >= deadline:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
                     return web.json_response(
                         {"error": "All instances at capacity", "code": "NO_CAPACITY"},
                         status=503,
                     )
-                await asyncio.sleep(delay)
+                wait_time = min(delay, remaining)
+                if self.redis_mgr and hasattr(self.redis_mgr, "wait_slot_available"):
+                    await self.redis_mgr.wait_slot_available(wait_time)
+                else:
+                    await asyncio.sleep(wait_time)
                 delay = min(delay * 2, 0.1)  # cap at 100ms
 
             # Circuit breaker disabled for benchmark fairness — all protocols

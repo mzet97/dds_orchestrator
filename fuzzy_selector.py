@@ -76,7 +76,19 @@ class FuzzyDecisionEngine:
         logger.info("Fuzzy decision engine initialized (18 rules)")
 
     def _build_fuzzy_system(self):
-        """Build the fuzzy control system with 4 inputs, 3 outputs, 18 rules."""
+        """Build the fuzzy control system with 4 inputs, 3 outputs, 18 rules.
+
+        Fundamentação teórica:
+        - Conjuntos fuzzy e Princípio de Extensão de Zadeh (1975):
+          μ_B̃(y) = sup{ min(μ_Ã₁(x₁),...,μ_Ãₙ(xₙ)) : f(x₁,...,xₙ)=y }
+          O operador AND (mínimo) nas regras Mamdani realiza esta t-norma.
+        - Funções de pertencimento Gaussianas (Mendel, 2001):
+          gaussmf(x; c, σ) = exp(−(x−c)² / (2σ²))
+          Substituem as triangulares para garantir superfícies de controle
+          infinitamente diferenciáveis e sem descontinuidades de gradiente.
+        - Defuzzificação por centroide (método padrão do skfuzzy):
+          y* = Σ y_j·μ_out(y_j) / Σ μ_out(y_j)
+        """
 
         # ─── Input variables (Antecedents) ───────────────────────────────
         urgency = ctrl.Antecedent(np.arange(0, 11, 0.5), 'urgency')
@@ -89,42 +101,51 @@ class FuzzyDecisionEngine:
         qos_profile = ctrl.Consequent(np.arange(0, 11, 0.5), 'qos_profile')
         strategy = ctrl.Consequent(np.arange(0, 11, 0.5), 'strategy')
 
-        # ─── Membership functions ────────────────────────────────────────
+        # ─── Membership functions (Gaussianas) ───────────────────────────
+        #
+        # Fundamentação: Princípio de Extensão de Zadeh (1975).
+        # A imagem fuzzy de Ã sob f é B̃ com μ_B̃(y) = sup{μ_Ã(x) : f(x)=y}.
+        # O operador AND (mínimo) nas regras realiza a t-norma sobre os graus
+        # de pertencimento, conforme derivado do princípio de extensão multivariado.
+        #
+        # Forma: gaussmf(x; c, σ) = exp(−(x−c)² / (2σ²))
+        # Vantagem sobre trimf: infinitamente diferenciável, sem descontinuidades
+        # de gradiente nos vértices → superfícies de controle suaves (Mendel, 2001).
 
-        # Urgency: low/medium/high
-        urgency['low'] = fuzz.trimf(urgency.universe, [0, 0, 4])
-        urgency['medium'] = fuzz.trimf(urgency.universe, [3, 5, 7])
-        urgency['high'] = fuzz.trimf(urgency.universe, [6, 10, 10])
+        # Urgency [0, 10]: c ∈ {0, 5, 10}, σ = 1.5
+        urgency['low']    = fuzz.gaussmf(urgency.universe, 0,  1.5)
+        urgency['medium'] = fuzz.gaussmf(urgency.universe, 5,  1.5)
+        urgency['high']   = fuzz.gaussmf(urgency.universe, 10, 1.5)
 
-        # Complexity: low/medium/high
-        complexity['low'] = fuzz.trimf(complexity.universe, [0, 0, 4])
-        complexity['medium'] = fuzz.trimf(complexity.universe, [3, 5, 7])
-        complexity['high'] = fuzz.trimf(complexity.universe, [6, 10, 10])
+        # Complexity [0, 10]: mesmos parâmetros de urgency (universo simétrico)
+        complexity['low']    = fuzz.gaussmf(complexity.universe, 0,  1.5)
+        complexity['medium'] = fuzz.gaussmf(complexity.universe, 5,  1.5)
+        complexity['high']   = fuzz.gaussmf(complexity.universe, 10, 1.5)
 
-        # Agent load: low/medium/high (0-100%)
-        agent_load['low'] = fuzz.trimf(agent_load.universe, [0, 0, 30])
-        agent_load['medium'] = fuzz.trimf(agent_load.universe, [20, 50, 80])
-        agent_load['high'] = fuzz.trimf(agent_load.universe, [70, 100, 100])
+        # Agent load [0, 100]: c ∈ {0, 50, 100}, σ = 15
+        agent_load['low']    = fuzz.gaussmf(agent_load.universe, 0,   15)
+        agent_load['medium'] = fuzz.gaussmf(agent_load.universe, 50,  15)
+        agent_load['high']   = fuzz.gaussmf(agent_load.universe, 100, 15)
 
-        # Agent latency: low/medium/high (0-2000ms)
-        agent_latency['low'] = fuzz.trimf(agent_latency.universe, [0, 0, 200])
-        agent_latency['medium'] = fuzz.trimf(agent_latency.universe, [100, 500, 1000])
-        agent_latency['high'] = fuzz.trimf(agent_latency.universe, [800, 2000, 2000])
+        # Agent latency [0, 2000ms]: c ∈ {0, 600, 2000}, σ ∈ {100, 200, 250}
+        agent_latency['low']    = fuzz.gaussmf(agent_latency.universe, 0,    100)
+        agent_latency['medium'] = fuzz.gaussmf(agent_latency.universe, 600,  200)
+        agent_latency['high']   = fuzz.gaussmf(agent_latency.universe, 2000, 250)
 
-        # Agent score: low/medium/high (0-100)
-        agent_score['low'] = fuzz.trimf(agent_score.universe, [0, 0, 40])
-        agent_score['medium'] = fuzz.trimf(agent_score.universe, [30, 50, 70])
-        agent_score['high'] = fuzz.trimf(agent_score.universe, [60, 100, 100])
+        # Agent score [0, 100]: c ∈ {0, 50, 100}, σ = 15
+        agent_score['low']    = fuzz.gaussmf(agent_score.universe, 0,   15)
+        agent_score['medium'] = fuzz.gaussmf(agent_score.universe, 50,  15)
+        agent_score['high']   = fuzz.gaussmf(agent_score.universe, 100, 15)
 
-        # QoS profile: low_cost/balanced/critical (0-10)
-        qos_profile['low_cost'] = fuzz.trimf(qos_profile.universe, [0, 0, 3])
-        qos_profile['balanced'] = fuzz.trimf(qos_profile.universe, [2, 5, 8])
-        qos_profile['critical'] = fuzz.trimf(qos_profile.universe, [7, 10, 10])
+        # QoS profile [0, 10]: c ∈ {0, 5, 10}, σ = 1.5
+        qos_profile['low_cost'] = fuzz.gaussmf(qos_profile.universe, 0,  1.5)
+        qos_profile['balanced'] = fuzz.gaussmf(qos_profile.universe, 5,  1.5)
+        qos_profile['critical'] = fuzz.gaussmf(qos_profile.universe, 10, 1.5)
 
-        # Strategy: single/retry/fanout (0-10)
-        strategy['single'] = fuzz.trimf(strategy.universe, [0, 0, 3])
-        strategy['retry'] = fuzz.trimf(strategy.universe, [2, 5, 8])
-        strategy['fanout'] = fuzz.trimf(strategy.universe, [7, 10, 10])
+        # Strategy [0, 10]: c ∈ {0, 5, 10}, σ = 1.5
+        strategy['single'] = fuzz.gaussmf(strategy.universe, 0,  1.5)
+        strategy['retry']  = fuzz.gaussmf(strategy.universe, 5,  1.5)
+        strategy['fanout'] = fuzz.gaussmf(strategy.universe, 10, 1.5)
 
         # ─── Rules ──────────────────────────────────────────────────────
 
@@ -159,7 +180,13 @@ class FuzzyDecisionEngine:
     def evaluate(self, inp: FuzzyInput) -> FuzzyOutput:
         """Run fuzzy inference for a single agent evaluation.
 
-        Creates a fresh simulation from the shared control system (thread-safe).
+        Pipeline Mamdani (4 etapas):
+          1. Fuzzificação   — gaussmf para cada variável de entrada
+          2. Avaliação      — força de disparo w_i = min(μ_A(x₁), μ_B(x₂), ...)
+          3. Agregação      — μ_out(y) = max_i[ min(w_i, μ_Ci(y)) ]
+          4. Defuzzificação — centroide: y* = Σ y·μ_out / Σ μ_out
+
+        Cria uma simulação nova a partir do ControlSystem compartilhado (thread-safe).
         """
         sim = ctrl.ControlSystemSimulation(self._ctrl_system)
 
@@ -294,9 +321,15 @@ class FuzzyDecisionEngine:
 
     @staticmethod
     def estimate_complexity(messages: list) -> float:
-        """Estimate task complexity from message content.
+        """Estimate task complexity from message text using four linguistic features.
 
-        Heuristic based on total character count and message count.
+        Features (Zadeh Extension applied to prompt space → complexity score):
+          f1 — token count normalized by L_max=512          (weight 0.4)
+          f2 — entity density (capitalized words mid-sentence) (weight 0.2)
+          f3 — syntactic depth via subordinate conjunctions   (weight 0.2)
+          f4 — multi-step reasoning keyword indicators        (weight 0.2)
+
+        Returns a value in [0, 10].
         Accepts both dict messages and Pydantic ChatMessage objects.
         """
         if not messages:
@@ -307,14 +340,64 @@ class FuzzyDecisionEngine:
                 return m.get("content", "")
             return getattr(m, "content", "") or ""
 
-        total_chars = sum(len(_content(m)) for m in messages)
-        num_messages = len(messages)
+        # Concatenate all user/assistant message content
+        full_text = " ".join(_content(m) for m in messages)
+        if not full_text.strip():
+            return 5.0
 
-        if total_chars < 50 and num_messages <= 1:
-            return 2.0
-        elif total_chars < 200 and num_messages <= 2:
-            return 4.0
-        elif total_chars < 500:
-            return 6.0
-        else:
-            return 8.0
+        tokens = full_text.split()
+        n_tok = len(tokens)
+        # L_MAX calibrado para prompts típicos neste sistema (8–100 tokens).
+        # Prompts do PROMPT_BANK variam de 16 a ~100 tokens; L_MAX=64 cobre
+        # o comprimento médio de referência sem penalizar textos curtos mas ricos.
+        L_MAX = 64
+
+        # f1: token count normalized
+        f1 = min(n_tok / L_MAX, 1.0)
+
+        # f2: entity density — capitalized words that are NOT at sentence start
+        sentences = full_text.replace("?", ".").replace("!", ".").split(".")
+        entity_count = 0
+        for sent in sentences:
+            words = sent.strip().split()
+            # skip first word of sentence (always capitalized)
+            for w in words[1:]:
+                if w and w[0].isupper() and w.isalpha():
+                    entity_count += 1
+        f2 = entity_count / (n_tok + 1)
+
+        # f3: syntactic depth via subordinate conjunctions
+        _subordinates_pt = {"que", "porque", "embora", "quando", "se", "enquanto",
+                             "embora", "pois", "como", "conforme", "apesar"}
+        _subordinates_en = {"that", "because", "although", "when", "if", "while",
+                             "since", "unless", "whether", "though", "as"}
+        subordinates = _subordinates_pt | _subordinates_en
+        sub_count = sum(1 for w in tokens if w.lower().rstrip(".,;:") in subordinates)
+        f3 = min(sub_count / (n_tok / 10 + 1), 1.0)
+
+        # f4: multi-step reasoning indicators (weighted keywords)
+        _keywords = {
+            # Portuguese
+            "analise": 1.0, "analisar": 1.0, "compare": 1.0, "comparar": 1.0,
+            "explique": 0.5, "explicar": 0.5, "justifique": 0.5, "justificar": 0.5,
+            "descreva": 0.5, "liste": 0.5, "enumere": 0.5, "detalhe": 0.5,
+            "calcule": 1.0, "resolva": 1.0, "demonstre": 1.0, "prove": 1.0,
+            # English
+            "analyze": 1.0, "analyse": 1.0, "explain": 0.5, "compare": 1.0,
+            "justify": 0.5, "describe": 0.5, "list": 0.5, "enumerate": 0.5,
+            "calculate": 1.0, "solve": 1.0, "demonstrate": 1.0, "prove": 1.0,
+            "step": 0.5, "steps": 0.5,
+        }
+        # Also detect multi-word phrases
+        text_lower = full_text.lower()
+        phrase_score = 0.0
+        for phrase, w in [("liste os passos", 1.0), ("step by step", 1.0),
+                          ("passo a passo", 1.0), ("etapa por etapa", 1.0)]:
+            if phrase in text_lower:
+                phrase_score += w
+
+        word_score = sum(_keywords.get(w.lower().rstrip(".,;:?!"), 0.0) for w in tokens)
+        f4 = min(word_score + phrase_score, 1.0)
+
+        complexity = 10.0 * (0.4 * f1 + 0.2 * f2 + 0.2 * f3 + 0.2 * f4)
+        return round(min(complexity, 10.0), 2)
