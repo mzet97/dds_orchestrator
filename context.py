@@ -29,9 +29,14 @@ class ContextManager:
     Manages conversation contexts across agents
     """
 
-    def __init__(self, max_contexts: int = 1000, max_messages_per_context: int = 20):
+    def __init__(self, max_contexts: int = 1000, max_messages_per_context: int = 20,
+                 context_ttl_seconds: int = 600):
         self.max_contexts = max_contexts
         self.max_messages = max_messages_per_context
+        # Drop contexts idle longer than this (10 min default). Benchmark
+        # runs with per-request uuid4 session_ids would otherwise fill the
+        # map long before max_contexts evicts.
+        self.context_ttl_seconds = context_ttl_seconds
 
         # Context storage
         self._contexts: Dict[str, ConversationContext] = {}
@@ -199,3 +204,24 @@ class ContextManager:
                 "total_messages": total_messages,
                 "max_contexts": self.max_contexts,
             }
+
+    async def cleanup_expired(self) -> int:
+        """Drop contexts untouched longer than context_ttl_seconds.
+        Call periodically from a background task. Returns count removed."""
+        if self.context_ttl_seconds <= 0:
+            return 0
+        cutoff = int(time.time()) - self.context_ttl_seconds
+        removed = 0
+        async with self._lock:
+            expired_ids = [cid for cid, c in self._contexts.items()
+                           if c.last_updated < cutoff]
+            for cid in expired_ids:
+                ctx = self._contexts.pop(cid, None)
+                if ctx and ctx.user_id in self._user_contexts:
+                    user_list = self._user_contexts[ctx.user_id]
+                    if cid in user_list:
+                        user_list.remove(cid)
+                    if not user_list:
+                        del self._user_contexts[ctx.user_id]
+                removed += 1
+        return removed

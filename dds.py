@@ -428,6 +428,24 @@ class DDSLayer:
         finally:
             self._pending_client_responses.pop(request_id, None)
 
+    def _assert_main_loop(self):
+        """Fail-fast if mutating ``_pending_agent_responses`` from the wrong loop.
+
+        The dict is read/written from the main asyncio loop and from listener
+        threads via ``call_soon_threadsafe`` (safe). Any *other* thread
+        touching it directly is a bug — this assertion catches that.
+        """
+        if self._event_loop is None:
+            return  # loop not yet captured — called from __init__ or tests
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # not inside a loop — let caller handle
+        assert current is self._event_loop, (
+            f"_pending_agent_responses mutated from unexpected loop "
+            f"(current={current}, expected={self._event_loop})"
+        )
+
     def prepare_agent_response_waiter(self, task_id: str):
         """Pre-register a waiter for the given task_id.
 
@@ -435,6 +453,7 @@ class DDSLayer:
         arriving between publish and wait is not discarded by the
         dispatch_agent_responses loop.
         """
+        self._assert_main_loop()
         if task_id not in self._pending_agent_responses:
             event = asyncio.Event()
             result_container = [None]
@@ -480,6 +499,7 @@ class DDSLayer:
         a waiter keyed as 'stream_{task_id}' that uses an asyncio.Queue to accumulate
         individual chunks without busy waiting.
         """
+        self._assert_main_loop()
         key = f"stream_{task_id}"
         if key not in self._pending_agent_responses:
             queue = asyncio.Queue()
@@ -596,7 +616,12 @@ class DDSLayer:
     start_waitset_dispatchers = start_dispatchers
 
     def _take_dispatch_loop(self, reader, dispatch_fn):
-        """Tight take() loop in dedicated thread. 0.5ms sleep between polls."""
+        """Fallback polling loop (only used when listener attach fails).
+
+        5 ms sleep keeps CPU usage bounded (~200 wakeups/sec) while still
+        giving acceptable tail latency on the rare fallback path. The
+        primary, event-driven listener path takes care of low-latency dispatch.
+        """
         import time as _time
         while self.dds_available:
             try:
@@ -607,7 +632,7 @@ class DDSLayer:
                             self._event_loop.call_soon_threadsafe(dispatch_fn, sample)
             except Exception as e:
                 logger.exception(f"Error in _take_dispatch_loop: {e}")
-            _time.sleep(0.0005)  # 0.5ms — balances latency vs CPU
+            _time.sleep(0.005)
 
     def _dispatch_agent_response_sample(self, sample):
         """Dispatch a single agent response sample (called from asyncio thread)."""
@@ -696,10 +721,24 @@ class DDSLayer:
                             )
 
             listener = TopicListener()
-            qos = self.qos_reliable if topic not in (TOPIC_AGENT_STATUS,) else self.qos_best_effort
-            reader = DataReader(Subscriber(self.participant), topic_obj, qos=qos, listener=listener)
-            self.subscribers[topic] = reader
-            logger.info(f"Subscribed to {topic} with listener")
+            existing = self.subscribers.get(topic)
+            if existing is not None:
+                # _create_pubsub() already built a DataReader for this topic.
+                # Reuse it and just attach the listener so we don't double-
+                # read the same samples (each DataReader gets its own copy).
+                try:
+                    existing.set_listener(listener)
+                except Exception as e:
+                    logger.warning(f"Could not attach listener to existing reader {topic}: {e}")
+                if not hasattr(self, "_dds_listeners"):
+                    self._dds_listeners = []
+                self._dds_listeners.append(listener)
+                logger.info(f"Attached listener to existing reader for {topic}")
+            else:
+                qos = self.qos_reliable if topic not in (TOPIC_AGENT_STATUS,) else self.qos_best_effort
+                reader = DataReader(Subscriber(self.participant), topic_obj, qos=qos, listener=listener)
+                self.subscribers[topic] = reader
+                logger.info(f"Subscribed to {topic} with listener")
         except Exception as e:
             logger.error(f"Failed to create subscription for {topic}: {e}")
             logger.info(f"Subscribed to {topic} (handler registered, no listener)")
@@ -905,7 +944,7 @@ class DDSLayer:
             "priority": request.priority,
             "timeout_ms": request.timeout_ms,
             "requires_context": request.requires_context,
-            "created_at": int(time.time()),
+            "created_at": int(time.time() * 1000),  # unified milliseconds (matches publish_agent_request)
         }
         await self.publish(TOPIC_CLIENT_REQUEST, data)
 
@@ -928,39 +967,6 @@ class DDSLayer:
         """Subscribe to client responses"""
         await self.subscribe(TOPIC_CLIENT_RESPONSE, handler)
 
-    # HTTP Fallback methods
-    async def send_request_via_http(self, agent_url: str, request: dict,
-                                     timeout: int = 120) -> dict:
-        """Send request via HTTP fallback"""
-        import aiohttp
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{agent_url}/generate",
-                    json=request,
-                    timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    return await response.json()
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def get_agent_health_via_http(self, agent_url: str) -> dict:
-        """Get agent health via HTTP"""
-        import aiohttp
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{agent_url}/health") as response:
-                    return await response.json()
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return {"available": False, "error": str(e)}
-
     def close(self):
         """Close DDS connections and release resources.
 
@@ -979,7 +985,9 @@ class DDSLayer:
 
         if self.participant:
             try:
-                del self.participant
+                close_fn = getattr(self.participant, 'close', None)
+                if callable(close_fn):
+                    close_fn()
             except Exception as e:
                 logger.error(f"Error closing DDS participant: {e}")
             self.participant = None
@@ -991,18 +999,3 @@ class DDSLayer:
     def is_available(self) -> bool:
         """Check if DDS is available"""
         return self.dds_available
-
-
-class DDSMessageSerializer:
-    """Serialize/deserialize DDS messages"""
-
-    @staticmethod
-    def serialize(obj) -> bytes:
-        """Serialize object to bytes"""
-        return _json_dumps(asdict(obj)).encode('utf-8')
-
-    @staticmethod
-    def deserialize(data: bytes, msg_type):
-        """Deserialize bytes to object"""
-        obj_dict = _json_loads(data.decode('utf-8'))
-        return msg_type(**obj_dict)

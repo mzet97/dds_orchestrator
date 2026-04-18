@@ -71,9 +71,46 @@ class TaskScheduler:
         self.running_tasks: Dict[str, Task] = {}
         self._lock = asyncio.Lock()
         self._task_handlers: Dict[str, Callable] = {}
+        # Periodic cleanup of old completed tasks — started on demand via
+        # start_cleanup_loop(); prevents unbounded growth of self.tasks under
+        # long-running benchmark matrices.
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_stop = asyncio.Event()
 
-        # TODO: Implement periodic cleanup of old completed/failed tasks
-        # self._cleanup_task = None
+    def start_cleanup_loop(self, interval_s: int = 60,
+                           max_tasks: int = 500,
+                           max_age_seconds: int = 300) -> None:
+        """Start a background task that periodically prunes old tasks."""
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return  # already running
+
+        async def _loop():
+            while not self._cleanup_stop.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._cleanup_stop.wait(), timeout=interval_s
+                    )
+                    return  # stop requested
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    await self.cleanup_old_tasks(max_tasks=max_tasks,
+                                                 max_age_seconds=max_age_seconds)
+                except Exception as e:
+                    logger.warning(f"cleanup_old_tasks failed: {e}")
+
+        self._cleanup_stop.clear()
+        self._cleanup_task = asyncio.create_task(_loop())
+
+    async def stop_cleanup_loop(self) -> None:
+        """Stop the periodic cleanup task."""
+        self._cleanup_stop.set()
+        if self._cleanup_task is not None:
+            try:
+                await asyncio.wait_for(self._cleanup_task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._cleanup_task.cancel()
+            self._cleanup_task = None
 
     def register_handler(self, task_type: str, handler: Callable):
         """Register a handler for a task type"""

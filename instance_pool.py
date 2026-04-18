@@ -130,35 +130,49 @@ class InstancePool:
         return None
 
     async def _select_least_loaded(self, prefer_type: str = None) -> Optional[InstanceInfo]:
-        """Least-loaded: pick instance with lowest slots_used/slots_total ratio."""
-        loads = await self._redis.get_all_loads()
-        if not loads:
-            return None
+        """Least-loaded: pick instance with lowest slots_used/slots_total ratio.
 
-        # Filter healthy and by type preference
-        candidates = []
-        for load in loads:
-            port = load["port"]
-            inst = self._instances.get(port)
-            if not inst or not load["healthy"]:
-                continue
-            if prefer_type and inst.inst_type != prefer_type:
-                continue
-            ratio = load["slots_used"] / max(load["slots_total"], 1)
-            candidates.append((ratio, port, inst))
+        Under high concurrency the "best" instance seen in a snapshot can be
+        acquired by another request before we get there, falling through a
+        stale list. After ``_MAX_STALE_ATTEMPTS`` consecutive misses we
+        re-fetch loads so subsequent tries use fresh data.
+        """
+        _MAX_STALE_ATTEMPTS = 3
 
-        if not candidates:
-            # Fallback: try all types
-            if prefer_type:
-                return await self._select_least_loaded(prefer_type=None)
-            return None
+        for _refresh in range(3):  # at most 3 full refreshes per call
+            loads = await self._redis.get_all_loads()
+            if not loads:
+                return None
 
-        # Sort by load ratio ascending
-        candidates.sort(key=lambda x: x[0])
+            # Filter healthy and by type preference
+            candidates = []
+            for load in loads:
+                port = load["port"]
+                inst = self._instances.get(port)
+                if not inst or not load["healthy"]:
+                    continue
+                if prefer_type and inst.inst_type != prefer_type:
+                    continue
+                ratio = load["slots_used"] / max(load["slots_total"], 1)
+                candidates.append((ratio, port, inst))
 
-        for _, port, inst in candidates:
-            if await self._redis.acquire_slot(port):
-                return inst
+            if not candidates:
+                # Fallback: try all types
+                if prefer_type:
+                    return await self._select_least_loaded(prefer_type=None)
+                return None
+
+            # Sort by load ratio ascending
+            candidates.sort(key=lambda x: x[0])
+
+            misses = 0
+            for _, port, inst in candidates:
+                if await self._redis.acquire_slot(port):
+                    return inst
+                misses += 1
+                if misses >= _MAX_STALE_ATTEMPTS:
+                    break  # snapshot likely stale; refresh
+
         return None
 
     async def _select_weighted_score(self, prefer_type: str = None) -> Optional[InstanceInfo]:

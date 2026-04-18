@@ -83,13 +83,22 @@ class OrchestratorServer:
 
     async def start(self):
         """Start the orchestrator server"""
-        # Create shared HTTP session for pool path
-        if self.instance_pool:
-            import aiohttp as _aiohttp
-            self._pool_session = _aiohttp.ClientSession(
-                connector=_aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
-                timeout=_aiohttp.ClientTimeout(total=self.config.task_timeout_seconds),
-            )
+        # Store reference to the main aiohttp/asyncio loop. The sync gRPC
+        # thread-pool handlers need this to schedule Redis-backed coroutines
+        # on the SAME loop that owns the Redis connections. Creating a new
+        # loop per call (via asyncio.run) would break Redis state and cause
+        # a fixed ~10s spin in _process_grpc_client_request_sync.
+        self._main_loop = asyncio.get_running_loop()
+
+        # Shared aiohttp session — created once and reused across handlers.
+        # Per-request ClientSession() costs ~1-3 ms of connector setup and
+        # prevents HTTP keep-alive across requests, which is significant on
+        # the hot path.
+        import aiohttp as _aiohttp
+        self._pool_session = _aiohttp.ClientSession(
+            connector=_aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+            timeout=_aiohttp.ClientTimeout(total=self.config.task_timeout_seconds),
+        )
 
         # Setup routes
         self.app = web.Application()
@@ -196,11 +205,14 @@ class OrchestratorServer:
             await self.runner.cleanup()
 
         if hasattr(self, '_grpc_channel_pool'):
-            for url, channel in self._grpc_channel_pool.items():
-                try:
-                    channel.close()
-                except Exception as e:
-                    logger.warning(f"Error closing channel {url}: {e}")
+            # Pool stores a LIST of channels per URL (HTTP/2 HOL mitigation),
+            # so iterate each channel, not the list itself.
+            for url, channels in self._grpc_channel_pool.items():
+                for ch in channels:
+                    try:
+                        ch.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing channel {url}: {e}")
             self._grpc_channel_pool.clear()
 
         logger.info("Server stopped")
@@ -210,13 +222,12 @@ class OrchestratorServer:
         while True:
             try:
                 await asyncio.sleep(10)
-                stale_ids = await self.registry.remove_stale_agents()
-                for agent_id in (stale_ids or []):
+                stale = await self.registry.remove_stale_agents()
+                for agent_id, grpc_url in (stale or []):
                     try:
                         await self.selector.unregister_agent(agent_id)
-                        # Cleanup gRPC connections
                         if self.grpc and self.grpc.is_available():
-                            await self.grpc.unregister_agent(agent_id)
+                            await self.grpc.unregister_agent(agent_id, grpc_url=grpc_url or None)
                     except Exception as e:
                         logger.warning(f"Failed to unregister stale agent {agent_id}: {e}")
             except asyncio.CancelledError:
@@ -338,9 +349,10 @@ class OrchestratorServer:
         # queuing behavior and making the comparison unfair.
         import asyncio as _asyncio
         agents = None
-        deadline = asyncio.get_event_loop().time() + 10.0  # 10s max wait
+        loop = _asyncio.get_running_loop()
+        deadline = loop.time() + 10.0  # 10s max wait
         delay = 0.005
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             agents = await self.registry.get_available_agents()
             if agents:
                 break
@@ -503,53 +515,53 @@ class OrchestratorServer:
         import asyncio as _asyncio
         import time as _time
 
-        if self.instance_pool:
-            try:
-                loop = _asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
+        # Unified slot acquisition: probe InstancePool AND registry in the
+        # SAME loop, using the stored main event loop (not a fresh one per
+        # iteration). This mirrors the HTTP path (handle_chat) and avoids
+        # the cascaded 10s+5s deadlines that previously pinned gRPC latency
+        # at ~10.3s when the pool's Redis-backed state didn't resolve
+        # cross-loop.
+        main_loop = getattr(self, "_main_loop", None)
+        total_timeout = min(timeout_ms / 1000.0, float(self.config.task_timeout_seconds))
+        deadline = _time.time() + total_timeout
+        agent = None
+        fuzzy_qos = None
+        fuzzy_strategy = None
+        delay = 0.005  # 5ms initial backoff, exponential cap at 100ms
 
-            deadline = _time.time() + min(timeout_ms / 1000, 10.0)
-            delay = 0.005
-            while instance is None and _time.time() < deadline:
+        while _time.time() < deadline:
+            # (1) Try InstancePool on the main loop with a short result timeout
+            if self.instance_pool and main_loop is not None and main_loop.is_running():
                 try:
-                    if loop and loop.is_running():
-                        future = _asyncio.run_coroutine_threadsafe(
-                            self.instance_pool.select_instance(), loop)
-                        instance = future.result(timeout=2)
-                    else:
-                        instance = _asyncio.run(self.instance_pool.select_instance())
+                    future = _asyncio.run_coroutine_threadsafe(
+                        self.instance_pool.select_instance(), main_loop)
+                    instance = future.result(timeout=0.2)  # 200ms, not 2s
                 except Exception:
-                    pass
+                    instance = None
                 if instance is not None:
                     break
-                _time.sleep(delay)
-                delay = min(delay * 2, 0.1)
 
-        if instance is None:
-            # Fallback to registry-based selection (same retry)
-            deadline_reg = _time.time() + min(timeout_ms / 1000, 5.0)
-            delay_reg = 0.005
-            while _time.time() < deadline_reg:
-                with self.registry._thread_lock:
-                    agents = [a for a in self.registry.agents.values()
-                              if a.slots_idle > 0 and a.status in ("idle", "busy")]
-                if agents:
-                    break
-                _time.sleep(delay_reg)
-                delay_reg = min(delay_reg * 2, 0.1)
-            else:
-                return {"content": "", "success": False, "error": "No agents available"}
-            agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-                agents, messages=messages, priority=priority)
+            # (2) Try registry in the same iteration (not a cascading fallback)
             with self.registry._thread_lock:
-                real_agent = self.registry.agents.get(agent.agent_id)
-                if not real_agent or real_agent.slots_idle <= 0:
-                    return {"content": "", "success": False, "error": "No agents available"}
-                real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
-            if real_agent.slots_idle == 0:
-                real_agent.status = "busy"
-            agent = real_agent
+                agents = [a for a in self.registry.agents.values()
+                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
+            if agents:
+                picked, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
+                    agents, messages=messages, priority=priority)
+                with self.registry._thread_lock:
+                    real_agent = self.registry.agents.get(picked.agent_id)
+                    if real_agent and real_agent.slots_idle > 0:
+                        real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
+                        if real_agent.slots_idle == 0:
+                            real_agent.status = "busy"
+                        agent = real_agent
+                        break
+
+            _time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+
+        if instance is None and agent is None:
+            return {"content": "", "success": False, "error": "No agents available"}
 
         # Resolve agent for logging + gRPC address
         if instance is not None:
@@ -637,22 +649,24 @@ class OrchestratorServer:
             return {"content": "", "success": False, "error": str(e)}
         finally:
             # Release slot via the same mechanism used for acquisition.
+            # CRITICAL: we run in a gRPC thread-pool thread with no event loop
+            # of its own. Must schedule onto the captured main loop — calling
+            # get_running_loop() here raises RuntimeError, silently leaking
+            # the Redis-backed slot forever.
             if instance is not None and self.instance_pool:
                 import asyncio as _asyncio
                 try:
-                    loop = _asyncio.get_running_loop()
+                    main_loop = getattr(self, "_main_loop", None)
+                    if main_loop is None:
+                        raise RuntimeError("main loop not captured")
                     _asyncio.run_coroutine_threadsafe(
-                        self.instance_pool.release_instance(instance.port, 0, True), loop
+                        self.instance_pool.release_instance(instance.port, 0, True),
+                        main_loop,
                     ).result(timeout=5)
-                except Exception:
-                    pass  # best-effort release
+                except Exception as e:
+                    logger.warning(f"Failed to release instance slot {instance.port}: {e}")
             else:
-                with self.registry._thread_lock:
-                    a = self.registry.agents.get(agent.agent_id)
-                    if a:
-                        a.slots_idle = min(a.slots_idle + 1, getattr(a, 'slots_total', 8))
-                        if a.slots_idle > 0:
-                            a.status = "idle"
+                self.registry.adjust_slots_sync(agent.agent_id, delta=+1)
 
     async def _cleanup_loop(self):
         """Background task to cleanup old tasks"""
@@ -794,17 +808,17 @@ class OrchestratorServer:
     async def handle_unregister_agent(self, request: web.Request) -> web.Response:
         """Unregister an agent"""
         agent_id = request.match_info['agent_id']
-        success = await self.registry.unregister_agent(agent_id)
+        agent_info = await self.registry.get_agent(agent_id)
+        grpc_url = getattr(agent_info, "grpc_address", "") if agent_info else ""
 
+        success = await self.registry.unregister_agent(agent_id)
         if not success:
             return web.json_response({"error": "Agent not found"}, status=404)
 
-        # Remover também do selector
         await self.selector.unregister_agent(agent_id)
-        
-        # Cleanup gRPC connections
+
         if self.grpc and self.grpc.is_available():
-            await self.grpc.unregister_agent(agent_id)
+            await self.grpc.unregister_agent(agent_id, grpc_url=grpc_url or None)
 
         return web.json_response({"success": True})
 
@@ -838,17 +852,16 @@ class OrchestratorServer:
                 agent_url = f"http://{agent.hostname}:{agent.port}"
                 try:
                     import aiohttp as _aiohttp
-                    async with _aiohttp.ClientSession() as _session:
-                        async with _session.post(
-                            f"{agent_url}/chat",
-                            json={
-                                "messages": messages,
-                                "max_tokens": max_tokens,
-                                "temperature": temperature,
-                            },
-                            timeout=_aiohttp.ClientTimeout(total=30)
-                        ) as _resp:
-                            http_result = await _resp.json()
+                    async with self._pool_session.post(
+                        f"{agent_url}/chat",
+                        json={
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                        timeout=_aiohttp.ClientTimeout(total=30)
+                    ) as _resp:
+                        http_result = await _resp.json()
 
                     content = http_result.get("content", "")
                     if not content and "choices" in http_result:
@@ -985,17 +998,16 @@ class OrchestratorServer:
                 agent_url = f"http://{agent.hostname}:{agent.port}"
                 try:
                     import aiohttp as _aiohttp
-                    async with _aiohttp.ClientSession() as _session:
-                        async with _session.post(
-                            f"{agent_url}/chat",
-                            json={
-                                "messages": messages,
-                                "max_tokens": max_tokens,
-                                "temperature": temperature,
-                            },
-                            timeout=_aiohttp.ClientTimeout(total=30)
-                        ) as _resp:
-                            http_result = await _resp.json()
+                    async with self._pool_session.post(
+                        f"{agent_url}/chat",
+                        json={
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                        timeout=_aiohttp.ClientTimeout(total=30)
+                    ) as _resp:
+                        http_result = await _resp.json()
 
                     content = http_result.get("content", "")
                     if not content and "choices" in http_result:
@@ -1205,6 +1217,11 @@ class OrchestratorServer:
         task_type = data.get("task_type", "chat")
         stream_requested = data.get("stream", False)
         protocol = data.get("protocol")  # optional: "http", "grpc", "dds"
+        # Must be available before any fanout/retry call — fanout reads it
+        # even when protocol=="http" (it decides on fallbacks). Previously
+        # it was only set inside the DDS branch, so HTTP paths triggered
+        # NameError on fallback.
+        dds_priority = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}.get(priority, 0)
 
         # ============================================================
         # PROTOCOL CONSISTENCY: HTTP entrypoint forces HTTP end-to-end.
@@ -1408,10 +1425,7 @@ class OrchestratorServer:
                         stream=stream_requested,
                     )
 
-                    # Map task priority to DDS TRANSPORT_PRIORITY
-                    priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
-                    dds_priority = priority_map.get(priority, 0)
-
+                    # dds_priority already computed at the top of the handler.
                     if stream_requested and self.dds.is_available():
                         # SSE streaming path: forward individual chunks to client
                         self.dds.prepare_stream_waiter(task.task_id)
@@ -1495,17 +1509,16 @@ class OrchestratorServer:
                 logger.info(f"HTTP fallback calling agent at {agent_url}/chat")
                 try:
                     import aiohttp as _aiohttp
-                    async with _aiohttp.ClientSession() as _session:
-                        async with _session.post(
-                            f"{agent_url}/chat",
-                            json={
-                                "messages": messages,
-                                "max_tokens": max_tokens,
-                                "temperature": temperature,
-                            },
-                            timeout=_aiohttp.ClientTimeout(total=max(1, task.timeout_ms // 1000))
-                        ) as _resp:
-                            http_result = await _resp.json()
+                    async with self._pool_session.post(
+                        f"{agent_url}/chat",
+                        json={
+                            "messages": messages,
+                            "max_tokens": max_tokens,
+                            "temperature": temperature,
+                        },
+                        timeout=_aiohttp.ClientTimeout(total=max(1, task.timeout_ms // 1000))
+                    ) as _resp:
+                        http_result = await _resp.json()
 
                     # Extract content from agent response
                     content = http_result.get("content", "")
@@ -2059,10 +2072,13 @@ class OrchestratorServer:
             return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
 
         try:
-            result = await self.dds.send_request_via_http(
-                agent_url,
-                {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
-            )
+            import aiohttp as _aiohttp
+            async with self._pool_session.post(
+                f"{agent_url}/generate",
+                json={"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature},
+                timeout=_aiohttp.ClientTimeout(total=120),
+            ) as _resp:
+                result = await _resp.json()
         except Exception as e:
             return web.json_response({"error": f"Agent communication failed: {e}"}, status=502)
         finally:
@@ -2120,8 +2136,13 @@ class OrchestratorServer:
             ]
         })
 
+    # Whitelist of DDS topics an unauthenticated HTTP client may publish to.
+    # Keep this minimal — the primary DDS writers are internal. Debug endpoint
+    # MUST NOT let callers inject into agent/orchestrator control topics.
+    _ALLOWED_PUBLISH_TOPICS = frozenset({"client/request", "client/ping"})
+
     async def handle_dds_publish(self, request: web.Request) -> web.Response:
-        """Publish to DDS topic"""
+        """Publish to a whitelisted DDS topic (debug endpoint)."""
         try:
             data = await request.json()
         except Exception:
@@ -2131,6 +2152,13 @@ class OrchestratorServer:
 
         if not topic or not message:
             return web.json_response({"error": "topic and message required"}, status=400)
+
+        if topic not in self._ALLOWED_PUBLISH_TOPICS:
+            logger.warning(f"Rejected /dds/publish to non-whitelisted topic: {topic!r}")
+            return web.json_response(
+                {"error": f"Topic '{topic}' not allowed"},
+                status=403,
+            )
 
         await self.dds.publish(topic, message)
 

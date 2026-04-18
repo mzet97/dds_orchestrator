@@ -75,6 +75,11 @@ class RedisStateManager:
         self._redis = None
         self._acquire_sha = None
         self._ema_sha = None
+        # Short-TTL cache of instance ports to avoid per-call SCAN over Redis.
+        # Ports change only on register/deregister; 1s staleness is acceptable.
+        self._ports_cache: list[str] = []
+        self._ports_cache_ts: float = 0.0
+        self._ports_cache_ttl: float = 1.0
 
     async def connect(self):
         """Connect to Redis and register Lua scripts."""
@@ -115,6 +120,7 @@ class RedisStateManager:
         pipe.set(f"inst:{port}:avg_latency", 0)
         pipe.set(f"inst:{port}:health", "alive", ex=30)
         await pipe.execute()
+        self.invalidate_ports_cache()
 
     # === Slot Management (Lua for atomicity) ===
 
@@ -185,21 +191,38 @@ class RedisStateManager:
         used, total = await pipe.execute()
         return int(used or 0), int(total or 0)
 
-    async def get_all_loads(self) -> list[dict]:
-        """Get load info for all instances via pipeline."""
-        # First get all instance ports
-        keys = []
+    async def _list_instance_ports(self) -> list[str]:
+        """Cached SCAN over ``inst:*:slots_total`` keys (TTL = ``_ports_cache_ttl``).
+
+        Port registration is infrequent relative to query rate, so a 1s cache
+        eliminates O(agents) SCAN cost on the hot path.
+        """
+        now = time.time()
+        if self._ports_cache and (now - self._ports_cache_ts) < self._ports_cache_ttl:
+            return self._ports_cache
+
+        keys: list[str] = []
         cursor = "0"
         while True:
             cursor, batch = await self._redis.scan(cursor=cursor, match="inst:*:slots_total", count=100)
             keys.extend(batch)
             if cursor == "0" or cursor == 0:
                 break
-
-        if not keys:
-            return []
-
         ports = [k.split(":")[1] for k in keys]
+        self._ports_cache = ports
+        self._ports_cache_ts = now
+        return ports
+
+    def invalidate_ports_cache(self) -> None:
+        """Force next :meth:`_list_instance_ports` to re-scan. Call after register/deregister."""
+        self._ports_cache = []
+        self._ports_cache_ts = 0.0
+
+    async def get_all_loads(self) -> list[dict]:
+        """Get load info for all instances via pipeline."""
+        ports = await self._list_instance_ports()
+        if not ports:
+            return []
         pipe = self._redis.pipeline()
         for port in ports:
             pipe.get(f"inst:{port}:slots_used")

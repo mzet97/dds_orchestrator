@@ -51,6 +51,17 @@ class AgentRegistry:
     def __init__(self, config):
         self.config = config
         self.agents: Dict[str, AgentInfo] = {}
+        # Dual-lock regime (intentional, not a bug):
+        #   * ``_lock`` / ``agent_available_condition`` guards async call sites
+        #     (aiohttp handlers, scheduler) and supports Condition.notify().
+        #   * ``_thread_lock`` guards sync call sites running in thread pools
+        #     (notably sync gRPC servicers in grpc_layer). Acquiring an
+        #     asyncio.Lock from a thread would deadlock the loop.
+        # The two locks do NOT serialize against each other. Treat the fields
+        # they protect (slots_idle, status, last_heartbeat) as eventually
+        # consistent across regimes — authoritative slot accounting lives in
+        # the Redis InstancePool; this registry view is a cache. Do NOT mix
+        # the two locks in one critical section.
         self._lock = asyncio.Lock()
         self.agent_available_condition = asyncio.Condition(self._lock)
         import threading
@@ -181,6 +192,30 @@ class AgentRegistry:
                 self.agent_available_condition.notify(1)
             return True
 
+    def adjust_slots_sync(self, agent_id: str, delta: int, status: str = None) -> bool:
+        """Thread-safe slot adjustment callable from sync (thread-pool) handlers.
+
+        Mirrors ``adjust_slots`` but uses ``_thread_lock`` so sync gRPC
+        servicers can mutate slot state without switching to the asyncio
+        loop. Callers must NOT mix this with ``adjust_slots`` for the same
+        agent in the same critical section — use one regime per call site.
+        """
+        with self._thread_lock:
+            agent = self.agents.get(agent_id)
+            if not agent:
+                return False
+            new_val = agent.slots_idle + delta
+            if delta >= 0:
+                agent.slots_idle = min(new_val, getattr(agent, "slots_total", new_val))
+            else:
+                agent.slots_idle = max(0, new_val)
+            if status is not None:
+                agent.status = status
+            else:
+                agent.status = "idle" if agent.slots_idle > 0 else "busy"
+            agent.last_heartbeat = time.time()
+            return True
+
     async def update_response_metrics(self, agent_id: str, latency_ms: float, success: bool):
         """Update running metrics after a response is received.
 
@@ -209,23 +244,28 @@ class AgentRegistry:
                 logger.debug(f"Agent {agent_id} profile changed: {old_profile} → {agent.agent_profile} "
                            f"(latency={agent.avg_latency_ms:.1f}ms, error_rate={agent.error_rate:.2%})")
 
-    async def remove_stale_agents(self, timeout_seconds: int = None) -> List[str]:
-        """Remove agents that haven't sent heartbeat"""
+    async def remove_stale_agents(self, timeout_seconds: int = None) -> List[tuple]:
+        """Remove agents that haven't sent heartbeat.
+
+        Returns list of (agent_id, grpc_address) tuples so callers can
+        clean up transport-layer caches (e.g. gRPC channel pools) that
+        are keyed by the agent URL, not the id.
+        """
         timeout = timeout_seconds or self.config.agent_timeout_seconds
         current_time = time.time()
-        stale_ids = []
+        stale = []
 
         async with self._lock:
             for agent_id, agent in list(self.agents.items()):
                 if current_time - agent.last_heartbeat > timeout:
                     logger.warning(f"Agent {agent_id} stale. Last heartbeat: {current_time - agent.last_heartbeat:.1f}s ago")
-                    stale_ids.append(agent_id)
+                    stale.append((agent_id, getattr(agent, "grpc_address", "") or ""))
                     self.agents.pop(agent_id, None)
 
-        if stale_ids:
-            logger.warning(f"Removed {len(stale_ids)} stale agents")
+        if stale:
+            logger.warning(f"Removed {len(stale)} stale agents")
 
-        return stale_ids
+        return stale
 
     async def select_agent(self, requirements: dict = None) -> Optional[AgentInfo]:
         """Select the best available agent based on requirements"""

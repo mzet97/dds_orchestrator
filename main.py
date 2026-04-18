@@ -250,6 +250,9 @@ async def main():
     # Start server
     try:
         await server.start()
+        # Start periodic scheduler cleanup so long benchmark runs don't leak
+        # completed-task memory indefinitely.
+        scheduler.start_cleanup_loop(interval_s=60, max_tasks=500, max_age_seconds=300)
 
         # Keep running
         logger.info("Orchestrator is running. Press Ctrl+C to stop.")
@@ -259,6 +262,7 @@ async def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
+        await scheduler.stop_cleanup_loop()
         await server.stop()
         if redis_mgr:
             await redis_mgr.close()

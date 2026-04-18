@@ -18,7 +18,6 @@ from models import AgentRegistration, AgentTaskRequest, TaskType, ChatMessage
 from registry import AgentRegistry, AgentInfo
 from scheduler import TaskScheduler, Task, TaskPriority
 from context import ContextManager
-from http_client import HTTPClient
 
 
 async def test_registry():
@@ -132,20 +131,6 @@ async def test_context_manager():
     print("[PASS] Context manager test passed!")
 
 
-async def test_http_client():
-    """Test HTTP client"""
-    print("\n=== Testing HTTP Client ===")
-
-    client = HTTPClient(timeout_seconds=10)
-
-    # Just test instantiation
-    async with client:
-        assert client is not None, "HTTP Client should be instantiated"
-        print("  HTTP Client created successfully")
-
-    print("[PASS] HTTP Client test passed!")
-
-
 async def main():
     """Run all tests"""
     print("=" * 50)
@@ -156,7 +141,6 @@ async def main():
         ("Registry", test_registry),
         ("Scheduler", test_scheduler),
         ("Context Manager", test_context_manager),
-        ("HTTP Client", test_http_client),
     ]
 
     passed = 0

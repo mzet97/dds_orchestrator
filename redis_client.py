@@ -4,6 +4,7 @@ Manages connections to K3s Homelab Redis Master
 Falls back to local in-memory storage if Redis is unavailable
 """
 
+import os
 import redis
 import logging
 import json
@@ -43,7 +44,7 @@ class RedisClient:
             self.redis_client = redis.Redis(
                 host=config.get("host", "192.168.1.51"),
                 port=config.get("port", 6379),
-                password=config.get("password", "Admin@123"),
+                password=config.get("password") or os.environ.get("REDIS_PASSWORD") or None,
                 db=config.get("db", 0),
                 decode_responses=config.get("decode_responses", True),
                 socket_timeout=config.get("socket_timeout", 5),
@@ -226,11 +227,16 @@ class RedisClient:
             return 0
 
     def subscribe(self, *channels):
-        """Subscribe to channels"""
+        """Subscribe to channels. Returns the PubSub object (or None) so the
+        caller can call get_message()/unsubscribe()/close() on it. Previously
+        we returned the result of `.subscribe()` (always None), which leaked
+        PubSub connections and made listeners unusable."""
         if not self.connected or not self.redis_client:
             logger.warning("Cannot subscribe in fallback mode")
             return None
-        return self.redis_client.pubsub().subscribe(*channels)
+        ps = self.redis_client.pubsub()
+        ps.subscribe(*channels)
+        return ps
 
     def info(self) -> Dict[str, Any]:
         """Get Redis info"""
@@ -290,10 +296,10 @@ def get_redis_client(config: Dict[str, Any] = None) -> RedisClient:
     if _redis_client is None:
         if config is None:
             config = {
-                "host": "192.168.1.51",
-                "port": 6379,
-                "password": "Admin@123",
-                "db": 0,
+                "host": os.environ.get("REDIS_HOST", "192.168.1.51"),
+                "port": int(os.environ.get("REDIS_PORT", "6379")),
+                "password": os.environ.get("REDIS_PASSWORD"),
+                "db": int(os.environ.get("REDIS_DB", "0")),
             }
         _redis_client = RedisClient(config)
 

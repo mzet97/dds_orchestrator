@@ -48,6 +48,18 @@ def _ensure_stubs():
         return False
 
 
+def _copy_messages_to_proto(messages, proto_req) -> None:
+    """Copy chat messages (dict or obj with role/content) into proto_req.messages."""
+    for msg in messages:
+        pm = proto_req.messages.add()
+        if isinstance(msg, dict):
+            pm.role = msg.get("role", "user")
+            pm.content = msg.get("content", "")
+        else:
+            pm.role = getattr(msg, "role", "user")
+            pm.content = getattr(msg, "content", "")
+
+
 @dataclass
 class AgentTaskRequest:
     """Task request to agent — mirrors dds.AgentTaskRequest"""
@@ -96,6 +108,14 @@ class GRPCLayer:
         self._agent_channels: Dict[str, grpc.aio.Channel] = {}
         # Agent stubs: agent_id -> stub
         self._agent_stubs: Dict[str, Any] = {}
+
+        # Async channel pool keyed by address for forward_to_instance round-robin.
+        # N channels per address mitigates HTTP/2 head-of-line blocking under
+        # concurrent inflight calls to the same agent.
+        self._aio_channel_pool: Dict[str, list] = {}
+        self._aio_rr_idx: Dict[str, int] = {}
+        self._aio_pool_lock = asyncio.Lock()
+        self._AIO_CHANNELS_PER_ADDR = 4
 
         # Server for receiving connections from agents
         self._server = None
@@ -165,11 +185,53 @@ class GRPCLayer:
             await channel.close()
         self._agent_channels.clear()
         self._agent_stubs.clear()
+
+        # Close pooled async channels used by forward_to_instance
+        async with self._aio_pool_lock:
+            for addr, channels in self._aio_channel_pool.items():
+                for ch in channels:
+                    try:
+                        await ch.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing pooled aio channel for {addr}: {e}")
+            self._aio_channel_pool.clear()
+            self._aio_rr_idx.clear()
+
         self.grpc_available = False
         logger.info("gRPC layer stopped")
 
-    async def unregister_agent(self, agent_id: str):
-        """Remove agent and close its gRPC channel to prevent resource leaks."""
+    async def _get_or_create_aio_channel(self, addr: str):
+        """Round-robin pooled grpc.aio.Channel for the given address.
+
+        Channels are created lazily and reused across calls. N channels per
+        address (configured via ``_AIO_CHANNELS_PER_ADDR``) keep concurrent
+        streams from serializing on HTTP/2 HOL blocking.
+        """
+        async with self._aio_pool_lock:
+            channels = self._aio_channel_pool.get(addr)
+            if channels is None:
+                opts = [
+                    ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                    ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                    ("grpc.keepalive_time_ms", 30000),
+                ]
+                channels = [
+                    grpc.aio.insecure_channel(addr, options=opts)
+                    for _ in range(self._AIO_CHANNELS_PER_ADDR)
+                ]
+                self._aio_channel_pool[addr] = channels
+                self._aio_rr_idx[addr] = 0
+            idx = self._aio_rr_idx[addr]
+            self._aio_rr_idx[addr] = (idx + 1) % len(channels)
+            return channels[idx]
+
+    async def unregister_agent(self, agent_id: str, grpc_url: str = None):
+        """Remove agent and close its gRPC channel(s) to prevent resource leaks.
+
+        If grpc_url is provided, also purge the sync channel pool entries
+        used by server.py for unary forwarding, plus the aio pool used by
+        forward_to_instance.
+        """
         if agent_id in self._agent_channels:
             try:
                 await self._agent_channels[agent_id].close()
@@ -178,14 +240,36 @@ class GRPCLayer:
             del self._agent_channels[agent_id]
         self._agent_stubs.pop(agent_id, None)
 
-        # Notify Orchestrator's internal sync channel pool if present
-        if hasattr(self, '_orchestrator_server') and hasattr(self._orchestrator_server, '_grpc_channel_pool'):
-            # The sync pool maps by URL, we need to clear matching ones
-            urls_to_remove = []
-            for url in self._orchestrator_server._grpc_channel_pool.keys():
-                # Naive matching: if we had a proper agent mapping we would use it,
-                # but closing it during next call attempt is also safe.
-                pass
+        if not grpc_url:
+            return
+
+        # Purge async pool entry (used by forward_to_instance)
+        async with self._aio_pool_lock:
+            aio_channels = self._aio_channel_pool.pop(grpc_url, [])
+            self._aio_rr_idx.pop(grpc_url, None)
+        for ch in aio_channels:
+            try:
+                await ch.close()
+            except Exception as e:
+                logger.warning(f"Error closing pooled aio channel for {grpc_url}: {e}")
+
+        # Purge sync pool entry (used by _process_grpc_client_request_sync in server.py)
+        srv = getattr(self, '_orchestrator_server', None)
+        pool = getattr(srv, '_grpc_channel_pool', None)
+        if pool is None or grpc_url not in pool:
+            return
+        pool_lock = getattr(srv, '_grpc_pool_lock', None)
+        if pool_lock is not None:
+            with pool_lock:
+                channels = pool.pop(grpc_url, [])
+                getattr(srv, '_grpc_rr_idx', {}).pop(grpc_url, None)
+        else:
+            channels = pool.pop(grpc_url, [])
+        for ch in channels:
+            try:
+                ch.close()
+            except Exception as e:
+                logger.warning(f"Error closing pooled gRPC channel for {grpc_url}: {e}")
 
     def _get_or_create_stub(self, agent_id: str, agent_url: str):
         """Get or create a gRPC stub for an agent."""
@@ -220,31 +304,35 @@ class GRPCLayer:
         """
         key = f"stream_{task_id}"
         if key not in self._pending_agent_responses:
-            event = asyncio.Event()
-            chunks = []  # list of chunk dicts
-            self._pending_agent_responses[key] = (event, chunks)
+            self._pending_agent_responses[key] = asyncio.Queue()
 
     async def stream_agent_response(self, task_id: str, timeout_ms: int = 120000):
         """Async generator that yields individual response chunks from agent.
-        Mirrors DDSLayer.stream_agent_response().
+
+        Chunks are pushed into an ``asyncio.Queue`` by ``publish_agent_request``
+        as they arrive from the agent, so this generator blocks on ``queue.get``
+        instead of 1 ms-polling a list.
         """
         key = f"stream_{task_id}"
         if key not in self._pending_agent_responses:
             self.prepare_stream_waiter(task_id)
 
+        queue = self._pending_agent_responses[key]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (timeout_ms / 1000)
 
-        while loop.time() < deadline:
-            if key in self._pending_agent_responses:
-                _, chunks = self._pending_agent_responses[key]
-                while chunks:
-                    chunk = chunks.pop(0)
-                    yield chunk
-                    if chunk.get("is_final", False):
-                        self._pending_agent_responses.pop(key, None)
-                        return
-            await asyncio.sleep(0.001)  # 1ms polling
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            yield chunk
+            if chunk.get("is_final", False):
+                self._pending_agent_responses.pop(key, None)
+                return
 
         # Timeout
         self._pending_agent_responses.pop(key, None)
@@ -278,14 +366,7 @@ class GRPCLayer:
             requires_context=request.requires_context,
             stream=request.stream,
         )
-        for msg in request.messages:
-            proto_msg = proto_req.messages.add()
-            if isinstance(msg, dict):
-                proto_msg.role = msg.get("role", "user")
-                proto_msg.content = msg.get("content", "")
-            else:
-                proto_msg.role = getattr(msg, "role", "user")
-                proto_msg.content = getattr(msg, "content", "")
+        _copy_messages_to_proto(request.messages, proto_req)
 
         try:
             if request.stream:
@@ -294,9 +375,9 @@ class GRPCLayer:
                 response_stream = stub.StreamTask(proto_req)
 
                 if stream_key in self._pending_agent_responses:
-                    # Per-chunk forwarding (SSE streaming path)
+                    # Per-chunk forwarding (SSE streaming path) via asyncio.Queue
+                    queue = self._pending_agent_responses.get(stream_key)
                     async for proto_resp in response_stream:
-                        _, chunks = self._pending_agent_responses.get(stream_key, (None, []))
                         chunk = {
                             "content": proto_resp.content,
                             "is_final": bool(proto_resp.is_final),
@@ -304,7 +385,8 @@ class GRPCLayer:
                             "completion_tokens": proto_resp.completion_tokens,
                             "processing_time_ms": proto_resp.processing_time_ms,
                         }
-                        chunks.append(chunk)
+                        if queue is not None:
+                            queue.put_nowait(chunk)
                         if proto_resp.is_final:
                             break
                 else:
@@ -408,41 +490,28 @@ class GRPCLayer:
                                    timeout_s: int = 120) -> dict:
         """Forward a request to an agent via gRPC (OrchestratorAgentService.SubmitTask).
 
-        Flow: Orchestrator → gRPC → Agent (agent_llm_grpc.py) → gRPC → llama-server
-        The agent acts as middleware, receiving via OrchestratorAgentService and
-        forwarding to llama-server via LlamaService.Chat.
-        """
-        try:
-            import grpc as _grpc
+        Uses a per-address pooled async channel so concurrent requests do not
+        pay the ~20-50 ms channel-setup cost and are not serialized by HTTP/2
+        HOL blocking on a single channel.
 
-            channel = _grpc.aio.insecure_channel(agent_grpc_addr)
+        Flow: Orchestrator → gRPC → Agent (agent_llm_grpc.py) → gRPC → llama-server
+        """
+        import grpc as _grpc
+
+        try:
+            channel = await self._get_or_create_aio_channel(agent_grpc_addr)
             stub = _pb2_grpc.OrchestratorAgentServiceStub(channel)
 
-            # Build AgentTaskRequest proto with ChatMessage repeated field
             proto_req = _pb2.AgentTaskRequest(
                 task_id=task_id,
                 max_tokens=request.max_tokens if hasattr(request, 'max_tokens') else 20,
                 temperature=request.temperature if hasattr(request, 'temperature') else 0.7,
                 stream=False,
             )
-            # Populate repeated ChatMessage field
             msgs = request.messages if isinstance(request.messages, list) else json.loads(request.messages_json)
-            for msg in msgs:
-                chat_msg = proto_req.messages.add()
-                # Accept dict, Pydantic ChatMessage, or any obj with role/content attrs
-                if isinstance(msg, dict):
-                    chat_msg.role = msg.get("role", "user")
-                    chat_msg.content = msg.get("content", "")
-                else:
-                    chat_msg.role = getattr(msg, "role", "user")
-                    chat_msg.content = getattr(msg, "content", "")
+            _copy_messages_to_proto(msgs, proto_req)
 
-            proto_resp = await asyncio.wait_for(
-                stub.SubmitTask(proto_req),
-                timeout=timeout_s,
-            )
-
-            await channel.close()
+            proto_resp = await stub.SubmitTask(proto_req, timeout=timeout_s)
 
             content = proto_resp.content if proto_resp.content else ""
             logger.info(f"gRPC forward response: task={task_id} content_len={len(content)} "
@@ -456,9 +525,12 @@ class GRPCLayer:
                 "completion_tokens": proto_resp.completion_tokens,
                 "success": proto_resp.success if hasattr(proto_resp, 'success') else bool(content),
             }
-        except asyncio.TimeoutError:
-            logger.error(f"gRPC timeout for task {task_id} to {agent_grpc_addr}")
-            return {"content": "", "error": "gRPC timeout"}
+        except _grpc.aio.AioRpcError as e:
+            if e.code() == _grpc.StatusCode.DEADLINE_EXCEEDED:
+                logger.error(f"gRPC timeout for task {task_id} to {agent_grpc_addr}")
+                return {"content": "", "error": "gRPC timeout"}
+            logger.error(f"gRPC forward to {agent_grpc_addr} failed: {e.code()} {e.details()}")
+            return {"content": "", "error": f"{e.code()}: {e.details()}"}
         except Exception as e:
             logger.error(f"gRPC forward to {agent_grpc_addr} failed: {e}")
             return {"content": "", "error": str(e)}
@@ -470,32 +542,16 @@ class GRPCLayer:
         while True:
             await asyncio.sleep(3600)  # effectively idle
 
-    # HTTP Fallback (reused from DDSLayer)
-    async def send_request_via_http(self, agent_url: str, request: dict,
-                                     timeout: int = 120) -> dict:
-        """Send request via HTTP fallback"""
-        import aiohttp
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{agent_url}/generate",
-                    json=request,
-                    timeout=aiohttp.ClientTimeout(total=timeout)
-                ) as response:
-                    return await response.json()
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return {"success": False, "error": str(e)}
-
     def is_available(self) -> bool:
         """Check if gRPC is available"""
         return self.grpc_available
 
     def close(self):
-        """Synchronous close (for cleanup)."""
-        self._agent_stubs.clear()
-        self._agent_channels.clear()
+        """Synchronous no-op — grpc.aio channels require `await self.stop()`.
+
+        Kept so that legacy sync shutdown paths do not crash; real cleanup
+        must go through `await self.stop()`.
+        """
         self.grpc_available = False
 
 
@@ -515,34 +571,7 @@ def _make_servicer_class():
                 message="OK"
             )
 
-        async def SubmitTask(self, request, context):
-            """Handle task submission from agent (reverse direction)."""
-            return _pb2.AgentTaskResponse(
-                task_id=request.task_id,
-                agent_id="orchestrator",
-                content="",
-                is_final=True,
-                success=False,
-                error_message="Orchestrator does not accept tasks via gRPC (use ClientOrchestratorService)",
-            )
-
     return _OrchestratorServicer
-
-
-def _make_client_servicer_class():
-    """Create async client-facing servicer (kept for compatibility, not currently used)."""
-    class _ClientServicer(_pb2_grpc.ClientOrchestratorServiceServicer):
-        def __init__(self, layer: GRPCLayer):
-            self._layer = layer
-
-        async def Chat(self, request, context):
-            return _pb2.ClientChatResponse(
-                request_id=request.request_id, content="",
-                is_final=True, success=False,
-                error_message="Use sync servicer",
-            )
-
-    return _ClientServicer
 
 
 def _make_client_servicer_class_sync():
@@ -618,8 +647,18 @@ def _make_client_servicer_class_sync():
                 return
 
             with registry._thread_lock:
-                agents = [a for a in registry.agents.values()
-                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
+                # Prefer agents serving the requested model (when given);
+                # fall back to any agent with idle slots. Pick the least
+                # loaded to spread streaming load across agents instead of
+                # piling onto agents[0] (previous behavior caused skewed
+                # benchmarks and ignored the `model` field entirely).
+                requested_model = (getattr(request, "model", "") or "").strip()
+                all_available = [a for a in registry.agents.values()
+                                 if a.slots_idle > 0 and a.status in ("idle", "busy")]
+                agents = [a for a in all_available if a.model == requested_model] \
+                         if requested_model else all_available
+                if not agents:
+                    agents = all_available  # no model match, fall back
                 if not agents:
                     yield _pb2.ClientChatResponse(
                         request_id=request.request_id, content="",
@@ -627,7 +666,7 @@ def _make_client_servicer_class_sync():
                         error_message="No agents available",
                     )
                     return
-                agent = agents[0]
+                agent = max(agents, key=lambda a: a.slots_idle)
                 agent.slots_idle = max(0, agent.slots_idle - 1)
                 if agent.slots_idle == 0:
                     agent.status = "busy"
@@ -658,7 +697,37 @@ def _make_client_servicer_class_sync():
                     pm.role = msg.role
                     pm.content = msg.content
 
-                channel = _grpc.insecure_channel(agent_url)
+                # Reuse the orchestrator's sync gRPC channel pool so we do
+                # not pay channel-setup cost per stream and avoid HTTP/2 HOL
+                # blocking on a single per-stream channel.
+                srv = getattr(layer, '_orchestrator_server', None)
+                pool = getattr(srv, '_grpc_channel_pool', None) if srv else None
+                pool_lock = getattr(srv, '_grpc_pool_lock', None) if srv else None
+                rr_idx = getattr(srv, '_grpc_rr_idx', None) if srv else None
+                channels_per = getattr(srv, '_GRPC_CHANNELS_PER_AGENT', 4) if srv else 4
+
+                if pool is not None and pool_lock is not None:
+                    with pool_lock:
+                        if agent_url not in pool:
+                            opts = [
+                                ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                                ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                                ("grpc.keepalive_time_ms", 30000),
+                            ]
+                            pool[agent_url] = [
+                                _grpc.insecure_channel(agent_url, options=opts)
+                                for _ in range(channels_per)
+                            ]
+                            rr_idx[agent_url] = 0
+                        channels = pool[agent_url]
+                        idx = rr_idx[agent_url]
+                        channel = channels[idx % len(channels)]
+                        rr_idx[agent_url] = idx + 1
+                    owns_channel = False
+                else:
+                    channel = _grpc.insecure_channel(agent_url)
+                    owns_channel = True
+
                 stub = _opb2_grpc.OrchestratorAgentServiceStub(channel)
                 try:
                     for agent_resp in stub.StreamTask(proto_req, timeout=120):
@@ -676,7 +745,8 @@ def _make_client_servicer_class_sync():
                         if agent_resp.is_final:
                             break
                 finally:
-                    channel.close()
+                    if owns_channel:
+                        channel.close()
             except Exception as e:
                 logger.error(f"StreamChat agent forward failed: {e}", exc_info=True)
                 yield _pb2.ClientChatResponse(
@@ -685,11 +755,6 @@ def _make_client_servicer_class_sync():
                     error_message=str(e),
                 )
             finally:
-                with registry._thread_lock:
-                    a = registry.agents.get(agent.agent_id)
-                    if a:
-                        a.slots_idle = min(a.slots_idle + 1, getattr(a, "slots_total", 1))
-                        if a.slots_idle > 0:
-                            a.status = "idle"
+                registry.adjust_slots_sync(agent.agent_id, delta=+1)
 
     return _ClientServicerSync
