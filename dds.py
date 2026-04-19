@@ -519,22 +519,23 @@ class DDSLayer:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (timeout_ms / 1000)
 
-        while loop.time() < deadline:
-            timeout = deadline - loop.time()
-            if timeout <= 0:
-                break
-            try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=timeout)
+        try:
+            while True:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    yield {"content": "", "is_final": True, "error": "timeout"}
+                    return
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    yield {"content": "", "is_final": True, "error": "timeout"}
+                    return
                 yield chunk
                 if chunk.get("is_final", False):
-                    self._pending_agent_responses.pop(key, None)
                     return
-            except asyncio.TimeoutError:
-                break
-
-        # Timeout
-        self._pending_agent_responses.pop(key, None)
-        yield {"content": "", "is_final": True, "error": "timeout"}
+        finally:
+            # Cleanup even if consumer abandons the generator mid-stream.
+            self._pending_agent_responses.pop(key, None)
 
     def start_dispatchers(self):
         """Start dedicated dispatch threads for DDS responses.

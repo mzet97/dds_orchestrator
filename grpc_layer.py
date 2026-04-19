@@ -321,22 +321,24 @@ class GRPCLayer:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + (timeout_ms / 1000)
 
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
-            yield chunk
-            if chunk.get("is_final", False):
-                self._pending_agent_responses.pop(key, None)
-                return
-
-        # Timeout
-        self._pending_agent_responses.pop(key, None)
-        yield {"content": "", "is_final": True, "error": "timeout"}
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    yield {"content": "", "is_final": True, "error": "timeout"}
+                    return
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    yield {"content": "", "is_final": True, "error": "timeout"}
+                    return
+                yield chunk
+                if chunk.get("is_final", False):
+                    return
+        finally:
+            # Ensures queue is released even if the consumer abandons the
+            # generator before is_final or timeout (e.g. SSE client disconnect).
+            self._pending_agent_responses.pop(key, None)
 
     async def publish_agent_request(self, request: AgentTaskRequest,
                                      agent_id: str = None,

@@ -345,15 +345,27 @@ class OrchestratorServer:
         logger.info(f"Processing DDS client request: {request_id} (priority={priority})")
 
         # Get available agent with retry+backoff (aligns with gRPC/HTTP behavior).
-        # Without retry, DDS rejects instantly under load, mismatching HTTP's
-        # queuing behavior and making the comparison unfair.
+        # Deadline mirrors gRPC path: honor client-supplied timeout_ms, capped
+        # by the orchestrator's task_timeout_seconds. Previously hardcoded 10s,
+        # which caused DDS to drop requests while HTTP/gRPC (120-300s deadlines)
+        # absorbed the same backlog — biasing comparison success rates.
         import asyncio as _asyncio
         agents = None
         loop = _asyncio.get_running_loop()
-        deadline = loop.time() + 10.0  # 10s max wait
+        _req_timeout_ms = getattr(req, "timeout_ms", 0) or 120000
+        _acquire_deadline_s = min(
+            _req_timeout_ms / 1000.0,
+            float(self.config.task_timeout_seconds),
+        )
+        deadline = loop.time() + _acquire_deadline_s
         delay = 0.005
         while loop.time() < deadline:
-            agents = await self.registry.get_available_agents()
+            # Transport filter: DDS entrypoint only picks agents that can
+            # actually serve DDS requests (requires CycloneDDS + DDS-enabled
+            # llama-server). Without this filter, an HTTP-only agent would be
+            # selected and the request would stall forever waiting on a DDS
+            # response that never comes.
+            agents = await self.registry.get_available_agents(transport="dds")
             if agents:
                 break
             await _asyncio.sleep(delay)
@@ -404,7 +416,7 @@ class OrchestratorServer:
                     await self.dds.publish_agent_request(dds_request, qos_profile=fuzzy_qos)
                     last_prompt = 0
                     last_completion = 0
-                    async for chunk in self.dds.stream_agent_response(request_id, timeout_ms=120000):
+                    async for chunk in self.dds.stream_agent_response(request_id, timeout_ms=_req_timeout_ms):
                         c_content = chunk.get("content", "") or ""
                         c_final = bool(chunk.get("is_final", False))
                         last_prompt = chunk.get("prompt_tokens", last_prompt)
@@ -428,7 +440,7 @@ class OrchestratorServer:
             self.dds.prepare_agent_response_waiter(request_id)
             try:
                 await self.dds.publish_agent_request(dds_request, qos_profile=fuzzy_qos)
-                agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=120000)
+                agent_response = await self.dds.wait_for_agent_response(request_id, timeout_ms=_req_timeout_ms)
             except Exception:
                 self.dds._pending_agent_responses.pop(request_id, None)
                 raise
@@ -506,59 +518,68 @@ class OrchestratorServer:
 
         logger.info(f"Processing gRPC client request (sync): {request_id}")
 
-        # Use InstancePool for slot acquisition (same as HTTP path) for fair
-        # protocol comparison. Falls back to AgentRegistry if no pool.
+        # Slot acquisition: InstancePool (if configured) or fair registry wait.
         instance = None
-        # Try InstancePool with retry+backoff (same strategy as HTTP path).
-        # Without retry, gRPC rejects instantly ("No agents available") when
-        # all slots are momentarily busy, causing 89%+ error rates under load.
         import asyncio as _asyncio
-        import time as _time
 
-        # Unified slot acquisition: probe InstancePool AND registry in the
-        # SAME loop, using the stored main event loop (not a fresh one per
-        # iteration). This mirrors the HTTP path (handle_chat) and avoids
-        # the cascaded 10s+5s deadlines that previously pinned gRPC latency
-        # at ~10.3s when the pool's Redis-backed state didn't resolve
-        # cross-loop.
+        # Fair slot acquisition: delegate to the same notification-based
+        # waiter the HTTP path uses (_wait_for_available_agent). The previous
+        # polling retry loop with 5ms→100ms exponential backoff caused
+        # starvation under c≥50 — ~11% of requests stuck 10-60s while others
+        # completed in 500-1000ms (bimodal distribution, spread 133× at c=50).
+        # Redis BLPOP / asyncio.Condition gives fair FIFO ordering instead.
         main_loop = getattr(self, "_main_loop", None)
         total_timeout = min(timeout_ms / 1000.0, float(self.config.task_timeout_seconds))
-        deadline = _time.time() + total_timeout
+        # Cap the slot-acquisition wait to fail fast when the cluster is broken
+        # (no agents, deadlocked queue) instead of waiting the full 120s task
+        # budget. 60s covers legitimate queue drain at c=250 with 8 slots
+        # (~250/8*700ms = 22s), while still cutting off pathological hangs.
+        wait_timeout = min(total_timeout, 60.0)
         agent = None
         fuzzy_qos = None
         fuzzy_strategy = None
-        delay = 0.005  # 5ms initial backoff, exponential cap at 100ms
 
-        while _time.time() < deadline:
-            # (1) Try InstancePool on the main loop with a short result timeout
-            if self.instance_pool and main_loop is not None and main_loop.is_running():
-                try:
-                    future = _asyncio.run_coroutine_threadsafe(
-                        self.instance_pool.select_instance(), main_loop)
-                    instance = future.result(timeout=0.2)  # 200ms, not 2s
-                except Exception:
-                    instance = None
-                if instance is not None:
-                    break
+        # (1) InstancePool (Redis-backed) first if available — it already
+        # blocks on Redis BLPOP, so no polling needed.
+        if self.instance_pool and main_loop is not None and main_loop.is_running():
+            try:
+                future = _asyncio.run_coroutine_threadsafe(
+                    self.instance_pool.select_instance(), main_loop)
+                instance = future.result(timeout=wait_timeout)
+            except Exception:
+                instance = None
 
-            # (2) Try registry in the same iteration (not a cascading fallback)
-            with self.registry._thread_lock:
-                agents = [a for a in self.registry.agents.values()
-                          if a.slots_idle > 0 and a.status in ("idle", "busy")]
-            if agents:
-                picked, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-                    agents, messages=messages, priority=priority)
+        # (2) Registry fair-wait — mirrors HTTP path, filters on transports=grpc
+        # so agents without a gRPC build (e.g. AMD ROCm 6.3 bfloat16 dup-symbols
+        # on RX6600M) are never selected.
+        if instance is None and main_loop is not None and main_loop.is_running():
+            try:
+                future = _asyncio.run_coroutine_threadsafe(
+                    self._wait_for_available_agent(
+                        timeout_s=wait_timeout,
+                        messages=messages,
+                        priority=priority,
+                        transport="grpc",
+                    ),
+                    main_loop,
+                )
+                agent, fuzzy_qos, fuzzy_strategy = future.result(timeout=wait_timeout + 1.0)
+            except Exception as e:
+                logger.warning(f"gRPC fair-wait failed: {e}")
+                agent, fuzzy_qos, fuzzy_strategy = None, None, None
+
+            # Decrement the chosen agent's slot atomically, mirroring handle_chat.
+            if agent is not None:
                 with self.registry._thread_lock:
-                    real_agent = self.registry.agents.get(picked.agent_id)
+                    real_agent = self.registry.agents.get(agent.agent_id)
                     if real_agent and real_agent.slots_idle > 0:
                         real_agent.slots_idle = max(0, real_agent.slots_idle - 1)
                         if real_agent.slots_idle == 0:
                             real_agent.status = "busy"
                         agent = real_agent
-                        break
-
-            _time.sleep(delay)
-            delay = min(delay * 2, 0.1)
+                    else:
+                        # Raced with another consumer — fall through to failure.
+                        agent = None
 
         if instance is None and agent is None:
             return {"content": "", "success": False, "error": "No agents available"}
@@ -662,7 +683,7 @@ class OrchestratorServer:
                     _asyncio.run_coroutine_threadsafe(
                         self.instance_pool.release_instance(instance.port, 0, True),
                         main_loop,
-                    ).result(timeout=5)
+                    ).result(timeout=30)
                 except Exception as e:
                     logger.warning(f"Failed to release instance slot {instance.port}: {e}")
             else:
@@ -755,6 +776,9 @@ class OrchestratorServer:
             slots_total=data.get("slots_total", data.get("slots_idle", 1)),
             vision_enabled=data.get("vision_enabled", False),
             capabilities=data.get("capabilities", []),
+            # transports defaults to ["http"] (universal); agents that can
+            # serve gRPC or DDS must declare it in their register payload.
+            transports=data.get("transports") or ["http"],
             grpc_address=data.get("grpc_address", ""),
             agent_profile=data.get("agent_profile", "balanced"),
             gpu_type=data.get("gpu_type", ""),
@@ -859,7 +883,7 @@ class OrchestratorServer:
                             "max_tokens": max_tokens,
                             "temperature": temperature,
                         },
-                        timeout=_aiohttp.ClientTimeout(total=30)
+                        timeout=_aiohttp.ClientTimeout(total=self.config.task_timeout_seconds)
                     ) as _resp:
                         http_result = await _resp.json()
 
@@ -918,7 +942,7 @@ class OrchestratorServer:
                             agent_id=agent.agent_id,
                             agent_grpc_url=agent.grpc_address,
                         )
-                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=task.timeout_ms)
                         if isinstance(response_data, dict) and response_data.get("error"):
                             error_msg = response_data.get("error")
                         else:
@@ -966,7 +990,7 @@ class OrchestratorServer:
                         self.dds.prepare_agent_response_waiter(task.task_id)
                         await self.dds.publish_agent_request(dds_request, priority=dds_priority,
                                                               qos_profile=fuzzy_qos)
-                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=task.timeout_ms)
 
                         content = ""
                         if isinstance(response_data, dict):
@@ -1005,7 +1029,7 @@ class OrchestratorServer:
                             "max_tokens": max_tokens,
                             "temperature": temperature,
                         },
-                        timeout=_aiohttp.ClientTimeout(total=30)
+                        timeout=_aiohttp.ClientTimeout(total=self.config.task_timeout_seconds)
                     ) as _resp:
                         http_result = await _resp.json()
 
@@ -1161,7 +1185,14 @@ class OrchestratorServer:
 
         if fanout_tasks:
             try:
-                done, pending = await asyncio.wait(fanout_tasks, return_when=asyncio.FIRST_COMPLETED, timeout=35)
+                # Fanout budget mirrors the request deadline (task.timeout_ms),
+                # so slow agents don't block the caller past its own budget.
+                _fanout_timeout_s = max(1.0, (task.timeout_ms or 120000) / 1000.0)
+                done, pending = await asyncio.wait(
+                    fanout_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=_fanout_timeout_s,
+                )
 
                 for task_coro in done:
                     try:
@@ -1228,6 +1259,17 @@ class OrchestratorServer:
         # gRPC/DDS have their own native entrypoints.
         protocol = "http"
 
+        # Deadline parity: derive a single per-request budget used for agent
+        # acquisition AND response receipt. Matches the DDS handler's budget
+        # policy (see _process_dds_client_request) so success rates aren't
+        # biased by inconsistent timeouts across transports.
+        _req_timeout_ms = int(data.get("timeout_ms", 120000) or 120000)
+        _req_timeout_ms = max(
+            1000,
+            min(_req_timeout_ms, self.config.task_timeout_seconds * 1000),
+        )
+        _wait_s = _req_timeout_ms / 1000.0
+
         # === Context Management ===
         # Extract or create session_id and retrieve conversation history
         session_id = data.get("session_id") or str(uuid.uuid4())
@@ -1256,7 +1298,7 @@ class OrchestratorServer:
         fuzzy_urgency = data.get("urgency")
         fuzzy_complexity = data.get("complexity")
         agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
-            timeout_s=300, messages=messages, priority=priority,
+            timeout_s=_wait_s, messages=messages, priority=priority,
             urgency=fuzzy_urgency, complexity=fuzzy_complexity,
         )
         if not agent:
@@ -1277,7 +1319,8 @@ class OrchestratorServer:
             agent_list.extend(additional_agents)
             logger.info(f"Strategy {fuzzy_strategy}: using agent pool of {len(agent_list)} agents")
 
-        # Create task
+        # Create task — propagate the request's deadline so downstream
+        # response waits use the same budget as the acquire phase.
         task = Task(
             task_id=f"task-{str(uuid.uuid4())}",
             task_type="chat",
@@ -1286,6 +1329,7 @@ class OrchestratorServer:
             temperature=temperature,
             priority=TaskScheduler._map_priority(priority),
             assigned_agent_id=agent.agent_id,
+            timeout_ms=_req_timeout_ms,
         )
 
         # Update agent status (atomic slot decrement, status auto-derived)
@@ -1294,7 +1338,7 @@ class OrchestratorServer:
             if await self.registry.adjust_slots(agent.agent_id, delta=-1):
                 break
             agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
-                timeout_s=300, messages=messages, priority=priority)
+                timeout_s=_wait_s, messages=messages, priority=priority)
             if not agent:
                 return web.json_response({"error": "Agent no longer available", "code": "AGENT_UNAVAILABLE"}, status=503)
         else:
@@ -1355,7 +1399,7 @@ class OrchestratorServer:
                         await sse_response.prepare(request)
 
                         try:
-                            async for chunk in self.grpc.stream_agent_response(task.task_id, timeout_ms=120000):
+                            async for chunk in self.grpc.stream_agent_response(task.task_id, timeout_ms=task.timeout_ms):
                                 content = chunk.get("content", "")
                                 is_final = chunk.get("is_final", False)
 
@@ -1392,7 +1436,7 @@ class OrchestratorServer:
                             agent_id=agent.agent_id,
                             agent_grpc_url=agent.grpc_address,
                         )
-                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        response_data = await self.grpc.wait_for_agent_response(task.task_id, timeout_ms=task.timeout_ms)
                         if isinstance(response_data, dict) and response_data.get("error"):
                             logger.warning(f"gRPC response error: {response_data.get('error')}")
                         else:
@@ -1444,7 +1488,7 @@ class OrchestratorServer:
                         await sse_response.prepare(request)
 
                         try:
-                            async for chunk in self.dds.stream_agent_response(task.task_id, timeout_ms=120000):
+                            async for chunk in self.dds.stream_agent_response(task.task_id, timeout_ms=task.timeout_ms):
                                 content = chunk.get("content", "")
                                 is_final = chunk.get("is_final", False)
 
@@ -1478,7 +1522,7 @@ class OrchestratorServer:
                         self.dds.prepare_agent_response_waiter(task.task_id)
                         await self.dds.publish_agent_request(dds_request, priority=dds_priority,
                                                               qos_profile=fuzzy_qos)
-                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=120000)
+                        response_data = await self.dds.wait_for_agent_response(task.task_id, timeout_ms=task.timeout_ms)
 
                         content = ""
                         if isinstance(response_data, dict):
@@ -1668,6 +1712,14 @@ class OrchestratorServer:
         task_id = f"task-{str(uuid.uuid4())}"
         instance = None
 
+        # Request deadline propagates to response waits so pool path behaves
+        # consistently with legacy handle_chat path.
+        _req_timeout_ms = int(data.get("timeout_ms", 120000) or 120000)
+        _req_timeout_ms = max(
+            1000,
+            min(_req_timeout_ms, self.config.task_timeout_seconds * 1000),
+        )
+
         try:
             # Select instance with retry + event-driven wait (Fix 4A).
             # When all slots are busy, wait for a slot:available BLPOP notification
@@ -1754,7 +1806,7 @@ class OrchestratorServer:
                     await sse_response.prepare(request)
                     stream_ok = True
                     try:
-                        async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=120000):
+                        async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=_req_timeout_ms):
                             content = chunk.get("content", "")
                             is_final = chunk.get("is_final", False)
                             if is_final and not content:
@@ -2006,8 +2058,15 @@ class OrchestratorServer:
         return agent, None, "single"
 
     async def _wait_for_available_agent(self, timeout_s=300, messages=None,
-                                         priority=5, urgency=None, complexity=None):
+                                         priority=5, urgency=None, complexity=None,
+                                         transport="http"):
         """Wait for an agent with idle slots using asyncio.Condition, then select using fuzzy or baseline.
+
+        Args:
+            transport: which transport the entrypoint requires — "http", "grpc",
+                or "dds". Agents that do not declare this transport are filtered
+                out. A heterogeneous cluster (e.g. AMD ROCm 6.3 without gRPC)
+                otherwise routes to an agent that silently stalls.
 
         Returns: (agent, qos_profile, strategy) or (None, None, None)
         """
@@ -2019,6 +2078,7 @@ class OrchestratorServer:
                 agents = [
                     agent for agent in self.registry.agents.values()
                     if agent.status == "idle" and agent.slots_idle > 0
+                    and transport in getattr(agent, "transports", ["http"])
                 ]
                 if agents:
                     # Found available agents, select outside the lock to avoid blocking
@@ -2060,12 +2120,19 @@ class OrchestratorServer:
         max_tokens = data.get("max_tokens", self.config.default_max_tokens)
         temperature = data.get("temperature", self.config.default_temperature)
 
-        # Selecionar agente e processar
-        available = await self.registry.get_available_agents()
-        if not available:
-            return web.json_response({"error": "No agents available"}, status=503)
-
-        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(available, messages=messages)
+        # Aguardar agente disponível (paridade com handle_chat; evita fail-fast
+        # quando um benchmark bate este endpoint sob carga — ver bug corrigido
+        # no DDS handler em 2026-04-18).
+        _req_timeout_ms = int(data.get("timeout_ms", 300000))
+        _wait_s = min(_req_timeout_ms / 1000.0, float(self.config.task_timeout_seconds))
+        agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
+            timeout_s=_wait_s, messages=messages, priority=data.get("priority", 5),
+        )
+        if not agent:
+            return web.json_response({
+                "error": "No agents available after timeout",
+                "code": "NO_AGENTS",
+            }, status=503)
         agent_url = f"http://{agent.hostname}:{agent.port}"
 
         if not await self.registry.adjust_slots(agent.agent_id, delta=-1):

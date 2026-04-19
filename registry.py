@@ -30,6 +30,13 @@ class AgentInfo:
     last_heartbeat: float = field(default_factory=time.time)
     registered_at: float = field(default_factory=time.time)
     capabilities: List[str] = field(default_factory=list)
+    # Transports this agent can actually serve requests on.
+    # Filled from the agent's registration payload. Selectors MUST
+    # filter on it — without this, the orchestrator will happily route
+    # a gRPC request to an agent whose llama-server has no gRPC build
+    # (observed: 97.8% failure rate on heterogeneous clusters).
+    # Defaults to ["http"] since every agent speaks HTTP.
+    transports: List[str] = field(default_factory=lambda: ["http"])
     llm_host: str = "localhost"  # Host da LLM que este agente gerencia
     llm_port: int = 8082  # Porta da LLM
     grpc_address: str = ""  # gRPC endpoint (host:port) if agent supports gRPC
@@ -145,12 +152,20 @@ class AgentRegistry:
         async with self._lock:
             return list(self.agents.values())
 
-    async def get_available_agents(self) -> List[AgentInfo]:
-        """Get agents that are idle and available"""
+    async def get_available_agents(self, transport: Optional[str] = None) -> List[AgentInfo]:
+        """Get agents that are idle and available.
+
+        When ``transport`` is given ("http"/"grpc"/"dds"), only agents whose
+        ``transports`` list declares support for it are returned. Without this
+        filter, heterogeneous clusters route requests to agents whose
+        llama-server has no matching build, producing silent failures.
+        """
         async with self._lock:
             return [
                 agent for agent in self.agents.values()
                 if agent.status == "idle" and agent.slots_idle > 0
+                and (transport is None
+                     or transport in getattr(agent, "transports", ["http"]))
             ]
 
     async def update_heartbeat(self, agent_id: str, status: str = None,
