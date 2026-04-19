@@ -552,24 +552,43 @@ class OrchestratorServer:
         # (2) Registry fair-wait — mirrors HTTP path, filters on transports=grpc
         # so agents without a gRPC build (e.g. AMD ROCm 6.3 bfloat16 dup-symbols
         # on RX6600M) are never selected.
+        #
+        # Retry on race loss (up to 3 times): fair-wait is advisory, the
+        # thread_lock decrement is authoritative. Under c≥50 concurrent requests
+        # several waiters see "slots_idle>0" at the same time and race to grab
+        # the same slot; without a retry the losers immediately return
+        # "No agents available" even though other slots may be free within
+        # milliseconds. HTTP path does the same retry (handle_chat line ~1337).
         if instance is None and main_loop is not None and main_loop.is_running():
-            try:
-                future = _asyncio.run_coroutine_threadsafe(
-                    self._wait_for_available_agent(
-                        timeout_s=wait_timeout,
-                        messages=messages,
-                        priority=priority,
-                        transport="grpc",
-                    ),
-                    main_loop,
-                )
-                agent, fuzzy_qos, fuzzy_strategy = future.result(timeout=wait_timeout + 1.0)
-            except Exception as e:
-                logger.warning(f"gRPC fair-wait failed: {e}")
-                agent, fuzzy_qos, fuzzy_strategy = None, None, None
+            import time as _time
+            race_deadline = _time.monotonic() + wait_timeout
+            for _attempt in range(3):
+                remaining = race_deadline - _time.monotonic()
+                if remaining <= 0:
+                    agent = None
+                    break
+                try:
+                    future = _asyncio.run_coroutine_threadsafe(
+                        self._wait_for_available_agent(
+                            timeout_s=remaining,
+                            messages=messages,
+                            priority=priority,
+                            transport="grpc",
+                        ),
+                        main_loop,
+                    )
+                    agent, fuzzy_qos, fuzzy_strategy = future.result(timeout=remaining + 1.0)
+                except Exception as e:
+                    logger.warning(f"gRPC fair-wait failed: {e}")
+                    agent = None
+                    break
 
-            # Decrement the chosen agent's slot atomically, mirroring handle_chat.
-            if agent is not None:
+                if agent is None:
+                    break
+
+                # Authoritative slot grab. If we race-lose, retry the fair-wait
+                # instead of giving up — another waiter got the slot, but a new
+                # slot may be available (or about to be).
                 with self.registry._thread_lock:
                     real_agent = self.registry.agents.get(agent.agent_id)
                     if real_agent and real_agent.slots_idle > 0:
@@ -577,9 +596,8 @@ class OrchestratorServer:
                         if real_agent.slots_idle == 0:
                             real_agent.status = "busy"
                         agent = real_agent
-                    else:
-                        # Raced with another consumer — fall through to failure.
-                        agent = None
+                        break  # Got slot
+                    agent = None  # Lost race, loop to re-wait
 
         if instance is None and agent is None:
             return {"content": "", "success": False, "error": "No agents available"}
