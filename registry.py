@@ -258,13 +258,11 @@ class AgentRegistry:
             agent.last_heartbeat = time.time()
             became_available = prev_slots == 0 and agent.slots_idle > 0
 
-        # Wake async waiters only on the 0→>0 edge. Notifying on every release
-        # (delta > 0) created a thundering herd: every completion woke all N
-        # waiters, which all re-contended the lock and re-read registry state,
-        # saturating the event loop under c=50+ load and starving the gRPC
-        # listener. Edge-triggered wake is enough — if slots > 0 already, any
-        # waiter that could proceed has already been woken by an earlier edge.
-        if became_available:
+        # Wake async waiters parked on agent_available_condition. Critical for
+        # the sync gRPC path: without this, the fair-waiter only unblocks on
+        # heartbeat/register and requests time out at the 60s wait cap while
+        # slots actually sit idle.
+        if became_available or delta > 0:
             self._notify_async_waiters_from_thread()
         return True
 
