@@ -73,31 +73,6 @@ class AgentRegistry:
         self.agent_available_condition = asyncio.Condition(self._lock)
         import threading
         self._thread_lock = threading.Lock()
-        # Main asyncio loop used to wake async waiters after sync slot
-        # adjustments. Set by the orchestrator after the loop starts.
-        self._main_loop = None
-
-    def bind_main_loop(self, loop) -> None:
-        """Attach the main asyncio loop so sync slot releases can notify
-        async waiters via call_soon_threadsafe."""
-        self._main_loop = loop
-
-    def _notify_async_waiters_from_thread(self) -> None:
-        """Schedule a condition notify on the main loop. No-op if the loop
-        is not bound yet (startup race). Safe to call from any thread."""
-        loop = self._main_loop
-        if loop is None or not loop.is_running():
-            return
-
-        async def _notify():
-            async with self.agent_available_condition:
-                self.agent_available_condition.notify_all()
-
-        try:
-            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_notify()))
-        except RuntimeError:
-            # Loop closing; drop the notify — no one will be waiting anyway.
-            pass
 
     async def register_agent(self, agent_info) -> str:
         """Register a new agent or update existing.
@@ -240,12 +215,10 @@ class AgentRegistry:
         loop. Callers must NOT mix this with ``adjust_slots`` for the same
         agent in the same critical section — use one regime per call site.
         """
-        became_available = False
         with self._thread_lock:
             agent = self.agents.get(agent_id)
             if not agent:
                 return False
-            prev_slots = agent.slots_idle
             new_val = agent.slots_idle + delta
             if delta >= 0:
                 agent.slots_idle = min(new_val, getattr(agent, "slots_total", new_val))
@@ -256,15 +229,7 @@ class AgentRegistry:
             else:
                 agent.status = "idle" if agent.slots_idle > 0 else "busy"
             agent.last_heartbeat = time.time()
-            became_available = prev_slots == 0 and agent.slots_idle > 0
-
-        # Wake async waiters parked on agent_available_condition. Critical for
-        # the sync gRPC path: without this, the fair-waiter only unblocks on
-        # heartbeat/register and requests time out at the 60s wait cap while
-        # slots actually sit idle.
-        if became_available or delta > 0:
-            self._notify_async_waiters_from_thread()
-        return True
+            return True
 
     async def update_response_metrics(self, agent_id: str, latency_ms: float, success: bool):
         """Update running metrics after a response is received.

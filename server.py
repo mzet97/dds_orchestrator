@@ -90,13 +90,6 @@ class OrchestratorServer:
         # a fixed ~10s spin in _process_grpc_client_request_sync.
         self._main_loop = asyncio.get_running_loop()
 
-        # Let the registry wake async fair-waiters from sync slot releases
-        # (gRPC sync servicer path). Without this, adjust_slots_sync adds
-        # slots without notifying asyncio.Condition, so requests time out
-        # at the 60s wait cap while slots actually sit idle.
-        if hasattr(self.registry, "bind_main_loop"):
-            self.registry.bind_main_loop(self._main_loop)
-
         # Shared aiohttp session — created once and reused across handlers.
         # Per-request ClientSession() costs ~1-3 ms of connector setup and
         # prevents HTTP keep-alive across requests, which is significant on
