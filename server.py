@@ -89,6 +89,9 @@ class OrchestratorServer:
         # loop per call (via asyncio.run) would break Redis state and cause
         # a fixed ~10s spin in _process_grpc_client_request_sync.
         self._main_loop = asyncio.get_running_loop()
+        # Wire registry so sync-path slot releases can notify async
+        # fair-waiters without waiting for the 5s heartbeat tick.
+        self.registry.bind_main_loop(self._main_loop)
 
         # Shared aiohttp session — created once and reused across handlers.
         # Per-request ClientSession() costs ~1-3 ms of connector setup and

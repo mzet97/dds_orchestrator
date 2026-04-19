@@ -73,6 +73,36 @@ class AgentRegistry:
         self.agent_available_condition = asyncio.Condition(self._lock)
         import threading
         self._thread_lock = threading.Lock()
+        # Main asyncio loop used to wake async waiters after sync slot
+        # releases (gRPC sync path). Without this, waiters only unblock on
+        # heartbeat (every 5s) → throughput capped at ~0.2 req/s for the
+        # backlog while slots actually sit idle. Set by server.start().
+        self._main_loop = None
+
+    def bind_main_loop(self, loop) -> None:
+        """Attach the main asyncio loop so sync slot releases can notify
+        async waiters via call_soon_threadsafe."""
+        self._main_loop = loop
+
+    def _notify_one_from_thread(self) -> None:
+        """Wake exactly one async fair-waiter from a sync context.
+
+        Uses notify(1) — not notify_all — to avoid thundering herd: one
+        released slot should wake one waiter, which will grab it. Other
+        waiters stay parked until the next release.
+        """
+        loop = self._main_loop
+        if loop is None or not loop.is_running():
+            return
+
+        async def _notify():
+            async with self.agent_available_condition:
+                self.agent_available_condition.notify(1)
+
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_notify()))
+        except RuntimeError:
+            pass
 
     async def register_agent(self, agent_info) -> str:
         """Register a new agent or update existing.
@@ -215,10 +245,12 @@ class AgentRegistry:
         loop. Callers must NOT mix this with ``adjust_slots`` for the same
         agent in the same critical section — use one regime per call site.
         """
+        freed_slot = False
         with self._thread_lock:
             agent = self.agents.get(agent_id)
             if not agent:
                 return False
+            prev_idle = agent.slots_idle
             new_val = agent.slots_idle + delta
             if delta >= 0:
                 agent.slots_idle = min(new_val, getattr(agent, "slots_total", new_val))
@@ -229,7 +261,15 @@ class AgentRegistry:
             else:
                 agent.status = "idle" if agent.slots_idle > 0 else "busy"
             agent.last_heartbeat = time.time()
-            return True
+            freed_slot = (agent.slots_idle > prev_idle) and (agent.status == "idle")
+
+        # Wake exactly one fair-waiter per freed slot. Without this,
+        # sync gRPC releases rely on the 5s heartbeat to notify, which
+        # caps backlog drain at ~0.2 req/s. Using notify(1) (not
+        # notify_all) avoids thundering herd: 1 release → 1 wake.
+        if freed_slot:
+            self._notify_one_from_thread()
+        return True
 
     async def update_response_metrics(self, agent_id: str, latency_ms: float, success: bool):
         """Update running metrics after a response is received.
