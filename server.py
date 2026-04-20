@@ -535,10 +535,10 @@ class OrchestratorServer:
         main_loop = getattr(self, "_main_loop", None)
         total_timeout = min(timeout_ms / 1000.0, float(self.config.task_timeout_seconds))
         # Cap the slot-acquisition wait to fail fast when the cluster is broken
-        # (no agents, deadlocked queue) instead of waiting the full 120s task
-        # budget. 60s covers legitimate queue drain at c=250 with 8 slots
-        # (~250/8*700ms = 22s), while still cutting off pathological hangs.
-        wait_timeout = min(total_timeout, 60.0)
+        # (no agents, deadlocked queue) instead of waiting the full task budget.
+        # Default 60s covers legitimate queue drain at c=250 with 8 slots
+        # (~250/8*700ms = 22s). Tune via config.fair_wait_cap_seconds.
+        wait_timeout = min(total_timeout, float(self.config.fair_wait_cap_seconds))
         agent = None
         fuzzy_qos = None
         fuzzy_strategy = None
@@ -705,7 +705,7 @@ class OrchestratorServer:
                     _asyncio.run_coroutine_threadsafe(
                         self.instance_pool.release_instance(instance.port, 0, True),
                         main_loop,
-                    ).result(timeout=30)
+                    ).result(timeout=self.config.slot_release_timeout_seconds)
                 except Exception as e:
                     logger.warning(f"Failed to release instance slot {instance.port}: {e}")
             else:

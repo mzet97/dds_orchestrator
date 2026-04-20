@@ -28,6 +28,13 @@ class OrchestratorConfig:
     # Task settings
     max_concurrent_tasks: int = 2000
     task_timeout_seconds: int = 120
+    # Cap for fair-wait slot acquisition (fails fast on cluster deadlock
+    # instead of waiting the whole task budget).
+    fair_wait_cap_seconds: int = 60
+    # Timeout for sync bridge to release a slot (run_coroutine_threadsafe
+    # from gRPC worker thread). Should be comfortably > expected event
+    # loop queue latency, generous enough to survive GC pauses.
+    slot_release_timeout_seconds: int = 30
 
     # gRPC settings
     grpc_enabled: bool = False
@@ -76,6 +83,8 @@ class OrchestratorConfig:
         "agent_timeout_seconds": int,
         "max_concurrent_tasks": int,
         "task_timeout_seconds": int,
+        "fair_wait_cap_seconds": int,
+        "slot_release_timeout_seconds": int,
         "log_level": str,
         "default_model": str,
         "default_max_tokens": int,
