@@ -1791,11 +1791,22 @@ class OrchestratorServer:
             # Resolve agent_id from instance hostname so the DDS agent can
             # filter and only process requests meant for it (avoids broadcast
             # overhead where all agents deserialize every request).
+            # Also capture the agent's HTTP proxy endpoint so the HTTP path
+            # below can route through the agent (not direct to llama-server).
             _target_agent_id = ""
+            _target_agent = None
             for _a in (await self.registry.get_all_agents()):
-                if _a.hostname == instance.hostname:
+                if _a.hostname != instance.hostname:
+                    continue
+                # Prefer an exact match on llm_port when available (multi-agent
+                # hosts), fall back to the first agent on the hostname.
+                if getattr(_a, "llm_port", None) == instance.port:
                     _target_agent_id = _a.agent_id
+                    _target_agent = _a
                     break
+                if _target_agent is None:
+                    _target_agent_id = _a.agent_id
+                    _target_agent = _a
 
             dds_request = AgentTaskRequest(
                 task_id=task_id,
@@ -1951,14 +1962,26 @@ class OrchestratorServer:
                 })
 
             # ── HTTP Path (default) ───────────────────────────────────
-            # Orchestrator → HTTP → llama-server directly
+            # Orchestrator → agent HTTP proxy → llama-server.
+            # Routing through the agent keeps the HTTP path symmetrical
+            # with DDS/gRPC (same number of hops) so benchmarks compare
+            # like-for-like, and lets the agent own future prompt/context
+            # decoration.
             else:
                 content = ""
                 success = False
-                agent_url = f"http://{instance.hostname}:{instance.port}"
+                if _target_agent is not None:
+                    agent_url = f"http://{_target_agent.hostname}:{_target_agent.port}"
+                    endpoint = f"{agent_url}/chat"
+                else:
+                    # No agent registered on the instance hostname — fall
+                    # back to the direct llama-server URL so single-node
+                    # dev setups keep working.
+                    agent_url = f"http://{instance.hostname}:{instance.port}"
+                    endpoint = f"{agent_url}/v1/chat/completions"
                 try:
                     async with self._pool_session.post(
-                        f"{agent_url}/v1/chat/completions",
+                        endpoint,
                         json={"messages": messages, "max_tokens": max_tokens,
                               "temperature": temperature},
                     ) as _resp:
@@ -1971,7 +1994,7 @@ class OrchestratorServer:
                 except Exception as e:
                     content = ""
                     success = False
-                    logger.error(f"HTTP to instance :{instance.port} failed: {e}")
+                    logger.error(f"HTTP to {endpoint} failed: {e}")
 
                 latency_ms = (_time.time() - t_start) * 1000
                 inst_port = instance.port
