@@ -292,8 +292,12 @@ class OrchestratorServer:
                         except asyncio.QueueEmpty:
                             break
                 else:
-                    await asyncio.sleep(0.001)  # Poll every 1ms
+                    # Fallback polling path (only hit when listener attach fails).
+                    # 1ms sleep here generated 1000 wakeups/s on the event loop
+                    # — wasteful since the fallback is rare and read_client_requests
+                    # already has a 100ms take() timeout that yields naturally.
                     if not self.dds.is_available():
+                        await asyncio.sleep(0.05)
                         continue
                     client_requests = await self.dds.read_client_requests(timeout_ms=100)
 

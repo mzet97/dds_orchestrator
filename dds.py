@@ -350,14 +350,15 @@ class DDSLayer:
             logger.debug(f"DDS unavailable, skipping publish to {topic}")
             return
 
-        # Use DDS writer if available
+        # Use DDS writer if available. Offload sync .write() to a worker
+        # thread so it never blocks the event loop (heartbeat bursts, status
+        # updates) — same rationale as publish_agent_request.
         if topic in self.publishers:
             try:
                 topic_type = self._topic_types.get(topic)
                 if topic_type:
-                    # Create message instance with all fields via constructor
                     msg = topic_type(**data)
-                    self.publishers[topic].write(msg)
+                    await asyncio.to_thread(self.publishers[topic].write, msg)
                     logger.debug(f"Published to {topic}: {data}")
             except Exception as e:
                 logger.error(f"Failed to publish to {topic}: {e}")
@@ -962,7 +963,11 @@ class DDSLayer:
             return
         if TOPIC_CLIENT_RESPONSE in self.publishers:
             try:
-                self.publishers[TOPIC_CLIENT_RESPONSE].write(response)
+                # Offload sync DDS write to a worker thread (every response
+                # passes through here; blocking would serialize the loop).
+                await asyncio.to_thread(
+                    self.publishers[TOPIC_CLIENT_RESPONSE].write, response
+                )
                 logger.info(f"Published client response to {TOPIC_CLIENT_RESPONSE}")
             except Exception as e:
                 logger.error(f"Failed to publish client response: {e}")

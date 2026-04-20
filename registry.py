@@ -78,6 +78,8 @@ class AgentRegistry:
         # heartbeat (every 5s) → throughput capped at ~0.2 req/s for the
         # backlog while slots actually sit idle. Set by server.start().
         self._main_loop = None
+        # Strong refs to in-flight notify tasks — prevents GC reaping.
+        self._pending_notifies: set = set()
 
     def bind_main_loop(self, loop) -> None:
         """Attach the main asyncio loop so sync slot releases can notify
@@ -100,7 +102,12 @@ class AgentRegistry:
                 self.agent_available_condition.notify(1)
 
         try:
-            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_notify()))
+            # Store task reference so GC doesn't reap it mid-wait.
+            def _schedule():
+                task = asyncio.ensure_future(_notify())
+                self._pending_notifies.add(task)
+                task.add_done_callback(self._pending_notifies.discard)
+            loop.call_soon_threadsafe(_schedule)
         except RuntimeError:
             pass
 

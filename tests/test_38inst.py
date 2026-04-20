@@ -117,7 +117,9 @@ async def _redis_available():
 
 redis_available = False
 try:
-    redis_available = asyncio.get_event_loop().run_until_complete(_redis_available())
+    # asyncio.get_event_loop() is deprecated when no loop is running (3.10+);
+    # use asyncio.run directly — it creates, runs, and closes a fresh loop.
+    redis_available = asyncio.run(_redis_available())
 except Exception:
     try:
         redis_available = asyncio.run(_redis_available())
@@ -247,7 +249,7 @@ async def _mongo_available():
 
 mongo_available = False
 try:
-    mongo_available = asyncio.get_event_loop().run_until_complete(_mongo_available())
+    mongo_available = asyncio.run(_mongo_available())
 except Exception:
     try:
         mongo_available = asyncio.run(_mongo_available())
