@@ -347,45 +347,38 @@ class OrchestratorServer:
 
         logger.info(f"Processing DDS client request: {request_id} (priority={priority})")
 
-        # Get available agent with retry+backoff (aligns with gRPC/HTTP behavior).
-        # Deadline mirrors gRPC path: honor client-supplied timeout_ms, capped
-        # by the orchestrator's task_timeout_seconds. Previously hardcoded 10s,
-        # which caused DDS to drop requests while HTTP/gRPC (120-300s deadlines)
-        # absorbed the same backlog — biasing comparison success rates.
-        import asyncio as _asyncio
-        agents = None
-        loop = _asyncio.get_running_loop()
+        # Fair-wait for an available DDS agent. Previously a busy-poll loop
+        # (5ms→100ms exponential backoff) fired here, which:
+        #   1. didn't preserve FIFO — racing waiters recomputed the candidate
+        #      list every tick, starving some requests under heavy contention
+        #      (root cause of p99=26-56s at c=50/100 with 100% success);
+        #   2. didn't wake on slot release — a waiter could miss a freed slot
+        #      by up to 100ms;
+        #   3. raced with other coroutines on adjust_slots(-1).
+        # _wait_for_available_agent uses asyncio.Condition → wake-on-release
+        # with FIFO ordering, the same regime HTTP/gRPC handlers use.
         _req_timeout_ms = getattr(req, "timeout_ms", 0) or 120000
         _acquire_deadline_s = min(
             _req_timeout_ms / 1000.0,
             float(self.config.task_timeout_seconds),
         )
-        deadline = loop.time() + _acquire_deadline_s
-        delay = 0.005
-        while loop.time() < deadline:
-            # Transport filter: DDS entrypoint only picks agents that can
-            # actually serve DDS requests (requires CycloneDDS + DDS-enabled
-            # llama-server). Without this filter, an HTTP-only agent would be
-            # selected and the request would stall forever waiting on a DDS
-            # response that never comes.
-            agents = await self.registry.get_available_agents(transport="dds")
-            if agents:
-                break
-            await _asyncio.sleep(delay)
-            delay = min(delay * 2, 0.1)
-        if not agents:
+        agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
+            timeout_s=_acquire_deadline_s,
+            messages=messages,
+            priority=priority,
+            transport="dds",
+        )
+        if agent is None:
             await self._send_dds_client_response(request_id, client_id, "", success=0, error="No agents available")
             return
-
-        # Select agent: fuzzy if enabled, otherwise max idle slots
-        # Priority maps to urgency; complexity is auto-estimated from messages
-        agent, fuzzy_qos, fuzzy_strategy = self._select_with_fuzzy(
-            agents, messages=messages, priority=priority)
         logger.info(f"Selected agent: {agent.agent_id} (fuzzy_qos={fuzzy_qos}, strategy={fuzzy_strategy})")
 
-        # Acquire agent slot (status auto-derived: idle if slots remain, busy if 0)
+        # Acquire agent slot. adjust_slots returns False only if the agent was
+        # removed (heartbeat timeout) between selection and acquisition — a
+        # race we treat as rare. The fair-wait above already guarantees a slot
+        # was idle at wake time; a concurrent waiter stealing it would leave
+        # slots_idle at 0, so we also guard against that.
         if not await self.registry.adjust_slots(agent.agent_id, delta=-1):
-            # Agent was removed between selection and slot acquisition
             await self._send_dds_client_response(request_id, client_id, "", success=0, error="Agent no longer available")
             return
 
@@ -405,7 +398,11 @@ class OrchestratorServer:
                 task_type="chat",
                 messages=messages,
                 priority=priority,
-                timeout_ms=60000,
+                # Forward client-supplied deadline (capped by orchestrator
+                # timeout) instead of hardcoded 60s. A 120s client timeout
+                # paired with a 60s agent timeout silently truncated long
+                # inferences under backlog.
+                timeout_ms=int(_req_timeout_ms),
                 requires_context=False,
                 max_tokens=req_max_tokens,
                 temperature=req_temperature,
