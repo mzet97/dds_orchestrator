@@ -1743,14 +1743,21 @@ class OrchestratorServer:
         )
 
         try:
-            # Select instance with retry + event-driven wait (Fix 4A).
-            # When all slots are busy, wait for a slot:available BLPOP notification
-            # instead of spinning with asyncio.sleep — reduces CPU and improves
-            # responsiveness (wakes up as soon as any slot is released).
-            queue_timeout = self.config.task_timeout_seconds
+            # Select instance with event-driven wait (Fix 4A + wave-3 cleanup).
+            # When all slots are busy, BLPOP on slot:available wakes as soon as
+            # any slot is released. We pass the full remaining deadline (capped
+            # at fair_wait_cap_seconds so a stuck Redis doesn't pin the worker)
+            # instead of the old 5ms→100ms doubling that forced ~10 redundant
+            # Redis round-trips per queued request. Fallback path (no redis)
+            # keeps the exponential backoff.
+            queue_timeout = min(
+                self.config.task_timeout_seconds,
+                self.config.fair_wait_cap_seconds,
+            )
             loop = asyncio.get_running_loop()
             deadline = loop.time() + queue_timeout
             delay = 0.005  # 5ms initial (used only when redis_mgr is absent)
+            use_blpop = self.redis_mgr and hasattr(self.redis_mgr, "wait_slot_available")
             while True:
                 instance = await self.instance_pool.select_instance()
                 if instance:
@@ -1761,12 +1768,13 @@ class OrchestratorServer:
                         {"error": "All instances at capacity", "code": "NO_CAPACITY"},
                         status=503,
                     )
-                wait_time = min(delay, remaining)
-                if self.redis_mgr and hasattr(self.redis_mgr, "wait_slot_available"):
-                    await self.redis_mgr.wait_slot_available(wait_time)
+                if use_blpop:
+                    # BLPOP blocks until notify-push or timeout; pass the full
+                    # remaining budget so we don't round-trip Redis unnecessarily.
+                    await self.redis_mgr.wait_slot_available(remaining)
                 else:
-                    await asyncio.sleep(wait_time)
-                delay = min(delay * 2, 0.1)  # cap at 100ms
+                    await asyncio.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 0.1)  # cap at 100ms
 
             # Circuit breaker disabled for benchmark fairness — all protocols
             # share the same instances and false-negative content detection
