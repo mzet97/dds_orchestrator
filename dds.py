@@ -786,6 +786,9 @@ class DDSLayer:
         # Fix 2A: use per-agent partition writer when target_agent_id is set.
         # The partitioned DataWriter delivers only to the matching agent's reader,
         # eliminating broadcast overhead (all agents deserializing all requests).
+        # CycloneDDS writes are sync. Under concurrent load, calling .write()
+        # directly blocks the event loop for ~1-10ms per call, which caps
+        # orchestrator throughput. asyncio.to_thread offloads to a worker.
         target = data.get("target_agent_id", "")
         if target:
             pw = self._get_partition_writer(target)
@@ -794,7 +797,7 @@ class DDSLayer:
                     topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
                     if topic_type:
                         msg = topic_type(**data)
-                        pw.write(msg)
+                        await asyncio.to_thread(pw.write, msg)
                         logger.debug(f"Published to {TOPIC_AGENT_REQUEST} via partition '{target}'")
                         return
                 except Exception as e:
@@ -808,7 +811,7 @@ class DDSLayer:
                     topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
                     if topic_type:
                         msg = topic_type(**data)
-                        writer.write(msg)
+                        await asyncio.to_thread(writer.write, msg)
                         logger.debug(f"Published to {TOPIC_AGENT_REQUEST} with QoS profile={qos_profile}")
                         return
                 except Exception as e:
@@ -822,7 +825,7 @@ class DDSLayer:
                     topic_type = self._topic_types.get(TOPIC_AGENT_REQUEST)
                     if topic_type:
                         msg = topic_type(**data)
-                        writer.write(msg)
+                        await asyncio.to_thread(writer.write, msg)
                         logger.debug(f"Published to {TOPIC_AGENT_REQUEST} with TRANSPORT_PRIORITY={priority}")
                         return
                 except Exception as e:
