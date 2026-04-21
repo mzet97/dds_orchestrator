@@ -96,7 +96,7 @@ async def test_execute_with_retry_success_on_second_attempt(mock_config, mock_ag
         [{"role": "user", "content": "Hello"}],
         [{"role": "user", "content": "Hello"}],
         100, 0.7, 5,
-        "balanced", "ctx-123", "session-123"
+        "balanced", "ctx-123", "session-123", "http"
     )
 
     # Verify success on retry
@@ -133,7 +133,7 @@ async def test_execute_with_retry_all_attempts_fail(mock_config, mock_agents, mo
         [{"role": "user", "content": "Hello"}],
         [{"role": "user", "content": "Hello"}],
         100, 0.7, 5,
-        "balanced", "ctx-123", "session-123"
+        "balanced", "ctx-123", "session-123", "http"
     )
 
     # All attempts failed - should return empty
@@ -173,7 +173,7 @@ async def test_execute_fanout_first_agent_wins(mock_config, mock_agents, mock_ta
         [{"role": "user", "content": "Hello"}],
         [{"role": "user", "content": "Hello"}],
         100, 0.7, 5,
-        "balanced", "ctx-123", "session-123", dds_priority=0
+        "balanced", "ctx-123", "session-123", "http", dds_priority=0
     )
 
     # First agent should win (fastest response)
@@ -215,7 +215,7 @@ async def test_execute_fanout_releases_slots(mock_config, mock_agents, mock_task
         [{"role": "user", "content": "Hello"}],
         [{"role": "user", "content": "Hello"}],
         100, 0.7, 5,
-        "balanced", "ctx-123", "session-123"
+        "balanced", "ctx-123", "session-123", "http"
     )
 
     # Should have acquired and released slots
@@ -242,7 +242,7 @@ async def test_execute_fanout_with_single_agent():
         [],  # messages
         [],  # all_messages
         100, 0.7, 5,
-        "balanced", "ctx-123", "session-123"
+        "balanced", "ctx-123", "session-123", "http"
     )
 
     assert response_content == ""

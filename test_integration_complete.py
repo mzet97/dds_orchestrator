@@ -40,8 +40,8 @@ class TestContextManagerPersistence:
 
         # First request
         context_id_1 = await context_manager.get_or_create_for_user(session_id)
-        await context_manager.add_message(context_id_1, "user", "Hello")
-        await context_manager.add_message(context_id_1, "assistant", "Hi there!")
+        await context_manager.add_message(context_id_1, ChatMessage(role="user", content="Hello"))
+        await context_manager.add_message(context_id_1, ChatMessage(role="assistant", content="Hi there!"))
 
         # Second request - should get same context with history
         context_id_2 = await context_manager.get_or_create_for_user(session_id)
@@ -62,7 +62,7 @@ class TestContextManagerPersistence:
 
         # Add more messages than max (5)
         for i in range(8):
-            await context_manager.add_message(context_id, "user", f"Message {i}")
+            await context_manager.add_message(context_id, ChatMessage(role="user", content=f"Message {i}"))
 
         messages = await context_manager.get_messages(context_id)
 
@@ -81,8 +81,8 @@ class TestContextManagerPersistence:
         context_1 = await context_manager.get_or_create_for_user(session_1)
         context_2 = await context_manager.get_or_create_for_user(session_2)
 
-        await context_manager.add_message(context_1, "user", "Session A message")
-        await context_manager.add_message(context_2, "user", "Session B message")
+        await context_manager.add_message(context_1, ChatMessage(role="user", content="Session A message"))
+        await context_manager.add_message(context_2, ChatMessage(role="user", content="Session B message"))
 
         msgs_1 = await context_manager.get_messages(context_1)
         msgs_2 = await context_manager.get_messages(context_2)
@@ -98,7 +98,7 @@ class TestContextManagerPersistence:
         session_id = "test-session-3"
         context_id = await context_manager.get_or_create_for_user(session_id)
 
-        await context_manager.add_message(context_id, "user", "Test")
+        await context_manager.add_message(context_id, ChatMessage(role="user", content="Test"))
         messages = await context_manager.get_messages(context_id)
         assert len(messages) == 1
 
@@ -348,9 +348,9 @@ class TestAgentListPreparation:
     def test_single_strategy_uses_one_agent(self):
         """single strategy should use only primary agent"""
         agents = [
-            AgentInfo(agent_id="agent-1"),
-            AgentInfo(agent_id="agent-2"),
-            AgentInfo(agent_id="agent-3"),
+            AgentInfo(agent_id="agent-1", hostname="h1", port=8001, model="m"),
+            AgentInfo(agent_id="agent-2", hostname="h2", port=8002, model="m"),
+            AgentInfo(agent_id="agent-3", hostname="h3", port=8003, model="m"),
         ]
         primary_agent = agents[0]
         strategy = "single"
@@ -363,9 +363,9 @@ class TestAgentListPreparation:
     def test_retry_strategy_prepares_pool(self):
         """retry strategy should prepare pool of agents"""
         agents = [
-            AgentInfo(agent_id="agent-1"),
-            AgentInfo(agent_id="agent-2"),
-            AgentInfo(agent_id="agent-3"),
+            AgentInfo(agent_id="agent-1", hostname="h1", port=8001, model="m"),
+            AgentInfo(agent_id="agent-2", hostname="h2", port=8002, model="m"),
+            AgentInfo(agent_id="agent-3", hostname="h3", port=8003, model="m"),
         ]
         primary_agent = agents[0]
         strategy = "retry"
@@ -385,9 +385,9 @@ class TestAgentListPreparation:
     def test_fanout_strategy_prepares_full_pool(self):
         """fanout strategy should prepare pool of all agents"""
         agents = [
-            AgentInfo(agent_id="agent-1"),
-            AgentInfo(agent_id="agent-2"),
-            AgentInfo(agent_id="agent-3"),
+            AgentInfo(agent_id="agent-1", hostname="h1", port=8001, model="m"),
+            AgentInfo(agent_id="agent-2", hostname="h2", port=8002, model="m"),
+            AgentInfo(agent_id="agent-3", hostname="h3", port=8003, model="m"),
         ]
         strategy = "fanout"
 
@@ -429,10 +429,11 @@ class TestFanoutStrategy:
 
         # Parallel: max(0.5, 0.1, 0.3) = 0.5s
         parallel_start = time.time()
-        done, pending = await asyncio.wait(
-            [slow_agent(), fast_agent(), medium_agent()],
-            return_when=asyncio.FIRST_COMPLETED
-        )
+        # Py3.11+ forbids passing bare coroutines — wrap in tasks first.
+        tasks = [asyncio.create_task(c) for c in (slow_agent(), fast_agent(), medium_agent())]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
         parallel_time = time.time() - parallel_start
 
         # Parallel should be significantly faster
@@ -496,34 +497,35 @@ class TestFanoutStrategy:
             return "delayed"
 
         # Create tasks
-        tasks = [
+        pending = {
             asyncio.create_task(failing_task()),
             asyncio.create_task(success_task()),
             asyncio.create_task(delayed_task()),
-        ]
+        }
 
-        # Wait for first completion
-        done, pending = await asyncio.wait(
-            tasks,
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        # Get first successful result
+        # Race for first SUCCESS — not just first completion. The failing
+        # task finishes immediately; a naïve FIRST_COMPLETED returns only it.
         result = None
-        for task in done:
-            try:
-                result = await task
-                if result:
-                    break
-            except Exception:
-                pass
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    result = task.result()
+                    if result:
+                        break
+                except Exception:
+                    continue
+            if result:
+                break
 
-        # Cancel others
         for task in pending:
             task.cancel()
+        for task in pending:
             try:
                 await task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
         assert result is not None
@@ -531,11 +533,11 @@ class TestFanoutStrategy:
 
     def test_fanout_requires_multiple_agents(self):
         """Fanout strategy requires at least 2 agents"""
-        agents_single = [AgentInfo(agent_id="agent-1")]
+        agents_single = [AgentInfo(agent_id="agent-1", hostname="h1", port=8001, model="m")]
         agents_multiple = [
-            AgentInfo(agent_id="agent-1"),
-            AgentInfo(agent_id="agent-2"),
-            AgentInfo(agent_id="agent-3"),
+            AgentInfo(agent_id="agent-1", hostname="h1", port=8001, model="m"),
+            AgentInfo(agent_id="agent-2", hostname="h2", port=8002, model="m"),
+            AgentInfo(agent_id="agent-3", hostname="h3", port=8003, model="m"),
         ]
 
         # Single agent: fanout not applicable
@@ -547,7 +549,7 @@ class TestFanoutStrategy:
     def test_fanout_uses_up_to_three_agents(self):
         """Fanout should use at most 3 agents even if more available"""
         agents = [
-            AgentInfo(agent_id=f"agent-{i}")
+            AgentInfo(agent_id=f"agent-{i}", hostname=f"h{i}", port=8000 + i, model="m")
             for i in range(1, 11)  # 10 agents
         ]
 

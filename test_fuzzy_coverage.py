@@ -131,6 +131,9 @@ async def test_handle_generate_fallback_without_fuzzy(mock_agent, mock_agent_slo
 async def test_dds_client_request_uses_priority(mock_agent):
     """Test that DDS client request passes priority to fuzzy selection"""
     config = MagicMock()
+    # Real number so min(...) in _process_dds_client_request works
+    # (otherwise MagicMock < float raises TypeError).
+    config.task_timeout_seconds = 60.0
     registry = MagicMock()
     scheduler = MagicMock()
     dds_layer = MagicMock()
@@ -152,12 +155,29 @@ async def test_dds_client_request_uses_priority(mock_agent):
 
     orchestrator.fuzzy = fuzzy_engine
 
+    # Short-circuit the condvar wait (registry is a MagicMock, so the real
+    # asyncio.Condition path blows up). Call the real selection helper so
+    # fuzzy.select gets the real task_input dict the assertion checks.
+    async def _fake_wait(*, messages=None, priority=5, urgency=None,
+                         complexity=None, **_kwargs):
+        return orchestrator._select_with_fuzzy(
+            [mock_agent], messages, priority, urgency, complexity,
+        )
+
+    orchestrator._wait_for_available_agent = _fake_wait
+
     # Create a mock DDS client request with high priority
     dds_request = MagicMock()
     dds_request.request_id = "req-123"
     dds_request.client_id = "client-1"
     dds_request.messages_json = '[{"role": "user", "content": "Complex analysis"}]'
     dds_request.priority = 9  # High priority
+    # Real scalars — MagicMock stand-ins break numeric comparisons in
+    # _process_dds_client_request (min/>=/int casts).
+    dds_request.timeout_ms = 30000
+    dds_request.max_tokens = 50
+    dds_request.temperature = 0.7
+    dds_request.stream = False
 
     # Mock registry methods
     orchestrator.registry.get_available_agents = AsyncMock(return_value=[mock_agent])
