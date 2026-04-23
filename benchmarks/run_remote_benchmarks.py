@@ -30,7 +30,7 @@ VM_CONFIG = {
         "user": "oldds",
         "password": "Admin@123",
         "role": "agent",
-        "model": "Phi-4-mini-reasoning-Q4_K_M.gguf"
+        "model": "Qwen3.5-0.8B-reasoning-Q4_K_M.gguf"
     },
     "agent2": {
         "ip": "192.168.1.61",
@@ -195,7 +195,7 @@ async def setup_agent(vm_config: Dict, agent_num: int) -> Dict:
     ip = vm_config["ip"]
     user = vm_config["user"]
     password = vm_config["password"]
-    model = vm_config.get("model", "Phi-4-mini-reasoning-Q4_K_M.gguf")
+    model = vm_config.get("model", "Qwen3.5-0.8B-reasoning-Q4_K_M.gguf")
 
     print(f"\n=== Configurando Agent {agent_num} em {ip} (model: {model}) ===")
 
@@ -255,8 +255,8 @@ async def run_all_benchmarks() -> Dict:
         ("E3_priority_http", "--carga 10 --duracao 30 --n 5"),
         ("E4_scalability_dds", "--agentes http://192.168.1.60:8082,http://192.168.1.61:8082 --clientes 4 --n 10"),
         ("E4_scalability_http", "--agentes http://192.168.1.60:8082,http://192.168.1.61:8082 --clientes 4 --n 10"),
-        ("E5_streaming_dds", "--model phi4-mini --n 5"),
-        ("E5_streaming_http", "--model phi4-mini --n 5"),
+        ("E5_streaming_dds", "--model qwen3.5-0.8b --n 5"),
+        ("E5_streaming_http", "--model qwen3.5-0.8b --n 5"),
     ]
 
     orch_ip = orchestrator["ip"]

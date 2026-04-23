@@ -169,7 +169,7 @@ class DDSClientBenchmark:
             self.participant = None
 
 
-async def run_benchmark(prompts: list, model: str = "phi4-mini",
+async def run_benchmark(prompts: list, model: str = "qwen3.5-0.8b",
                        domain: int = 0, num_runs: int = 5) -> list:
     """Executa o benchmark com os prompts fornecidos.
 
@@ -240,7 +240,7 @@ def main():
     parser = argparse.ArgumentParser(description="DDS Client Benchmark")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain")
     parser.add_argument("--runs", type=int, default=5, help="Número de execuções por prompt")
-    parser.add_argument("--model", type=str, default="phi4-mini", help="Modelo a usar")
+    parser.add_argument("--model", type=str, default="qwen3.5-0.8b", help="Modelo a usar")
     args = parser.parse_args()
 
     # Prompts de teste (B1: Simple, B2: Medium, B3: Complex)

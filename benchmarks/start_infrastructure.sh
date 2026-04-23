@@ -10,7 +10,7 @@ echo "=========================================="
 # Variables
 REPO_ROOT="/mnt/e/TI/git/tese"
 LLAMA_SERVER="$REPO_ROOT/llama.cpp_dds/build/bin/llama-server"
-MODEL="$REPO_ROOT/models/phi4-mini-q3_k_m.gguf"
+MODEL="$REPO_ROOT/models/qwen3.5-0.8b-q3_k_m.gguf"
 ORCHESTRATOR_DIR="$REPO_ROOT/dds_orchestrator"
 LOG_DIR="$REPO_ROOT/logs"
 BENCHMARK_DIR="$REPO_ROOT/dds_orchestrator/benchmark_results"

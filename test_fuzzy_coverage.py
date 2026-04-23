@@ -20,7 +20,7 @@ def mock_agent():
     agent.agent_id = "test-agent-1"
     agent.hostname = "localhost"
     agent.port = 8082
-    agent.model = "phi-4-mini"
+    agent.model = "qwen3.5-0.8b"
     agent.slots_idle = 1
     agent.slots_total = 2
     agent.avg_latency_ms = 150.0  # Fast agent

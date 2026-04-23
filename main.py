@@ -248,11 +248,43 @@ async def main():
     )
 
     # Start server
+    status_consumer_task = None
     try:
         await server.start()
         # Start periodic scheduler cleanup so long benchmark runs don't leak
         # completed-task memory indefinitely.
         scheduler.start_cleanup_loop(interval_s=60, max_tasks=500, max_age_seconds=300)
+
+        # DDS agent/status consumer — dissertation v3 §sec:heartbeat_centralizado:
+        # "o orquestrador é o único assinante desse tópico e mantém, para cada
+        # agente, o timestamp do último heartbeat recebido." Each AgentStatus
+        # sample refreshes the registry so the HUB never relies solely on the
+        # HTTP /heartbeat endpoint for liveness.
+        if dds_layer is not None and getattr(dds_layer, "is_available", lambda: False)():
+            async def _status_consumer():
+                logger.info("DDS agent/status consumer started")
+                while True:
+                    try:
+                        samples = await dds_layer.read_status_updates(timeout_ms=0)
+                        for s in samples or []:
+                            agent_id = getattr(s, "agent_id", None)
+                            if not agent_id:
+                                continue
+                            await registry.update_heartbeat(
+                                agent_id=agent_id,
+                                status=getattr(s, "state", None),
+                                slots_idle=getattr(s, "idle_slots", None),
+                                memory_usage_mb=getattr(s, "vram_usage_mb", None),
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"status consumer error: {e}")
+                    # Poll at half the agent publish period (5s) so samples
+                    # never wait longer than 2.5s to be acknowledged.
+                    await asyncio.sleep(2.5)
+
+            status_consumer_task = asyncio.create_task(_status_consumer())
 
         # Keep running
         logger.info("Orchestrator is running. Press Ctrl+C to stop.")
@@ -262,6 +294,12 @@ async def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
+        if status_consumer_task is not None and not status_consumer_task.done():
+            status_consumer_task.cancel()
+            try:
+                await status_consumer_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await scheduler.stop_cleanup_loop()
         await server.stop()
         if redis_mgr:

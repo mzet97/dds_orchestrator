@@ -15,7 +15,7 @@ Metricas:
   ITL  = tempo entre tokens consecutivos (ms); mede jitter de entrega
 
 Usage:
-    python E5_streaming_http.py --url http://localhost:8082 --model phi4-mini --n 50
+    python E5_streaming_http.py --url http://localhost:8082 --model qwen3.5-0.8b --n 50
 """
 
 import argparse
@@ -193,9 +193,9 @@ async def run_benchmark(args):
 
 def main():
     parser = argparse.ArgumentParser(description="E5: Streaming Token-a-Token - HTTP Direto")
-    parser.add_argument("--model", default="phi4-mini", help="Modelo a usar")
+    parser.add_argument("--model", default="qwen3.5-0.8b", help="Modelo a usar")
     parser.add_argument("--url", default="http://localhost:8082", help="URL do agente HTTP direto")
-    parser.add_argument("--n", type=int, default=50, help="Numero de iteracoes")
+    parser.add_argument("--n", type=int, default=1000, help="Numero de iteracoes")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

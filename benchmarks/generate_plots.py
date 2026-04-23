@@ -51,10 +51,10 @@ def plot_e1_latency_breakdown(results_dir, output_dir):
     print("Gerando E1: Decomposicao de Latencia...")
 
     # Ler dados
-    dds_short = _try_read_csv(results_dir / "E1_DDS_phi4-mini_short.csv")
-    dds_long = _try_read_csv(results_dir / "E1_DDS_phi4-mini_long.csv")
-    http_short = _try_read_csv(results_dir / "E1_HTTP_phi4-mini_short.csv")
-    http_long = _try_read_csv(results_dir / "E1_HTTP_phi4-mini_long.csv")
+    dds_short = _try_read_csv(results_dir / "E1_DDS_qwen3.5-0.8b_short.csv")
+    dds_long = _try_read_csv(results_dir / "E1_DDS_qwen3.5-0.8b_long.csv")
+    http_short = _try_read_csv(results_dir / "E1_HTTP_qwen3.5-0.8b_short.csv")
+    http_long = _try_read_csv(results_dir / "E1_HTTP_qwen3.5-0.8b_long.csv")
 
     if any(df is None for df in [dds_short, dds_long, http_short, http_long]):
         print("  AVISO: Faltam CSVs de E1. Execute os benchmarks E1 antes de gerar plots.")
@@ -343,11 +343,11 @@ def plot_e5_streaming(results_dir, output_dir):
     print("Gerando E5: Streaming...")
 
     # Tentar nomes novos e antigos dos CSVs
-    df_phi = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_phi4-mini.csv")
+    df_phi = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_qwen3.5-0.8b.csv")
     if df_phi is None:
-        df_phi = _try_read_csv(results_dir / "E5_DDS_streaming_phi4-mini.csv")
+        df_phi = _try_read_csv(results_dir / "E5_DDS_streaming_qwen3.5-0.8b.csv")
     if df_phi is None:
-        df_phi = _try_read_csv(results_dir / "E5_streaming_phi4-mini.csv")
+        df_phi = _try_read_csv(results_dir / "E5_streaming_qwen3.5-0.8b.csv")
 
     df_qwen = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_qwen3.5-9b.csv")
     if df_qwen is None:
@@ -359,7 +359,7 @@ def plot_e5_streaming(results_dir, output_dir):
         print("  AVISO: Sem dados E5. Execute os benchmarks E5 antes de gerar plots.")
         return
 
-    available = [(name, df) for name, df in [("Phi-4-mini", df_phi), ("Qwen3.5-9B", df_qwen)] if df is not None]
+    available = [(name, df) for name, df in [("Qwen3.5-0.8B", df_phi), ("Qwen3.5-9B", df_qwen)] if df is not None]
 
     fig, axes = plt.subplots(1, len(available), figsize=(7 * len(available), 5))
     if len(available) == 1:
@@ -391,8 +391,8 @@ def plot_summary(results_dir, output_dir):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
     # E1 - Speedup
-    dds_short = _try_read_csv(results_dir / "E1_DDS_phi4-mini_short.csv")
-    http_short = _try_read_csv(results_dir / "E1_HTTP_phi4-mini_short.csv")
+    dds_short = _try_read_csv(results_dir / "E1_DDS_qwen3.5-0.8b_short.csv")
+    http_short = _try_read_csv(results_dir / "E1_HTTP_qwen3.5-0.8b_short.csv")
 
     dds_layers = ['T1_serialization_ms', 'T2_transport_send_ms', 'T3_queue_ms',
                   'T4_inference_ms', 'T5_transport_return_ms', 'T6_deserialization_ms']
@@ -476,11 +476,11 @@ def plot_summary(results_dir, output_dir):
     axes[1, 0].set_ylabel('ms')
 
     # E5 - Streaming (tentar nomes novos e antigos)
-    df_phi = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_phi4-mini.csv")
+    df_phi = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_qwen3.5-0.8b.csv")
     if df_phi is None:
-        df_phi = _try_read_csv(results_dir / "E5_DDS_streaming_phi4-mini.csv")
+        df_phi = _try_read_csv(results_dir / "E5_DDS_streaming_qwen3.5-0.8b.csv")
     if df_phi is None:
-        df_phi = _try_read_csv(results_dir / "E5_streaming_phi4-mini.csv")
+        df_phi = _try_read_csv(results_dir / "E5_streaming_qwen3.5-0.8b.csv")
 
     df_qwen = _try_read_csv(results_dir / "E5_DDS_VIA_ORCH_streaming_qwen3.5-9b.csv")
     if df_qwen is None:
@@ -489,11 +489,11 @@ def plot_summary(results_dir, output_dir):
         df_qwen = _try_read_csv(results_dir / "E5_streaming_qwen3.5-9b.csv")
 
     if df_phi is not None and df_qwen is not None:
-        axes[1, 1].bar(['Phi-4-mini', 'Qwen3.5-9B'],
+        axes[1, 1].bar(['Qwen3.5-0.8B', 'Qwen3.5-9B'],
                        [df_phi['total_time_ms'].mean(), df_qwen['total_time_ms'].mean()],
                        color=[COLORS['primary'], COLORS['secondary']], alpha=0.8)
     elif df_phi is not None:
-        axes[1, 1].bar(['Phi-4-mini'], [df_phi['total_time_ms'].mean()],
+        axes[1, 1].bar(['Qwen3.5-0.8B'], [df_phi['total_time_ms'].mean()],
                        color=[COLORS['primary']], alpha=0.8)
     else:
         axes[1, 1].text(0.5, 0.5, 'Sem dados E5', ha='center', va='center', transform=axes[1, 1].transAxes)
@@ -523,7 +523,7 @@ def plot_summary(results_dir, output_dir):
         f"  8 clientes: {df_8['latency_ms'].median():.1f}ms" if df_8 is not None else "",
         "",
         "E5 - Streaming:",
-        f"  Phi-4-mini: {df_phi['total_time_ms'].mean():.1f}ms" if df_phi is not None else "  sem dados",
+        f"  Qwen3.5-0.8B: {df_phi['total_time_ms'].mean():.1f}ms" if df_phi is not None else "  sem dados",
         f"  Qwen: {df_qwen['total_time_ms'].mean():.1f}ms" if df_qwen is not None else "",
     ]
     summary_text = "\n".join(summary_lines)

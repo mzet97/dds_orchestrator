@@ -248,7 +248,7 @@ def main():
     parser.add_argument("--url", default="http://192.168.1.62:8080")
     parser.add_argument("--endpoint", default="192.168.1.62:50052")
     parser.add_argument("--domain", type=int, default=0)
-    parser.add_argument("--model", default="Phi-4-mini")
+    parser.add_argument("--model", default="Qwen3.5-0.8B")
     parser.add_argument("--clients", default="1,10,50,100,200,500",
                         help="Comma-separated client counts")
     parser.add_argument("--requests-per-client", type=int, default=5)

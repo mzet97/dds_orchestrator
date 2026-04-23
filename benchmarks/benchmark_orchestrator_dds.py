@@ -640,7 +640,7 @@ def estimate_time(modes: List[str], client_counts: List[int], requests: int,
 
     Args:
         gpu_slots: Number of concurrent inference slots on the GPU.
-                   Default 1 (e.g., Phi-4-mini with 1 slot).
+                   Default 1 (e.g., Qwen3.5-0.8B with 1 slot).
                    Adjust based on your llama-server --n-parallel setting.
     """
     total_s = 0

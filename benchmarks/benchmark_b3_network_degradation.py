@@ -93,7 +93,7 @@ async def benchmark_dds_latency(url: str, iterations: int = 100) -> Dict[str, fl
                 async with session.post(
                     f"{url}/v1/chat/completions",
                     json={
-                        "model": "phi4-mini",
+                        "model": "qwen3.5-0.8b",
                         "messages": [{"role": "user", "content": "ok"}],
                         "max_tokens": 5,
                     },
@@ -123,7 +123,7 @@ async def benchmark_http_latency(url: str, iterations: int = 100) -> Dict[str, f
                 async with session.post(
                     f"{url}/v1/chat/completions",
                     json={
-                        "model": "phi4-mini",
+                        "model": "qwen3.5-0.8b",
                         "messages": [{"role": "user", "content": "ok"}],
                         "max_tokens": 5,
                     },

@@ -35,7 +35,7 @@ async def main_async(args):
             try:
                 req = pb2.ClientChatRequest(
                     request_id=f"bg-{int(t0*1000)}",
-                    model="phi4-mini",
+                    model="qwen3.5-0.8b",
                     messages=[pb2.ChatMessage(role="user", content="Hi")],
                     max_tokens=1, temperature=0.0, priority=5, timeout_ms=10000,
                 )
@@ -58,7 +58,7 @@ async def main_async(args):
             t0 = time.perf_counter()
             req = pb2.ClientChatRequest(
                 request_id=f"hi-{i}",
-                model="phi4-mini",
+                model="qwen3.5-0.8b",
                 messages=[pb2.ChatMessage(role="user", content="Hi")],
                 max_tokens=1, temperature=0.0, priority=10, timeout_ms=10000,
             )
@@ -114,8 +114,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--orch", default="localhost:50052")
     p.add_argument("--carga", type=int, default=5)
-    p.add_argument("--duracao", type=int, default=30)
-    p.add_argument("--n", type=int, default=5)
+    # v3 forces N=1000 HIGH injections; duration scales at ~carga req/s
+    p.add_argument("--duracao", type=int, default=10000)
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
     asyncio.run(main_async(args))
 

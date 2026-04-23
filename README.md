@@ -112,7 +112,7 @@ python main.py --port 8080 --log-level DEBUG
 curl -X POST http://localhost:8080/api/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "phi-4-mini",
+    "model": "qwen3.5-0.8b",
     "messages": [{"role": "user", "content": "Olá!"}],
     "stream": false
   }'
@@ -124,7 +124,7 @@ curl -X POST http://localhost:8080/api/v1/chat/completions \
 curl -X POST http://localhost:8080/api/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "phi-4-mini",
+    "model": "qwen3.5-0.8b",
     "messages": [{"role": "user", "content": "Conte uma história"}],
     "stream": true
   }'
@@ -144,7 +144,7 @@ Os agentes se registram automaticamente enviando heartbeat periódico:
 {
   "agent_id": "uuid",
   "specialization": "text|vision|embedding",
-  "model": "phi-4-mini",
+  "model": "qwen3.5-0.8b",
   "status": "idle|busy",
   "capabilities": ["streaming", "functions"]
 }

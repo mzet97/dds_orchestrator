@@ -10,7 +10,10 @@ dds_enabled: true
 
 # Agent settings
 max_agents: 1000
-agent_timeout_seconds: 300
+# Offline threshold: agent evicted if no heartbeat (HTTP or DDS agent/status)
+# arrives within this window. Matches dissertation v3 (30s); with the 5s
+# heartbeat period, the HUB tolerates up to 6 consecutive missed heartbeats.
+agent_timeout_seconds: 30
 
 # Task settings
 max_concurrent_tasks: 2000

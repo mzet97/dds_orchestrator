@@ -98,11 +98,11 @@ async def run_benchmark(args):
     }
 
     Path("results").mkdir(exist_ok=True)
-    with open("results/E5_DDS_NATIVE_streaming_phi4-mini.csv", "w") as f:
+    with open("results/E5_DDS_NATIVE_streaming_qwen3.5-0.8b.csv", "w") as f:
         f.write("iteration,ttft_ms,itl_mean_ms,tokens\n")
         for i, (t, m, n) in enumerate(zip(ttfts, itls_per_iter, token_counts), start=1):
             f.write(f"{i},{t},{m},{n}\n")
-    with open("results/E5_DDS_NATIVE_streaming_phi4-mini_summary.json", "w") as f:
+    with open("results/E5_DDS_NATIVE_streaming_qwen3.5-0.8b_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print()
@@ -114,8 +114,8 @@ async def run_benchmark(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--domain", type=int, default=0)
-    p.add_argument("--model", default="phi4-mini")
-    p.add_argument("--n", type=int, default=30)
+    p.add_argument("--model", default="qwen3.5-0.8b")
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
     asyncio.run(run_benchmark(args))
 

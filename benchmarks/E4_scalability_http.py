@@ -53,7 +53,7 @@ async def run_benchmark(args):
             async with session.post(
                 f"{agent_url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": [{"role": "user", "content": "O que e 2+2?"}],
                     "max_tokens": 20
                 },
@@ -151,8 +151,8 @@ def main():
     parser.add_argument("--agentes", default="http://localhost:8082",
                         help="URLs dos agentes separados por vírgula. "
                              "1 agente = Fase A, 2 agentes = Fase B")
-    parser.add_argument("--n", type=int, default=50,
-                        help="Requisições por cliente por configuração")
+    parser.add_argument("--n", type=int, default=1000,
+                        help="Requisições por cliente por configuração (v3: N=1000)")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

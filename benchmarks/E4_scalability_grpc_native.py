@@ -23,7 +23,7 @@ async def one_client(stub, client_id, n_per_client, results):
         try:
             req = pb2.ClientChatRequest(
                 request_id=f"e4-c{client_id}-{i}",
-                model="phi4-mini",
+                model="qwen3.5-0.8b",
                 messages=[pb2.ChatMessage(role="user", content="Hi")],
                 max_tokens=1, temperature=0.0, priority=5, timeout_ms=120000,
             )
@@ -89,7 +89,7 @@ async def main_async(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--orch", default="localhost:50052")
-    p.add_argument("--n", type=int, default=20)
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
     asyncio.run(main_async(args))
 

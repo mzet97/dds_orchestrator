@@ -29,7 +29,7 @@ python main.py --port 8080 --log-level DEBUG
 ```bash
 curl -X POST http://localhost:8080/api/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model": "phi-4-mini", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "qwen3.5-0.8b", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 ### Run Tests

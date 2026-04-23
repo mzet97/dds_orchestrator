@@ -59,7 +59,7 @@ class LLMServiceHandlers:
         Requisição unária: encaminha para /v1/chat/completions (não-streaming).
         """
         payload = {
-            "model": request.get("model", "phi4-mini"),
+            "model": request.get("model", "qwen3.5-0.8b"),
             "messages": [{"role": "user", "content": request.get("content", "")}],
             "max_tokens": request.get("max_tokens", 50),
             "stream": False,
@@ -90,7 +90,7 @@ class LLMServiceHandlers:
         Produz um chunk por token recebido via SSE.
         """
         payload = {
-            "model": request.get("model", "phi4-mini"),
+            "model": request.get("model", "qwen3.5-0.8b"),
             "messages": [{"role": "user", "content": request.get("content", "")}],
             "max_tokens": request.get("max_tokens", 200),
             "stream": True,

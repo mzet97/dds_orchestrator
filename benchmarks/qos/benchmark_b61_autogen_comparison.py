@@ -94,7 +94,7 @@ class DDSOrchestratorClient:
             resp = self.session.post(
                 f"{self.orchestrator_url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": messages,
                     "max_tokens": 50,
                 },
@@ -159,7 +159,7 @@ class AutoGenClient:
             resp = self.session.post(
                 f"{self.url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": messages,
                     "max_tokens": 50,
                 },

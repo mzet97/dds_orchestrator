@@ -2,8 +2,8 @@
 """
 Deploy 5 LLM Agents on 2 GPUs for Fuzzy Benchmark
 ====================================================
-RTX 3080 (10GB, 192.168.1.61): 3x Phi-4-mini (Agent_Fast, Agent_Quality, Agent_Balanced)
-RX 6600M (8GB, 192.168.1.60):  2x Phi-4-mini (Agent_Backup_1, Agent_Backup_2)
+RTX 3080 (10GB, 192.168.1.61): 3x Qwen3.5-0.8B (Agent_Fast, Agent_Quality, Agent_Balanced)
+RX 6600M (8GB, 192.168.1.60):  2x Qwen3.5-0.8B (Agent_Backup_1, Agent_Backup_2)
 
 Each agent has a different profile that the fuzzy engine uses for selection.
 
@@ -39,8 +39,8 @@ AGENTS = [
         "profile": "fast",
         "llama_port": 8082,
         "agent_port": 8081,
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        "model_name": "Qwen3.5-0.8B",
         "context_size": 1024,
         "max_tokens": 50,
         "threads": 4,
@@ -53,8 +53,8 @@ AGENTS = [
         "profile": "quality",
         "llama_port": 8083,
         "agent_port": 8091,
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        "model_name": "Qwen3.5-0.8B",
         "context_size": 4096,
         "max_tokens": 500,
         "threads": 4,
@@ -67,8 +67,8 @@ AGENTS = [
         "profile": "balanced",
         "llama_port": 8084,
         "agent_port": 8092,
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        "model_name": "Qwen3.5-0.8B",
         "context_size": 2048,
         "max_tokens": 200,
         "threads": 4,
@@ -81,8 +81,8 @@ AGENTS = [
         "profile": "backup",
         "llama_port": 8082,
         "agent_port": 8081,
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        "model_name": "Qwen3.5-0.8B",
         "context_size": 2048,
         "max_tokens": 200,
         "threads": 4,
@@ -95,8 +95,8 @@ AGENTS = [
         "profile": "backup",
         "llama_port": 8083,
         "agent_port": 8091,
-        "model": "Phi-4-mini-instruct-Q4_K_M.gguf",
-        "model_name": "Phi-4-mini",
+        "model": "Qwen3.5-0.8B-UD-IQ2_XXS.gguf",
+        "model_name": "Qwen3.5-0.8B",
         "context_size": 1024,
         "max_tokens": 100,
         "threads": 4,

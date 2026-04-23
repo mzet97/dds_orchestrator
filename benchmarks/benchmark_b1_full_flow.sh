@@ -56,7 +56,7 @@ export PYTHONPATH=/home/oldds/dds_agent/python:/home/oldds/dds_orchestrator
 export LD_LIBRARY_PATH=/home/oldds/llama.cpp_dds/build/bin:/home/oldds/cyclonedds/build-install/lib:/opt/rocm/lib
 export ROCM_PATH=/opt/rocm
 export CYCLONEDDS_URI=file:///home/oldds/llama.cpp_dds/dds/cyclonedds-local.xml
-nohup python3 agent_llm_dds.py --orchestrator-url http://localhost:$ORCH_PORT --model-path /home/oldds/models/phi4-mini-q3_k_m.gguf --model-name phi4-mini > /tmp/agent.log 2>&1 &
+nohup python3 agent_llm_dds.py --orchestrator-url http://localhost:$ORCH_PORT --model-path /home/oldds/models/qwen3.5-0.8b-q3_k_m.gguf --model-name qwen3.5-0.8b > /tmp/agent.log 2>&1 &
 sleep 45
 "
 

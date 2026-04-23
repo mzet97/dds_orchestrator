@@ -227,7 +227,7 @@ def main():
                         help="Período equivalente em ms (poll a cada periodo/10)")
     parser.add_argument("--tipo", choices=["kill9", "sigterm", "deadlock"], default="kill9",
                         help="Tipo de falha")
-    parser.add_argument("--n", type=int, default=10, help="Número de iterações")
+    parser.add_argument("--n", type=int, default=1000, help="Número de iterações (v3: N=1000)")
     parser.add_argument("--port", type=int, default=50099,
                         help="Porta do servidor gRPC de health check")
 

@@ -24,9 +24,9 @@ import orchestrator_pb2_grpc as pb2_grpc
 def main():
     p = argparse.ArgumentParser(description="E1 — gRPC NATIVE (full)")
     p.add_argument("--orch", default="localhost:50052")
-    p.add_argument("--model", default="phi4-mini")
+    p.add_argument("--model", default="qwen3.5-0.8b")
     p.add_argument("--prompt", dest="prompt_type", choices=["short", "long"], default="short")
-    p.add_argument("--n", type=int, default=100)
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
 
     prompts = {

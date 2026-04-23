@@ -203,7 +203,7 @@ class gRPCClient:
 
         try:
             payload = {
-                "model": "phi4-mini",
+                "model": "qwen3.5-0.8b",
                 "content": str(data.get("content", "ok")),
                 "max_tokens": 5,
             }
@@ -243,7 +243,7 @@ class HTTPClient:
             resp = self.session.post(
                 f"{self.url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": [{"role": "user", "content": str(data.get("content", "ok"))}],
                     "max_tokens": 5,
                 },
@@ -393,7 +393,7 @@ def run_serialization_benchmark(
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Explain quantum computing in detail."},
             ],
-            "model": "phi-4-mini",
+            "model": "qwen3.5-0.8b",
             "temperature": 0.7,
             "max_tokens": 1000,
         },

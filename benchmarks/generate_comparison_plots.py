@@ -19,19 +19,19 @@ RESULTS_DIR = Path(__file__).parent / "results"
 PLOTS_DIR = Path(__file__).parent / "plots"
 PLOTS_DIR.mkdir(exist_ok=True)
 
-# RX 6600M + Phi-4-mini (n=1000) — use for single-GPU comparison
+# RX 6600M + Qwen3.5-0.8B (n=1000) — use for single-GPU comparison
 FILES_RX6600M = {
     "HTTP": "e2e_http_20260315_133259.json",
     "gRPC": "e2e_grpc_20260315_142734.json",
     "DDS":  "e2e_dds_20260315_152325.json",
 }
-# RTX 3080 + Phi-4-mini (n=1000) — use for GPU comparison
+# RTX 3080 + Qwen3.5-0.8B (n=1000) — use for GPU comparison
 FILES_RTX3080 = {
     "HTTP": "e2e_http_20260315_210700.json",
     "gRPC": "e2e_grpc_20260315_212821.json",
     "DDS":  "e2e_dds_20260315_215109.json",
 }
-# RTX 3080 final results (n=1000, Phi-4-mini, all fixes)
+# RTX 3080 final results (n=1000, Qwen3.5-0.8B, all fixes)
 FILES_RTX3080_FINAL = {
     "HTTP": "e2e_http_20260316_141112.json",
     "gRPC": "e2e_grpc_20260316_143311.json",
@@ -429,7 +429,7 @@ def plot_summary_table(data):
         for j, label in enumerate(["HTTP", "gRPC", "DDS"]):
             table[i + 1, j + 1].set_facecolor(COLORS[label] + '30')  # 30 = alpha hex
 
-    ax.set_title('Summary: HTTP vs gRPC vs DDS (n=100, Phi-4-mini, AMD RX 6600M)',
+    ax.set_title('Summary: HTTP vs gRPC vs DDS (n=100, Qwen3.5-0.8B, AMD RX 6600M)',
                  fontsize=13, fontweight='bold', pad=20)
 
     plt.tight_layout()

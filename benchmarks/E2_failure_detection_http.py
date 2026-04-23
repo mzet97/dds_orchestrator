@@ -51,7 +51,7 @@ class HeartbeatDetector:
 
         # Usar sys.executable para garantir o mesmo interpretador Python
         proc = subprocess.Popen(
-            [sys.executable, str(agent_script), "--model-path", "../models/phi4-mini.gguf"],
+            [sys.executable, str(agent_script), "--model-path", "../models/qwen3.5-0.8b.gguf"],
             cwd=str(agent_cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
@@ -260,7 +260,7 @@ def main():
     parser.add_argument("--agent-url", default="http://localhost:8082", help="URL do agente")
     parser.add_argument("--intervalo", type=int, default=1000, help="Intervalo de heartbeat em ms")
     parser.add_argument("--tipo", choices=["kill9", "sigterm", "deadlock"], default="kill9", help="Tipo de falha")
-    parser.add_argument("--n", type=int, default=50, help="Numero de iteracoes")
+    parser.add_argument("--n", type=int, default=1000, help="Numero de iteracoes (v3: N=1000)")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

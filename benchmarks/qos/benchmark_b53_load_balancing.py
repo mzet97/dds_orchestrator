@@ -80,7 +80,7 @@ class DDSOwnershipBalancer:
             resp = self.session.post(
                 f"{self.orchestrator_url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": [{"role": "user", "content": "ok"}],
                     "max_tokens": 5,
                 },
@@ -139,7 +139,7 @@ class PythonRoundRobinBalancer:
             resp = self.session.post(
                 f"{url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": [{"role": "user", "content": "ok"}],
                     "max_tokens": 5,
                 },
@@ -185,7 +185,7 @@ class NginxBalancer:
             resp = self.session.post(
                 f"{self.base_url}/v1/chat/completions",
                 json={
-                    "model": "phi4-mini",
+                    "model": "qwen3.5-0.8b",
                     "messages": [{"role": "user", "content": "ok"}],
                     "max_tokens": 5,
                 },

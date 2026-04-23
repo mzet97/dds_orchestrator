@@ -118,9 +118,9 @@ async def run_benchmark(args):
 def main():
     p = argparse.ArgumentParser(description="E1 — DDS NATIVE")
     p.add_argument("--domain", type=int, default=0)
-    p.add_argument("--model", default="phi4-mini")
+    p.add_argument("--model", default="qwen3.5-0.8b")
     p.add_argument("--prompt", dest="prompt_type", choices=["short", "long"], default="short")
-    p.add_argument("--n", type=int, default=100)
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
     asyncio.run(run_benchmark(args))
 

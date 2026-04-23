@@ -17,8 +17,8 @@ import orchestrator_pb2_grpc as pb2_grpc
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--orch", default="localhost:50052")
-    p.add_argument("--model", default="phi4-mini")
-    p.add_argument("--n", type=int, default=30)
+    p.add_argument("--model", default="qwen3.5-0.8b")
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
 
     channel = grpc.insecure_channel(args.orch)
@@ -93,11 +93,11 @@ def main():
         "tokens": {"mean": round(statistics.mean(token_counts), 0)},
     }
     Path("results").mkdir(exist_ok=True)
-    with open("results/E5_GRPC_NATIVE_FULL_streaming_phi4-mini.csv", "w") as f:
+    with open("results/E5_GRPC_NATIVE_FULL_streaming_qwen3.5-0.8b.csv", "w") as f:
         f.write("iteration,ttft_ms,itl_mean_ms,tokens\n")
         for i, (t, m, n) in enumerate(zip(ttfts, itl_means, token_counts), 1):
             f.write(f"{i},{t},{m},{n}\n")
-    with open("results/E5_GRPC_NATIVE_FULL_streaming_phi4-mini_summary.json", "w") as f:
+    with open("results/E5_GRPC_NATIVE_FULL_streaming_qwen3.5-0.8b_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nTTFT medio: {summary['ttft']['mean_ms']}ms")
     print(f"ITL medio:  {summary['itl_mean']['mean_ms']}ms")

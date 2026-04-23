@@ -28,8 +28,8 @@ ORCH_IP = "192.168.1.62"
 AGENT_IP = "192.168.1.61"
 CLIENT_IP = "192.168.1.63"
 XML = f"{BASE}/llama.cpp_dds/dds/cyclonedds-network-optimized.xml"
-MODEL = "Phi-4-mini-instruct-Q4_K_M.gguf"
-MODEL_NAME = "Phi-4-mini"
+MODEL = "Qwen3.5-0.8B-UD-IQ2_XXS.gguf"
+MODEL_NAME = "Qwen3.5-0.8B"
 
 N = 100  # Requests per scenario
 

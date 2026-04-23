@@ -23,7 +23,7 @@ class OrchestratorConfig:
 
     # Agent settings
     max_agents: int = 1000
-    agent_timeout_seconds: int = 300
+    agent_timeout_seconds: int = 30
 
     # Task settings
     max_concurrent_tasks: int = 2000

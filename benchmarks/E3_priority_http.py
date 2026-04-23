@@ -65,7 +65,7 @@ class PriorityBenchmarkHTTP:
         max_tokens=5 para minimizar inferência e isolar fila de prioridade.
         """
         payload = {
-            "model": "phi4-mini",
+            "model": "qwen3.5-0.8b",
             "messages": [{"role": "user", "content": "Responda apenas: ok"}],
             "max_tokens": 5,
             "priority": priority
@@ -230,8 +230,9 @@ def main():
     parser = argparse.ArgumentParser(description="E3: Priorização - HTTP + heapq")
     parser.add_argument("--url", default="http://localhost:8080", help="URL do orquestrador")
     parser.add_argument("--carga", type=int, default=10, help="Carga NORMAL em req/s")
-    parser.add_argument("--duracao", type=int, default=300, help="Duração em segundos (padrão: 300=5min)")
-    parser.add_argument("--n", type=int, default=30, help="Número de injeções HIGH priority")
+    # v3 forces N=1000 HIGH injections; duration scales with N at 10req/s (~2h45m)
+    parser.add_argument("--duracao", type=int, default=10000, help="Duração em segundos (dimensionado para N=1000)")
+    parser.add_argument("--n", type=int, default=1000, help="Número de injeções HIGH priority (v3: N=1000)")
 
     args = parser.parse_args()
     asyncio.run(run_benchmark(args))

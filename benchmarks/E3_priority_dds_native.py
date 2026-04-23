@@ -124,8 +124,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--domain", type=int, default=0)
     p.add_argument("--carga", type=int, default=5)
-    p.add_argument("--duracao", type=int, default=30)
-    p.add_argument("--n", type=int, default=5)
+    # v3 forces N=1000 HIGH injections; duration scales at ~carga req/s (1000 inj * 10s = ~2h45m at 10req/s)
+    p.add_argument("--duracao", type=int, default=10000)
+    p.add_argument("--n", type=int, default=1000)
     args = p.parse_args()
     asyncio.run(run_benchmark(args))
 

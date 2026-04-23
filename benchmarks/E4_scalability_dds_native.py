@@ -97,7 +97,7 @@ async def run_benchmark(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--n", type=int, default=20, help="N requests per client")
+    p.add_argument("--n", type=int, default=1000, help="N requests per client (v3: N=1000)")
     args = p.parse_args()
     asyncio.run(run_benchmark(args))
 

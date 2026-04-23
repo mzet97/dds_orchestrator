@@ -190,9 +190,9 @@ async def run_benchmark(args):
 
 def main():
     parser = argparse.ArgumentParser(description="E1: Decomposicao de Latencia - HTTP")
-    parser.add_argument("--model", default="phi4-mini", help="Modelo a usar")
+    parser.add_argument("--model", default="qwen3.5-0.8b", help="Modelo a usar")
     parser.add_argument("--prompt", dest="prompt_type", choices=["short", "long"], default="short")
-    parser.add_argument("--n", type=int, default=100, help="Numero de iteracoes")
+    parser.add_argument("--n", type=int, default=1000, help="Numero de iteracoes")
     parser.add_argument("--url", default="http://localhost:8080", help="URL base do servidor")
 
     args = parser.parse_args()

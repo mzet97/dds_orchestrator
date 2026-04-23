@@ -312,7 +312,7 @@ def main():
                         help="Lease LIVELINESS em ms (0=disabled, default: 200)")
     parser.add_argument("--tipo", choices=["kill9", "sigterm", "deadlock"], default="kill9",
                         help="Tipo de falha")
-    parser.add_argument("--n", type=int, default=10, help="Número de iterações")
+    parser.add_argument("--n", type=int, default=1000, help="Número de iterações (v3: N=1000)")
     parser.add_argument("--domain", type=int, default=0, help="DDS Domain ID")
 
     args = parser.parse_args()
