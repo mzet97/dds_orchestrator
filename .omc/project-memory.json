@@ -1,0 +1,208 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776632867333,
+  "projectRoot": "/Users/zeitune/Documents/tese/dds_orchestrator",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "examples",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 29,
+      "lastAccessed": 1776632867314,
+      "keyFiles": [
+        "__init__.cpython-310.pyc",
+        "__init__.cpython-313.pyc",
+        "backpressure.cpython-313.pyc",
+        "config.cpython-310.pyc",
+        "config.cpython-313.pyc"
+      ]
+    },
+    "benchmark_results": {
+      "path": "benchmark_results",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1776632867314,
+      "keyFiles": [
+        "B51_failure_detection_20260310_221841.json",
+        "B51_failure_detection_20260310_234041.json",
+        "B51_failure_detection_20260310_235154.json",
+        "B51_failure_detection_20260310_235855.json",
+        "B51_failure_detection_20260311_000621.json"
+      ]
+    },
+    "benchmarks": {
+      "path": "benchmarks",
+      "purpose": null,
+      "fileCount": 78,
+      "lastAccessed": 1776632867314,
+      "keyFiles": [
+        "CLAUDE.md",
+        "E1_decompose_latency_dds.py",
+        "E1_decompose_latency_dds_native.py",
+        "E1_decompose_latency_grpc.py",
+        "E1_decompose_latency_grpc_native.py"
+      ]
+    },
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776632867315,
+      "keyFiles": [
+        "cyclonedds-10inst-network.xml"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 1,
+      "lastAccessed": 1776632867315,
+      "keyFiles": [
+        "client_example.py"
+      ]
+    },
+    "llama": {
+      "path": "llama",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776632867315,
+      "keyFiles": [
+        "_LlamaDDS.py",
+        "__init__.py"
+      ]
+    },
+    "orchestrator": {
+      "path": "orchestrator",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776632867315,
+      "keyFiles": [
+        "_OrchestratorDDS.py",
+        "__init__.py"
+      ]
+    },
+    "proto": {
+      "path": "proto",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1776632867316,
+      "keyFiles": [
+        "__init__.py",
+        "orchestrator.proto",
+        "orchestrator_pb2.py",
+        "orchestrator_pb2_grpc.py"
+      ]
+    },
+    "results": {
+      "path": "results",
+      "purpose": null,
+      "fileCount": 6,
+      "lastAccessed": 1776632867316,
+      "keyFiles": [
+        "E1_DDS_NATIVE_qwen3.5-0.8b_long.csv",
+        "E1_DDS_NATIVE_qwen3.5-0.8b_long_summary.json",
+        "E1_DDS_NATIVE_qwen3.5-0.8b_short.csv",
+        "E1_DDS_NATIVE_qwen3.5-0.8b_short_summary.json",
+        "E3_DDS_NATIVE_PRIORITY_carga10.csv"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 14,
+      "lastAccessed": 1776632867316,
+      "keyFiles": [
+        "CLAUDE.md",
+        "__init__.py",
+        "deploy_and_test_real.py",
+        "full_e2e_3protocols.py",
+        "run_remote_tests.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "test_integration_complete.py",
+      "accessCount": 16,
+      "lastAccessed": 1776733302232,
+      "type": "directory"
+    },
+    {
+      "path": "server.py",
+      "accessCount": 15,
+      "lastAccessed": 1776732673751,
+      "type": "directory"
+    },
+    {
+      "path": "registry.py",
+      "accessCount": 5,
+      "lastAccessed": 1776632903550,
+      "type": "file"
+    },
+    {
+      "path": "context.py",
+      "accessCount": 2,
+      "lastAccessed": 1776733258405,
+      "type": "directory"
+    },
+    {
+      "path": "",
+      "accessCount": 2,
+      "lastAccessed": 1776733261691,
+      "type": "directory"
+    },
+    {
+      "path": "redis_layer.py",
+      "accessCount": 1,
+      "lastAccessed": 1776688725956,
+      "type": "file"
+    },
+    {
+      "path": "models.py",
+      "accessCount": 1,
+      "lastAccessed": 1776733197321,
+      "type": "directory"
+    }
+  ],
+  "userDirectives": []
+}

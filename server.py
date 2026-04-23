@@ -1322,6 +1322,7 @@ class OrchestratorServer:
         agent, fuzzy_qos, fuzzy_strategy = await self._wait_for_available_agent(
             timeout_s=_wait_s, messages=messages, priority=priority,
             urgency=fuzzy_urgency, complexity=fuzzy_complexity,
+            transport=protocol,
         )
         if not agent:
             return web.json_response({
