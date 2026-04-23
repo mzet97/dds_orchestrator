@@ -36,12 +36,32 @@ class OrchestratorServer:
                  instance_pool=None,
                  redis_mgr=None,
                  mongo_store=None,
-                 backpressure=None):
+                 backpressure=None,
+                 transports=None):
         self.config = config
         self.registry = registry
         self.scheduler = scheduler
         self.dds = dds_layer
         self.grpc = grpc_layer  # optional gRPC layer (mirrors DDS layer interface)
+
+        # Transport registry — camada de transporte abstrata (dissertação v3
+        # Seção 5.2). Dicionário {name -> TransportAdapter} que substitui
+        # progressivamente os condicionais `if protocol ==` espalhados pelo
+        # dispatcher. Se o chamador não fornecer um registry, construímos um
+        # a partir das camadas existentes; o comportamento permanece idêntico
+        # até cada callsite ser migrado para usar `self.transports[proto]`.
+        if transports is None:
+            try:
+                from transport import build_transport_registry
+                transports = build_transport_registry(
+                    dds_layer=dds_layer,
+                    grpc_layer=grpc_layer,
+                    http_session=None,
+                )
+            except Exception as _e:  # import failure must not break the server
+                logger.warning(f"transport registry unavailable: {_e}")
+                transports = {}
+        self.transports = transports
         if self.grpc is not None:
             # Allow grpc_layer servicers to call back into the orchestrator
             # (used by StreamChat for agent selection / slot bookkeeping)
@@ -721,6 +741,37 @@ class OrchestratorServer:
                 break
             except Exception as e:
                 logger.error(f"Error in cleanup loop: {e}")
+
+    # === Transport dispatch via TransportAdapter registry ===
+    # Ponto de entrada único para o dispatcher exercer a camada de transporte
+    # abstrata descrita em dissertação v3 §2174. Os callsites existentes em
+    # handle_chat / handle_generate ainda usam if/elif históricos; cada um
+    # deles pode ser migrado para consultar este método sem mudar o contrato
+    # externo. O método é tolerante a protocolo desconhecido e adaptador
+    # ausente — devolve um TransportResult com success=False e a causa no
+    # campo error_message, de modo que o callsite decida se faz fallback.
+
+    async def _dispatch_via_adapter(self, protocol: str, task: dict,
+                                    agent, timeout_ms: int):
+        """Despacha `task` para `agent` via o adaptador registrado em
+        `self.transports[protocol]`. Retorna um `TransportResult`."""
+        adapter = (self.transports or {}).get(protocol)
+        if adapter is None:
+            # Import local para evitar dependência circular em cargas de módulo.
+            from transport.base import TransportResult
+            return TransportResult(
+                success=False,
+                agent_id=getattr(agent, "agent_id", ""),
+                error_message=f"transport '{protocol}' not registered",
+            )
+        if not adapter.is_available():
+            from transport.base import TransportResult
+            return TransportResult(
+                success=False,
+                agent_id=getattr(agent, "agent_id", ""),
+                error_message=f"transport '{protocol}' unavailable",
+            )
+        return await adapter.dispatch(task, agent, timeout_ms)
 
     # === Request Handlers ===
 
@@ -1827,200 +1878,63 @@ class OrchestratorServer:
             priority_map = {1: 0, 2: 5, 5: 5, 10: 10, 20: 20}
             dds_priority = priority_map.get(priority, 0)
 
-            # Protocol consistency: HTTP entry always runs HTTP end-to-end.
-            effective_protocol = "http"
-
-            # ── DDS Path (DISABLED FOR HTTP ENTRYPOINT) ───────────────
-            if effective_protocol == "dds" and self.dds.is_available():
-                self.dds.prepare_agent_response_waiter(task_id)
-                await self.dds.publish_agent_request(dds_request, priority=dds_priority)
-
-                if stream_requested:
-                    self.dds.prepare_stream_waiter(task_id)
-                    sse_response = web.StreamResponse(
-                        status=200, reason='OK',
-                        headers={
-                            'Content-Type': 'text/event-stream',
-                            'Cache-Control': 'no-cache',
-                            'Connection': 'keep-alive',
-                        }
-                    )
-                    await sse_response.prepare(request)
-                    stream_ok = True
-                    try:
-                        async for chunk in self.dds.stream_agent_response(task_id, timeout_ms=_req_timeout_ms):
-                            content = chunk.get("content", "")
-                            is_final = chunk.get("is_final", False)
-                            if is_final and not content:
-                                await sse_response.write(b"data: [DONE]\n\n")
-                                break
-                            sse_data = json.dumps({
-                                "id": task_id,
-                                "object": "chat.completion.chunk",
-                                "choices": [{"index": 0, "delta": {"content": content},
-                                             "finish_reason": "stop" if is_final else None}],
-                            })
-                            await sse_response.write(f"data: {sse_data}\n\n".encode())
-                            if is_final:
-                                await sse_response.write(b"data: [DONE]\n\n")
-                                break
-                    except Exception:
-                        stream_ok = False
-                        raise
-                    finally:
-                        latency_ms = (_time.time() - t_start) * 1000
-                        inst_port = instance.port
-                        inst_type = instance.inst_type
-                        await self.instance_pool.release_instance(inst_port, latency_ms, stream_ok)
-                        instance = None
-                        if self.mongo_store:
-                            asyncio.create_task(self.mongo_store.log_request({
-                                "request_id": task_id, "instance_port": inst_port,
-                                "instance_type": inst_type, "protocol": "dds",
-                                "algorithm": self.instance_pool._algorithm.value,
-                                "latency_ms": latency_ms, "success": stream_ok,
-                                "scenario": data.get("scenario", ""),
-                            }))
-                    return sse_response
-                else:
-                    # Non-streaming DDS: publish request, wait for response
-                    dds_resp = await self.dds.wait_for_agent_response(
-                        task_id, timeout_ms=self.config.task_timeout_seconds * 1000
-                    )
-                    # dds_resp can be dict or AgentTaskResponse dataclass
-                    if dds_resp is None:
-                        content = ""
-                    elif isinstance(dds_resp, dict):
-                        content = dds_resp.get("content", "")
-                    elif hasattr(dds_resp, "content"):
-                        content = dds_resp.content or ""
-                    else:
-                        content = str(dds_resp)
-                    success = bool(content)
-                    latency_ms = (_time.time() - t_start) * 1000
-                    inst_port = instance.port
-                    inst_type = instance.inst_type
-                    await self.instance_pool.release_instance(inst_port, latency_ms, success)
-                    instance = None
-                    if self.mongo_store:
-                        asyncio.create_task(self.mongo_store.log_request({
-                            "request_id": task_id, "instance_port": inst_port,
-                            "instance_type": inst_type, "protocol": "dds",
-                            "algorithm": self.instance_pool._algorithm.value,
-                            "latency_ms": latency_ms, "success": success,
-                            "scenario": data.get("scenario", ""),
-                        }))
-                    return web.json_response({
-                        "id": task_id, "object": "chat.completion",
-                        "choices": [{"index": 0,
-                                     "message": {"role": "assistant", "content": content},
-                                     "finish_reason": "stop" if content else "error"}],
-                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                        "instance_port": inst_port, "instance_type": inst_type,
-                        "protocol": "dds", "processing_time_ms": int(latency_ms),
-                    })
-
-            # ── gRPC Path (DISABLED FOR HTTP ENTRYPOINT) ──────────────
-            elif effective_protocol == "grpc" and self.grpc:
-                content = ""
-                success = False
-                try:
-                    # Target agent's gRPC address: hostname:grpc_port
-                    grpc_port = 59000 + (instance.port - 8000)  # convention: agent gRPC at 59082, 59088
-                    agent_grpc_addr = f"{instance.hostname}:{grpc_port}"
-                    grpc_resp = await self.grpc.forward_to_instance(
-                        agent_grpc_addr, dds_request, task_id,
-                        timeout_s=self.config.task_timeout_seconds,
-                    )
-                    content = grpc_resp.get("content", "") if grpc_resp else ""
-                    success = bool(content)
-                except Exception as e:
-                    logger.error(f"gRPC to instance :{instance.port} failed: {e}")
-                    content = ""
-                    success = False
-
-                latency_ms = (_time.time() - t_start) * 1000
-                inst_port = instance.port
-                inst_type = instance.inst_type
-                await self.instance_pool.release_instance(inst_port, latency_ms, success)
-                instance = None
-                if self.mongo_store:
-                    asyncio.create_task(self.mongo_store.log_request({
-                        "request_id": task_id, "instance_port": inst_port,
-                        "instance_type": inst_type, "protocol": "grpc",
-                        "algorithm": self.instance_pool._algorithm.value,
-                        "latency_ms": latency_ms, "success": success,
-                        "scenario": data.get("scenario", ""),
-                    }))
-                return web.json_response({
-                    "id": task_id, "object": "chat.completion",
-                    "choices": [{"index": 0,
-                                 "message": {"role": "assistant", "content": content},
-                                 "finish_reason": "stop" if content else "error"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    "instance_port": inst_port, "instance_type": inst_type,
-                    "protocol": "grpc", "processing_time_ms": int(latency_ms),
-                })
-
-            # ── HTTP Path (default) ───────────────────────────────────
-            # Orchestrator → agent HTTP proxy → llama-server.
-            # Routing through the agent keeps the HTTP path symmetrical
-            # with DDS/gRPC (same number of hops) so benchmarks compare
-            # like-for-like, and lets the agent own future prompt/context
-            # decoration.
+            # HTTP end-to-end: cliente HTTP → orquestrador → agente HTTP → llama-server.
+            # O roteamento pelo agente mantém a simetria de saltos com DDS/gRPC
+            # (mesma quantidade de hops), permitindo comparação pareada entre
+            # protocolos nos benchmarks E1--E5, e deixa o agente responsável por
+            # decoração futura do prompt/contexto.
+            content = ""
+            success = False
+            if _target_agent is not None:
+                agent_url = f"http://{_target_agent.hostname}:{_target_agent.port}"
+                endpoint = f"{agent_url}/chat"
             else:
+                # No agent registered on the instance hostname — fall back to
+                # the direct llama-server URL so single-node dev setups keep
+                # working.
+                agent_url = f"http://{instance.hostname}:{instance.port}"
+                endpoint = f"{agent_url}/v1/chat/completions"
+            try:
+                async with self._pool_session.post(
+                    endpoint,
+                    json={"messages": messages, "max_tokens": max_tokens,
+                          "temperature": temperature},
+                ) as _resp:
+                    http_result = await _resp.json()
+                content = http_result.get("content", "")
+                if not content and "choices" in http_result:
+                    msg = http_result["choices"][0].get("message", {})
+                    content = msg.get("content", "") or msg.get("reasoning_content", "")
+                success = bool(content)
+            except Exception as e:
                 content = ""
                 success = False
-                if _target_agent is not None:
-                    agent_url = f"http://{_target_agent.hostname}:{_target_agent.port}"
-                    endpoint = f"{agent_url}/chat"
-                else:
-                    # No agent registered on the instance hostname — fall
-                    # back to the direct llama-server URL so single-node
-                    # dev setups keep working.
-                    agent_url = f"http://{instance.hostname}:{instance.port}"
-                    endpoint = f"{agent_url}/v1/chat/completions"
-                try:
-                    async with self._pool_session.post(
-                        endpoint,
-                        json={"messages": messages, "max_tokens": max_tokens,
-                              "temperature": temperature},
-                    ) as _resp:
-                        http_result = await _resp.json()
-                    content = http_result.get("content", "")
-                    if not content and "choices" in http_result:
-                        msg = http_result["choices"][0].get("message", {})
-                        content = msg.get("content", "") or msg.get("reasoning_content", "")
-                    success = bool(content)
-                except Exception as e:
-                    content = ""
-                    success = False
-                    logger.error(f"HTTP to {endpoint} failed: {e}")
+                logger.error(f"HTTP to {endpoint} failed: {e}")
 
-                latency_ms = (_time.time() - t_start) * 1000
-                inst_port = instance.port
-                inst_type = instance.inst_type
-                await self.instance_pool.release_instance(inst_port, latency_ms, success)
-                instance = None
+            latency_ms = (_time.time() - t_start) * 1000
+            inst_port = instance.port
+            inst_type = instance.inst_type
+            await self.instance_pool.release_instance(inst_port, latency_ms, success)
+            instance = None
 
-                if self.mongo_store:
-                    asyncio.create_task(self.mongo_store.log_request({
-                        "request_id": task_id, "instance_port": inst_port,
-                        "instance_type": inst_type, "protocol": "http",
-                        "algorithm": self.instance_pool._algorithm.value,
-                        "latency_ms": latency_ms, "success": success,
-                        "scenario": data.get("scenario", ""),
-                    }))
+            if self.mongo_store:
+                asyncio.create_task(self.mongo_store.log_request({
+                    "request_id": task_id, "instance_port": inst_port,
+                    "instance_type": inst_type, "protocol": "http",
+                    "algorithm": self.instance_pool._algorithm.value,
+                    "latency_ms": latency_ms, "success": success,
+                    "scenario": data.get("scenario", ""),
+                }))
 
-                return web.json_response({
-                    "id": task_id, "object": "chat.completion",
-                    "choices": [{"index": 0,
-                                 "message": {"role": "assistant", "content": content},
-                                 "finish_reason": "stop" if content else "error"}],
-                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    "instance_port": inst_port, "instance_type": inst_type,
-                    "protocol": "http", "processing_time_ms": int(latency_ms),
-                })
+            return web.json_response({
+                "id": task_id, "object": "chat.completion",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": content},
+                             "finish_reason": "stop" if content else "error"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "instance_port": inst_port, "instance_type": inst_type,
+                "protocol": "http", "processing_time_ms": int(latency_ms),
+            })
         except Exception as e:
             latency_ms = (_time.time() - t_start) * 1000
             if instance:

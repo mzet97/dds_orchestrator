@@ -232,6 +232,27 @@ async def main():
         logger.info(f"InstancePool ready: {len(instance_pool._instances)} instances, "
                      f"algorithm={config.routing_algorithm}")
 
+    # Transport registry — camada de transporte abstrata (dissertação v3 §2174).
+    # Montamos aqui os três adaptadores (HTTP, DDS, gRPC) a partir das camadas
+    # já construídas acima e os entregamos ao servidor por injeção. Callsites
+    # do dispatcher são migrados progressivamente a consultar este dicionário
+    # em vez de ramificar por protocolo.
+    try:
+        from transport import build_transport_registry
+        transport_registry = build_transport_registry(
+            dds_layer=dds_layer,
+            grpc_layer=grpc_layer,
+            http_session=None,
+        )
+        logger.info(
+            "Transport registry ready: "
+            + ", ".join(f"{name}={adapter.is_available()}"
+                        for name, adapter in transport_registry.items())
+        )
+    except Exception as _e:
+        logger.warning(f"Transport registry not built: {_e}")
+        transport_registry = None
+
     # Create server
     server = OrchestratorServer(
         config=config,
@@ -245,6 +266,7 @@ async def main():
         redis_mgr=redis_mgr,
         mongo_store=mongo_store,
         backpressure=backpressure,
+        transports=transport_registry,
     )
 
     # Start server
