@@ -49,7 +49,7 @@ async def run_benchmark(args):
         T1 = (t1_end - t1_start) / 1e6
 
         try:
-            wall_ms, resp = await client.request(messages, max_tokens=1, temperature=0.0, timeout_s=60)
+            wall_ms, resp = await client.request(messages, max_tokens=50, temperature=0.0, timeout_s=60)
         except Exception as e:
             print(f"Iter {i+1} ERR: {e}")
             continue

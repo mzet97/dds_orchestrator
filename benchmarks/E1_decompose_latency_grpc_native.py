@@ -50,7 +50,7 @@ def main():
             request_id=f"e1-{i}",
             model=args.model,
             messages=[pb2.ChatMessage(role="user", content=prompt)],
-            max_tokens=1, temperature=0.0,
+            max_tokens=50, temperature=0.0,
             priority=5, timeout_ms=60000,
         )
         T1 = (time.perf_counter_ns() - t1_start) / 1e6
