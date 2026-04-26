@@ -179,61 +179,35 @@ class DDSFailureDetector:
         try:
             await asyncio.wait_for(self._detection_event.wait(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            self._cleanup_iteration(pub_proc)
+            # Bug 1 minimal-fix: SIGKILL fallback to ensure the SIGTERM/SIGSTOP
+            # subprocess actually dies. Then yield reader and pause longer so the
+            # CycloneDDS entities are reclaimed before the next iteration's reader.
+            try: pub_proc.kill()
+            except Exception: pass
+            try: pub_proc.wait(timeout=3)
+            except Exception: pass
+            del self._reader
+            await asyncio.sleep(1.5)
             return {"detection_time_ms": -1, "detected_by": "TIMEOUT"}
 
         t_detect = self._t_detect
         detection_ms = (t_detect - t_fail) * 1000.0
 
-        self._cleanup_iteration(pub_proc)
+        # Limpar
+        try: pub_proc.kill()
+        except Exception: pass
+        try: pub_proc.wait(timeout=3)
+        except Exception: pass
+
+        # Destruir reader para próxima iteração ter estado limpo
+        del self._reader
+
+        # Pausa para DDS estabilizar entre iterações. Bug 1 fix: aumentado
+        # de 0.5s para 1.5s para dar tempo do publisher SIGTERM/SIGSTOP
+        # parar de fato de publicar (handler de signal demora dezenas de ms).
+        await asyncio.sleep(1.5)
+
         return {"detection_time_ms": detection_ms, "detected_by": self._detected_by}
-
-    def _cleanup_iteration(self, pub_proc):
-        """Limpeza determinística entre iterações.
-
-        Bug 1 fix: o cleanup anterior usava ``del self._reader`` + sleep 0.5s,
-        que não destrói o reader DDS imediatamente (depende de GC) e deixa o
-        listener ainda registrado. Para sigterm/deadlock o publisher demora a
-        morrer e os dados continuam chegando na entidade DDS antiga, fazendo
-        a próxima iteração começar com estado contaminado e o callback
-        DEADLINE/LIVELINESS nunca dispara (pattern "TIMEOUT (NONE)").
-
-        Aqui:
-          - SIGKILL forçado e ``wait`` para garantir o publisher morre.
-          - ``set_listener(None)`` desregistra antes de fechar.
-          - ``close()`` libera as entidades CycloneDDS imediatamente.
-          - ``gc.collect()`` força liberação dos handles Python.
-        """
-        import gc
-
-        # garantir que o publisher subprocess realmente morreu, mesmo com
-        # SIGTERM/SIGSTOP que dão chance de cleanup ao filho
-        try:
-            pub_proc.kill()
-        except Exception:
-            pass
-        try:
-            pub_proc.wait(timeout=3)
-        except Exception:
-            pass
-
-        # tear down DDS reader determinístico
-        try:
-            self._reader.set_listener(None)
-        except Exception:
-            pass
-        try:
-            self._reader.close()
-        except Exception:
-            pass
-        self._reader = None
-        self._listener = None
-        gc.collect()
-
-        # Sleep maior para CycloneDDS reciclar entidades + libera-thread do
-        # listener que está em mid-callback no SIGSTOP/SIGTERM cases.
-        # Não usamos await aqui (síncrono) — o caller ainda fará outro sleep.
-        time.sleep(2.0)
 
 
 async def run_benchmark(args):
